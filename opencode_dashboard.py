@@ -97,7 +97,7 @@ def pad_activity(days):
     """Overlay recorded per-day usage onto the canonical 52-week window.
 
     All numeric keys are carried over (not just the OpenCode set), so the
-    Codex day breakdown — reqs/ok/err/err429/what_if — survives padding and
+    Codex day breakdown, reqs/ok/err/err429/what_if, survives padding and
     stays consistent between the per-day table, the heatmap and the
     period rollups. Totals are recomputed by each caller with the correct
     token semantics (local includes the separate cache stream, Codex input
@@ -158,7 +158,7 @@ def compute_streaks(activity, tokens_only=False):
 
     slots = list(activity or [])
     if slots and not active(slots[-1]):
-        slots = slots[:-1]  # today quiet so far — streak stands through yesterday
+        slots = slots[:-1]  # today quiet so far, streak stands through yesterday
     cur = 0
     for slot in reversed(slots):
         if active(slot):
@@ -177,7 +177,7 @@ def compute_streaks(activity, tokens_only=False):
 
 def parse_model(raw):
     if not raw:
-        return "—"
+        return "-"
     try:
         return json.loads(raw).get("id", raw)
     except (ValueError, AttributeError):
@@ -186,7 +186,7 @@ def parse_model(raw):
 
 def short_dir(path):
     if not path:
-        return "—"
+        return "-"
     parts = [p for p in path.split("/") if p]
     if len(parts) > 2:
         return "/".join(parts[-2:])
@@ -243,7 +243,7 @@ def db_worktrees(db_path):
 
 
 def repo_heads(worktrees):
-    """Current HEAD per worktree — cheap git fingerprint for cache invalidation."""
+    """Current HEAD per worktree, cheap git fingerprint for cache invalidation."""
     heads = []
     seen = set()
     for _, wt in worktrees or []:
@@ -267,7 +267,7 @@ def repo_heads(worktrees):
 def collect_repo_commits(worktrees, per_repo=MAX_COMMITS_PER_REPO):
     """Recent commits per worktree: sha/subject/date/files/+/-.
 
-    Skips missing dirs and non-git worktrees silently — the panels simply
+    Skips missing dirs and non-git worktrees silently, the panels simply
     show fewer repos. Never raises for git failures.
     """
     commits = []
@@ -929,7 +929,7 @@ def query_stats(con):
         models[m]["cache"] += r["ca"]
         models[m]["cost"] += r["cost"]
 
-    # Most recent sessions only — the payload stays bounded and the detail
+    # Most recent sessions only, the payload stays bounded and the detail
     # endpoint fetches prompts on demand.
     sessions = []
     for r in con.execute(
@@ -994,7 +994,7 @@ def query_stats(con):
                    +COALESCE(tokens_cache_write,0) AS tot
            FROM session"""
     ):
-        nm, wt = pid_info.get(r["project_id"], ("—", ""))
+        nm, wt = pid_info.get(r["project_id"], ("-", ""))
         sess_all[r["id"]] = (r["tot"] or 0, r["time_updated"] or 0, nm, wt)
 
     # Changed files from edit/write tool parts: distinct filePaths per session.
@@ -1096,7 +1096,7 @@ def query_stats(con):
     totals["cache_rate"] = cache_rate(totals["tokens_input"], totals["tokens_cache_read"])
     totals["avg_tokens_per_session"] = round(total_tokens / totals["sessions"], 0) if totals["sessions"] else 0
 
-    # Records: biggest day / session / burn / streaks — pure tokens, fun to know.
+    # Records: biggest day / session / burn / streaks, pure tokens; nice to know.
     # Biggest session + fastest burn come from full-table queries (not the
     # capped recent-sessions list) so large histories still report all-time
     # bests accurately.
@@ -1136,7 +1136,7 @@ def query_stats(con):
     streaks = compute_streaks(activity)
     busiest = biggest_day["date"] if biggest_day else None
     top_model = sorted(models.items(), key=lambda kv: -(kv[1]["ti"] + kv[1]["to"] + kv[1]["tr"] + kv[1]["cache"]))[0] if models else None
-    top_agent = sorted(agents.items(), key=lambda kv: -kv[1]["n"])[0] if agents else ("—", {"n": 0})
+    top_agent = sorted(agents.items(), key=lambda kv: -kv[1]["n"])[0] if agents else ("-", {"n": 0})
     longest = con.execute(
         """
         SELECT title, (time_updated-time_created)/60000.0 AS mins FROM session
@@ -1147,20 +1147,20 @@ def query_stats(con):
 
     insights = [
         f"Across {totals['sessions']} sessions you used {total_tokens:,.0f} tokens in {totals['messages']:,} messages.",
-        f"Your biggest token day was {busiest} — {biggest_day['total']:,.0f} tokens across {biggest_day['sessions']} sessions."
+        f"Your biggest token day was {busiest}, {biggest_day['total']:,.0f} tokens across {biggest_day['sessions']} sessions."
         if biggest_day else "No activity recorded yet.",
-        f"Most-used model: {top_model[0]} — {top_model[1]['n']:,} sessions, {top_model[1]['ti'] + top_model[1]['to'] + top_model[1]['tr'] + top_model[1]['cache']:,.0f} tokens."
+        f"Most-used model: {top_model[0]}, {top_model[1]['n']:,} sessions, {top_model[1]['ti'] + top_model[1]['to'] + top_model[1]['tr'] + top_model[1]['cache']:,.0f} tokens."
         if top_model else "",
         f"The {top_agent[0]} agent did the heavy lifting with {top_agent[1]['n']} sessions and {top_agent[1]['toks']:,} tokens."
         if agents else "",
-        f"Top subsystem: {subsys_rows[0][0]} — {subsys_rows[0][1]:,.0f} tokens across {subsys_rows[0][2]} sessions."
+        f"Top subsystem: {subsys_rows[0][0]}, {subsys_rows[0][1]:,.0f} tokens across {subsys_rows[0][2]} sessions."
         if subsys_rows else "",
-        f"Priciest commit: “{(commit_rows[0][1] or '')[:60]}” — {commit_rows[0][7]:,.0f} tokens in the prior 24h."
+        f"Priciest commit: “{(commit_rows[0][1] or '')[:60]}”, {commit_rows[0][7]:,.0f} tokens in the prior 24h."
         if commit_rows and commit_rows[0][7] else "",
-        f"Longest session: “{longest['title']}” — {fmt_dur_min(longest['mins'])}."
+        f"Longest session: “{longest['title']}”, {fmt_dur_min(longest['mins'])}."
         if longest else "",
         (
-            f"Cache hit rate is {totals['cache_rate']}% — {totals['tokens_cache_read'] + totals['tokens_cache_write']:,.0f} cache tokens reused."
+            f"Cache hit rate is {totals['cache_rate']}%, {totals['tokens_cache_read'] + totals['tokens_cache_write']:,.0f} cache tokens reused."
             if totals["tokens_cache_read"] else ""
         ),
     ]
@@ -1322,7 +1322,7 @@ def cached_local_stats(db_path):
 def router_short(model):
     """Short display name: last path segment, e.g. 'a/b' -> 'b'."""
     if not model:
-        return "—"
+        return "-"
     return str(model).split("/")[-1] or str(model)
 
 
@@ -1361,7 +1361,7 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
     Each event: {at, date, hour, model, short, provider, status, ok,
     ti, cache, to, total, reasoning, cache_write, ms, free, what_if}. Missing token fields on
     error rows (401/429/500) become 0 and are counted as errors, never
-    estimated — actuals only.
+    estimated, actuals only.
     """
     p = Path(path)
     try:
@@ -1382,7 +1382,7 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
             continue
         if not isinstance(e, dict):
             continue
-        model = e.get("model") or "—"
+        model = e.get("model") or "-"
         short = router_short(model)
         try:
             status = int(e.get("status", 0))
@@ -1409,7 +1409,7 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
                 "hour": hour,
                 "model": str(model),
                 "short": short,
-                "provider": str(e.get("provider") or "—"),
+                "provider": str(e.get("provider") or "-"),
                 "status": status,
                 "ok": ok,
                 "ti": ti,
@@ -1464,7 +1464,7 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     MAX_ROUTER_ROWS either way.
 
     `worktrees` ([(name, path)]) feeds the tokens-per-commit panel: router
-    events carry no project info, so attribution is timestamp-only — request
+    events carry no project info, so attribution is timestamp-only, request
     tokens in the 24h window before each commit.
     """
     try:
@@ -1479,8 +1479,8 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         truncated = total_lines > MAX_ROUTER_EVENTS
         scanned_events = parse_router_events(events_path, MAX_ROUTER_EVENTS)
     # Successful responses that carried no token fields (local/unmetered
-    # models, image calls) are excluded from every count and average —
-    # never estimated — and reported separately as `unmetered`.
+    # models, image calls) are excluded from every count and average -
+    # never estimated, and reported separately as `unmetered`.
     unmetered = sum(1 for e in scanned_events if e["ok"] and not e["total"])
     events = [e for e in scanned_events if not e["ok"] or e["total"]]
     ok_events = [e for e in events if e["ok"]]
@@ -1646,27 +1646,27 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     peak_hour = max(range(24), key=lambda h: hour_tokens.get(h, 0)) if any(hour_tokens.values()) else None
     req_word = "model calls" if full_scan else "requests"
     insights = [
-        f"Codex made {len(events):,} {req_word} across {len(by_model)} models — {len(ok_events):,} ok, {len(err_events):,} errors.",
-        (f"Top model: {router_short(top_model[0])} — {top_model[2]:,.0f} tokens over {top_model[1]:,} requests."
+        f"Codex made {len(events):,} {req_word} across {len(by_model)} models, {len(ok_events):,} ok, {len(err_events):,} errors.",
+        (f"Top model: {router_short(top_model[0])}, {top_model[2]:,.0f} tokens over {top_model[1]:,} requests."
          if top_model else ""),
-        (f"Busiest day: {biggest_day['date']} — {biggest_day['total']:,.0f} tokens, {biggest_day['reqs']} requests."
+        (f"Busiest day: {biggest_day['date']}, {biggest_day['total']:,.0f} tokens, {biggest_day['reqs']} requests."
          if biggest_day else "No Codex activity recorded yet."),
     ]
     if err429:
-        insights.append(f"{err429} requests hit 429 rate limits — usually free-model capacity, not token size.")
+        insights.append(f"{err429} requests hit 429 rate limits, usually free-model capacity, not token size.")
     if unmetered:
         insights.append(
             f"{unmetered:,} successful requests reported no token counts "
-            f"(local / unmetered models) — excluded from all counts and averages."
+            f"(local / unmetered models), excluded from all counts and averages."
         )
     if free_unpriced:
         insights.append(
             f"What-if paid ${what_if:.2f} covers only models with known pricing "
-            f"(muse-spark) — {free_unpriced:,} other free-model requests have no rate on file."
+            f"(muse-spark), {free_unpriced:,} other free-model requests have no rate on file."
         )
     if truncated:
         insights.append(
-            f"Showing the most recent {len(scanned_events):,} of {total_lines:,} events — "
+            f"Showing the most recent {len(scanned_events):,} of {total_lines:,} events, "
             f"totals cover the scanned window only."
         )
     insights = [i for i in insights if i]
@@ -1776,7 +1776,7 @@ def cached_router_stats(events_path, limits_path=None, worktrees=None, full_scan
 
 
 def session_prompts(con, session_id):
-    """Prompts for one session — from session_input when available, otherwise
+    """Prompts for one session, from session_input when available, otherwise
     reconstructed from user text parts (older opencode versions)."""
     rows = [
         {"t": r["time_created"], "p": r["prompt"]}
@@ -2401,9 +2401,9 @@ const BOLD=s=>{const ents=[];const t=s.replace(/&(?:#\d+|[a-z]+);/g,m=>{ents.pus
   return t.replace(/(\d[\d,]*(?:\.\d+)?)/g,'<b>$1</b>').replace(/@@[A-Z]+@@/g,m=>ents[m.charCodeAt(2)-65]);};
 const F=n=>{const s=Math.round(Number(n)||0).toString();return s.replace(/\B(?=(\d{3})+(?!\d))/g,',');};
 const FN=n=>{n=Number(n)||0;return n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(Math.round(n));};
-const DT=t=>{if(!t)return'—';const d=new Date(t>1e12?t:t*1000);return d.toLocaleDateString('en-CA')+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
+const DT=t=>{if(!t)return'-';const d=new Date(t>1e12?t:t*1000);return d.toLocaleDateString('en-CA')+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
 const DS=t=>{if(!t)return'';const d=new Date(t>1e12?t:t*1000);return d.toLocaleDateString('en-CA');};
-const DUR=m=>{if(m==null)return'—';if(m<1)return'<1m';if(m<60)return Math.round(m)+'m';const h=Math.floor(m/60);return h+'h '+Math.round(m%60)+'m';};
+const DUR=m=>{if(m==null)return'-';if(m<1)return'<1m';if(m<60)return Math.round(m)+'m';const h=Math.floor(m/60);return h+'h '+Math.round(m%60)+'m';};
 const BURN=b=>{b=Number(b)||0;return b>=1000?(b/1000).toFixed(1)+'K/m':Math.round(b)+'/m';};
 let S=null; if(typeof S0!=='undefined'&&S0){S=S0;}
 let R=null; try{if(typeof R0!=='undefined'&&R0){R=R0;}}catch(_){R=null;}
@@ -2597,7 +2597,7 @@ function renderCommitChart(){
       '<div><div class="mn">'+ESC(msg.length>44?msg.slice(0,44)+'…':msg)+'</div>'+
       '<div class="ms">'+sha.slice(0,7)+' · '+date+' · '+ESC(proj)+' · +'+F(add)+'/-'+F(del)+'</div></div>'+
       '<div class="mbar"><i style="width:'+Math.max(toks?2:0,toks/max*100).toFixed(1)+'%;background:'+t.accent2+'"></i></div>'+
-      '<div class="mv">'+(toks?FN(toks):'—')+'</div></div>';
+      '<div class="mv">'+(toks?FN(toks):'-')+'</div></div>';
   }).join('')+(rows.length>6?'<button class="more-btn" data-exp="cs">'+(CS_EXP?'Show less':'Show all '+rows.length)+' '+(CS_EXP?'▴':'▾')+'</button>':'');
 }
 /* period helpers */
@@ -2633,11 +2633,11 @@ function renderHero(){
   $('range').textContent='LOCAL · RECORDED '+S.range.toUpperCase()+' · LAST '+periodLbl+' · REFRESHES AUTOMATICALLY';
   $('headline').innerHTML=BOLD(ESC(S.insights[0]||'No activity yet.'));
   const last=[...S.sessions].sort((a,b)=>b.time_created-a.time_created)[0];
-  const ltitle=last?ESC(last.title):'—';
+  const ltitle=last?ESC(last.title):'-';
   const nModels=S.models.length;
   $('pills').innerHTML=[
     ['Total tokens',FN(S.totals.tokens_total||0)],
-    ['Models',nModels>1?nModels+' models':ESC(((S.models[0]||['—'])[0]+'').split('/').pop())],
+    ['Models',nModels>1?nModels+' models':ESC(((S.models[0]||['-'])[0]+'').split('/').pop())],
     ['Latest',ltitle.length>36?ltitle.slice(0,36)+'…':ltitle]]
     .map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+v+'</b></span>').join('');
 }
@@ -2688,7 +2688,7 @@ function renderKpis(){
     row('Avg tokens/session (all)',FN(t.avg_tokens_per_session||0),'var(--subtle)')+'</div>';
   const topSub=((S.subsystems||[])[0])||null;
   const burnCard='<div class="kpi"><h3>Burn &amp; activity</h3><div class="big">'+F(sessions)+' <small>sessions</small>'+actTag+'</div>'+
-    row('Messages',F(msgs),c.accent)+row('Top subsystem',topSub?ESC(topSub[0]):'—',c.accent2,'all-time')+
+    row('Messages',F(msgs),c.accent)+row('Top subsystem',topSub?ESC(topSub[0]):'-',c.accent2,'all-time')+
     row('Avg session',DUR(t.avg_duration_min),'var(--subtle)','all-time')+'</div>';
   $('kpis').innerHTML=tokCard+effCard+burnCard;
 }
@@ -2717,7 +2717,7 @@ function renderCharts(){
   renderFileChart();
   renderCommitChart();
 }
-function modelShort(m){return (m||'—').split('/').pop();}
+function modelShort(m){return (m||'-').split('/').pop();}
 function renderModels(){
   const el=$('models');if(!el)return;
   const t=T();
@@ -2977,7 +2977,7 @@ function renderFilterBar(){
   bar.querySelector('.fclear').onclick=()=>{for(const k in FSTATE)FSTATE[k]=null;$('agent-f').value='';$('model-f').value='';renderAll();};
 }
 /* ---- Codex tab (all models, from usage-events.jsonl) ---- */
-function rModelShort(m){return (m||'—').split('/').pop();}
+function rModelShort(m){return (m||'-').split('/').pop();}
 function rDayTokenTotal(d){return (d.ti||0)+(d.to||0)+(d.tr||0);}
 function rCutDate(){
   if(RRANGE==='all')return'';
@@ -3105,7 +3105,7 @@ function renderRouterCommitChart(){
       '<div><div class="mn">'+ESC(msg.length>44?msg.slice(0,44)+'…':msg)+'</div>'+
       '<div class="ms">'+sha.slice(0,7)+' · '+date+' · '+ESC(proj)+' · +'+F(add)+'/-'+F(del)+'</div></div>'+
       '<div class="mbar"><i style="width:'+Math.max(toks?2:0,toks/max*100).toFixed(1)+'%;background:'+t.accent2+'"></i></div>'+
-      '<div class="mv">'+(toks?FN(toks):'—')+'</div></div>';
+      '<div class="mv">'+(toks?FN(toks):'-')+'</div></div>';
   }).join('')+(rows.length>6?'<button class="more-btn" data-exp="rcs">'+(RCS_EXP?'Show less':'Show all '+rows.length)+' '+(RCS_EXP?'▴':'▾')+'</button>':'');
 }
 function rHumanize(n){n=Number(n)||0;const words=Math.round(n/1.3);if(words>1e6)return (words/1e6).toFixed(1)+'M words';if(words>1e3)return (words/1e3).toFixed(0)+'K words';return words+' words';}
@@ -3250,7 +3250,7 @@ function renderRouter(){
     '<div class="kpi"><h3>Burn &amp; activity</h3><div class="big">'+F(totReqs)+' <small>requests · '+okRate+'% ok</small></div>'+
     row('Errors',F(cur?cur.err:(t.errors||0)),(cur?cur.err:t.errors)?'var(--bad)':'var(--subtle)')+
     row('429s',F(cur?cur.err429:(t.err429||0)),(cur?cur.err429:(t.err429||0))?'var(--bad)':'var(--subtle)')+
-    row('Top commit',topCommit?ESC((topCommit[1]||'').slice(0,30)):'—',c.accent2,'all-time')+
+    row('Top commit',topCommit?ESC((topCommit[1]||'').slice(0,30)):'-',c.accent2,'all-time')+
     row('Avg latency',(t.latency_na?'N/A':(F(t.avg_ms||0)+' ms')),'var(--subtle)',(t.latency_na?'no timing in Codex data':'ok-only · all-time'))+'</div>';
   renderRouterRecords(R,totTokens);
   const d=rPeriodDays();
@@ -3273,8 +3273,8 @@ function renderRouter(){
       '<span class=\'trow\'><span>Input / Cached / Output</span><b>'+FN(ti)+' / '+FN(ca)+' / '+FN(out)+'</b></span>'+
       (RSPLIT?'<span class=\'trow\'><span>Reasoning</span><b>'+FN(tr)+'</b></span>':'')+
       '<span class=\'trow\'><span>Provider</span><b>'+ESC(prov)+'</b></span>'+
-      ((!tot&&ok)?'<span class=\'trow\'><span>Note</span><b>unmetered — 0 tokens reported</b></span>':'')+
-      ((free&&!wi)?'<span class=\'trow\'><span>Pricing</span><b>no rate on file — excluded from what-if</b></span>':'')+
+      ((!tot&&ok)?'<span class=\'trow\'><span>Note</span><b>unmetered, 0 tokens reported</b></span>':'')+
+      ((free&&!wi)?'<span class=\'trow\'><span>Pricing</span><b>no rate on file, excluded from what-if</b></span>':'')+
       (free?'<span class=\'trow\'><span>What-if paid</span><b>$'+Number(wi).toFixed(4)+'</b></span>':''));
     return '<div class="model-row clickable'+(RFSTATE.model===name?' active':'')+'" data-rm="'+ESC(name)+'" data-tip="'+tipH+'">'+
       '<div><div class="mn">'+ESC(rModelShort(name))+(free?'<span class="free-tag">free</span>':'')+'</div><div class="ms">'+reqs+' req · '+(tot/totalAll*100).toFixed(1)+'% · '+ESC(prov)+'</div></div>'+
@@ -3550,7 +3550,7 @@ function renderSSTable(){var tb=document.querySelector('#sstbl tbody');if(!tb)re
 async function fetchSessions(){var p='q='+encodeURIComponent(document.getElementById('ss-q').value)+'&agent='+encodeURIComponent(document.getElementById('ss-agent').value)+'&model='+encodeURIComponent(document.getElementById('ss-model').value);try{var r=await fetch('/api/sessions?'+p+'&_='+Date.now(),{headers:{'X-Window-Id':WID}});if(r.ok){SB=await r.json();renderSSTable();}}catch(_){}}
 function renderProjects(){var tb=document.querySelector('#projtbl tbody');if(!tb)return;if(!PJ||PJ.error){tb.innerHTML='<tr><td colspan="5">ERR</td></tr>';return;}var H='';for(var i=0;i<PJ.rows.length;i++){var r=PJ.rows[i];var nm=r.name||r.directory||r.worktree||r.id;H+='<tr><td>'+ESC(nm)+'</td><td>'+ESC(r.directory||r.worktree||'')+'</td><td>'+ESC(r.vcs||'')+'</td><td class="num">'+(r.sessions||0)+'</td><td>'+fmtT(r.last)+'</td></tr>';}if(!H)H='<tr><td colspan="5">no projects</td></tr>';tb.innerHTML=H;}
 function renderSignals(){var el=document.getElementById('sig-chips');if(!el)return;if(!SG||SG.error){el.textContent='ERR';return;}var H='';for(var i=0;i<SG.signals.length;i++){var s=SG.signals[i];var c=(s.level==='warn')?'#a6761d':((s.level==='err')?'#c00':'#16a34a');H+='<span style="display:inline-block;padding:2px 10px;border:1px solid '+c+';border-radius:12px;margin:2px;color:'+c+'">'+ESC(s.text)+'</span>';}if(!H)H='<span>all clear</span>';el.innerHTML=H;}
-async function inspect(sid){var box=document.getElementById('insp');if(!box)return;box.hidden=false;box.textContent='loading '+sid+' ...';try{var r=await fetch('/api/inspect?id='+encodeURIComponent(sid)+'&_='+Date.now(),{headers:{'X-Window-Id':WID}});var d=await r.json();if(!d||!d.found){box.textContent='not found '+sid;return;}var H='<b>'+ESC(d.title||sid)+'</b> <span style="opacity:.65">'+ESC(d.agent||'')+' / '+ESC(d.model||'')+' / '+ESC(d.directory||'')+'</span>';for(var i=0;i<d.messages.length;i++){var m=d.messages[i];H+='<div style="margin-top:8px"><b>'+ESC(m.role)+'</b> <span style="opacity:.65">'+ESC(m.agent||'')+' '+ESC(m.model||'')+' · '+m.parts.length+' parts</span>';if(m.summary)H+='<div>'+ESC(m.summary)+'</div>';for(var j=0;j<m.parts.length;j++){var p=m.parts[j];H+='<div style="margin-left:12px;opacity:.85">['+ESC(p.type)+'] '+p.size+' B'+(p.preview?(' — '+ESC(String(p.preview).slice(0,300))):'')+'</div>';}H+='</div>';}box.innerHTML=H;box.scrollIntoView();}catch(e){box.textContent='ERR '+e.message;}}
+async function inspect(sid){var box=document.getElementById('insp');if(!box)return;box.hidden=false;box.textContent='loading '+sid+' ...';try{var r=await fetch('/api/inspect?id='+encodeURIComponent(sid)+'&_='+Date.now(),{headers:{'X-Window-Id':WID}});var d=await r.json();if(!d||!d.found){box.textContent='not found '+sid;return;}var H='<b>'+ESC(d.title||sid)+'</b> <span style="opacity:.65">'+ESC(d.agent||'')+' / '+ESC(d.model||'')+' / '+ESC(d.directory||'')+'</span>';for(var i=0;i<d.messages.length;i++){var m=d.messages[i];H+='<div style="margin-top:8px"><b>'+ESC(m.role)+'</b> <span style="opacity:.65">'+ESC(m.agent||'')+' '+ESC(m.model||'')+' · '+m.parts.length+' parts</span>';if(m.summary)H+='<div>'+ESC(m.summary)+'</div>';for(var j=0;j<m.parts.length;j++){var p=m.parts[j];H+='<div style="margin-left:12px;opacity:.85">['+ESC(p.type)+'] '+p.size+' B'+(p.preview?(', '+ESC(String(p.preview).slice(0,300))):'')+'</div>';}H+='</div>';}box.innerHTML=H;box.scrollIntoView();}catch(e){box.textContent='ERR '+e.message;}}
 if(!window.__p1wire){window.__p1wire=1;document.addEventListener('click',function(e){var t=(e.target&&e.target.closest)?e.target.closest('[data-sid]'):null;if(t)inspect(t.getAttribute('data-sid'));});['ss-q','ss-agent','ss-model'].forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener('input',function(){if(window.__p1t)clearTimeout(window.__p1t);window.__p1t=setTimeout(fetchSessions,350);});});}
 $('refresh').onclick=load;
 $('search').addEventListener('input',renderSessions);

@@ -2,6 +2,8 @@
 
 A single-file, zero-dependency usage dashboard for [OpenCode](https://github.com/sst/opencode) with a Codex view built in. Download it, double-click the launcher, and your own stats appear in the browser.
 
+![Dashboard screenshot](screenshot.png)
+
 ![logo](logo.png)
 
 ## What it shows

@@ -426,3 +426,143 @@
 - Remote operations: none (no push/merge/fetch). Process hygiene: no servers
   started by this scope; suite servers bind `127.0.0.1:0` only; only own
   PIDs/threads handled; no repo files left dirty beyond the intended set.
+
+# FIX_REPORT — F5b/F5c codex enumeration + rec guard (RED → GREEN)
+
+## F5b-F5c-1. Repo, base, tested SHA, worktree, environment
+
+- Repo: `V3/little-better-dashboard`, branch `fix/audit-f1-f8`.
+- Start of this run: HEAD `8834c63` ("F5a/F6a FIX_REPORT + acceptance matrix").
+  Worktree DIRTY at start: `M opencode_dashboard.py`,
+  `M tests/test_codex_incremental.py`, `M tests/test_codex_publication.py`
+  = the F5b/F5c patch + tests from an interrupted predecessor run; kept after
+  byte-level review (contract matches §10/§11 exactly; local session-stats path
+  untouched).
+- Incident, disclosed for honesty: `tests/test_synth_publish.py` was reported
+  deleted by an external actor mid-run (likely a foreign process in this
+  workstation; no evidence it was this scope or Claude). Restored by hardlink;
+  content proven byte-identical to HEAD: `git diff` empty for that path and
+  filtered hash `fbfee71e4e24687d4fb4fd2b6d943348b0d3732c` ==
+  `HEAD:tests/test_synth_publish.py`. It carries a cosmetic stat-dirty flag
+  only; it is NOT part of this change and is not staged.
+- Code hashes tested (current worktree bytes):
+  - `opencode_dashboard.py`: `sha256:ffe64b48bb675c10c38999c7bc5ebd397e102c07a3b87a741784e41ca0576309`
+  - `tests/test_codex_publication.py`: `sha256:65a8057164300c4678e52be3bf07c36dbb30d67bde7183b73ac22e9440198321`
+  - `tests/test_codex_incremental.py`: `sha256:79665da6709735dfb3338146e51fd9c181383c7084825baae5fd3b2aabf2b57a`
+- Environment: Windows, `python` = Python 3.14.3. Tests are pure unit/thread
+  plus loopback HTTP; server tests bind `127.0.0.1:0` only (never
+  8765/8766/8770); fixtures synthetic in temp dirs with isolated HOME.
+
+## F5b-F5c-2. Change (TODO -> REPRODUCED -> PATCHED -> VERIFIED -> DONE)
+
+- Contract (§10 F5b, §11 F5c, binding):
+  - ONE shared enumeration of real Codex rollout files (`rollout-*.jsonl`,
+    recursive under `CODEX_DIR`) used by diagnostics (`/api/signals`), session
+    list (`/api/codex`) and synth publish — no third parallel rglob.
+  - Honest distinct states: dir missing / unreadable / exists-but-empty /
+    files present / partial read (skipped entries). A file vanishing between
+    enumeration and `stat()` never aborts; skips are counted and surfaced.
+    Foreign `.jsonl` without the rollout pattern never inflates counts; counts
+    and newest-mtime come from the same set the parser reads; cache freshness
+    stays signature-based (size/mtime) so new files are visible once present.
+  - `_parse_codex_file`: after successful `json.loads`, a non-dict record
+    increments a rejection counter and is skipped; the existing `pl` guard is
+    kept untouched; malformed JSON keeps the previous silent skip; empty lines
+    are not "invalid"; rejected contents are never logged; the counter is
+    surfaced in diagnostic metadata (`invalid_records` aggregate; `_invalid`
+    per cached row). Exactly one new guard, as bound ("F5c wyłącznie brakujący
+    guard rec").
+- Changed symbols in `opencode_dashboard.py`:
+  - NEW: `CODEX_ROLLOUT_GLOB = "rollout-*.jsonl"`, `_codex_rollout_files()` ->
+    `(files, state, skipped)` with `missing|unreadable|empty|partial|ok`, and
+    `_codex_rollout_stats(files)` -> `(ok_count, newest_mtime, skipped)`.
+  - `query_signals`: codex block rewritten on the shared enumeration; texts
+    distinguish missing dir / unreadable dir / rollout files unreadable
+    (skipped N) / empty / `N files, newest X.Xh ago` (+ ` (partial: N
+    skipped)`); level `ok` only when fresh and nothing skipped; obsolete
+    `import os as _os` alias dropped.
+  - `_parse_codex_file`: row gains `_invalid` / `_err`; open OSError ->
+    `_err = True` + return; non-dict parsed record -> `_invalid += 1;
+    continue` placed after `json.loads` and before the first `rec.get`
+    (`pl` guard untouched).
+  - `query_codex`: uses the shared enumeration; stat-loop OSError counts as
+    skipped; response adds additive diagnostics `invalid_records` (sum over
+    cache) and `partial` (bool; skips + `_err` rows).
+  - `ensure_codex_synth`: the same shared enumeration replaces its private
+    try/rglob.
+  - Tests: `tests/test_codex_publication.py` gains `TestF5bEnumeration`
+    (t01..t05); `tests/test_codex_incremental.py` gains `TestF5cRecGuard`
+    (t01..t05, incl. real `/api/codex` HTTP case); pre-existing skeleton tests
+    kept.
+- RED evidence (`artifacts/F5b-F5c-RED.windows.log`, exit 1): the new tests
+  executed against the unpatched dashboard: `Ran 16, FAILED failures=9
+  errors=1` — all 10 new tests red; t01 `AttributeError: 'list' object has no
+  attribute 'get'`; t05 the handler swallowed the same error into `ok:false`
+  (the actual flaw); F5b failures show old diagnostics reporting "Codex
+  sessions dir empty" for a nested rollout and lacking `unreadable`/`partial`
+  states. Genuine contract-level RED. Test-side fix during capture: the bearer
+  secret must be >=20 chars (`secrets.token_urlsafe(32)`).
+- GREEN evidence:
+  - `artifacts/F5b-F5c-GREEN.windows.log`: target files verbose
+    `Ran 16 tests, OK` (0.63 s) + three full-suite runs `Ran 91 tests, OK`
+    (81 prior + 10 new; zero regressions).
+  - `python -m py_compile opencode_dashboard.py` OK. Frontend untouched ->
+    `node --check` N/A for this scope.
+- Extra, disclosed outside this family's scope: F2-T09 close-race
+  stabilization. `/api/close` popped the window AFTER sending `200`, so a
+  client could still observe the window registered right after the response
+  (thread-scheduling race). Discovered by GREEN verification as an
+  intermittent full-suite failure; proven pre-existing on pristine HEAD
+  `8834c63` (organic: 1/5 suite runs; controlled probe with widened switch
+  interval: 9/150 hits) and absent after the fix (0/150). Fix: pop + "others"
+  computation under `LOCK` BEFORE `_send(200)`; `_arm_close()` still runs
+  after the send. No test was changed. Evidence pair in
+  `artifacts/F2-T09-race-evidence.windows.log`. Reason folded into this commit:
+  it blocks honest 91/91 evidence and is a 3-line ordering fix in the same
+  file.
+- Typesafe/Jev second-opinion gate (run BEFORE committing, on the real
+  `git diff`; jev-1.13.0, DIFF_CHARS=25314, first 24000 sent):
+  `touches_local_path` 0.07 (low — codex/router path only),
+  `touches_codex_reader_path` 0.99, `shared_enumeration_present` 0.97,
+  `diagnostics_states_distinguished` 0.97, `rec_guard_present` 0.98.
+  Consistent with the diff and tests.
+- Matrix: F5b-T01..T05 + F5c-T01..T05 -> PASS (windows,
+  `artifacts/F5b-F5c-GREEN.windows.log`); placeholder file names replaced with
+  the real test IDs.
+- Retries: one RED-to-GREEN cycle for the patch itself (5 edits, single pass,
+  no follow-up fixes); one test-side token-length fix during RED capture; no
+  report row faked — every claim maps to a log.
+
+## F5b-F5c-3. Not changed (verified)
+
+- Local session-stats path untouched (Jev `touches_local_path` 0.07; F1/F3
+  scopes); `day_total`/`dayTotal`/`outMerged` and local OpenCode SQL semantics
+  untouched.
+- `pl` payload guard untouched (F5c-T03 green proves it still protects);
+  `_parse_codex_events` rec/pay validation untouched; `token_usage_record` and
+  nested `item`/`usage` field semantics unchanged (F5c-T04 asserts pre/post
+  equivalence; only the diagnostic counter is new).
+- Malformed-JSON lines are still skipped without counting — deliberate minimal
+  scope of §11 (binding: "wyłącznie brakujący guard rec").
+- `/api/codex` response only gains additive diagnostic keys (`invalid_records`,
+  `partial`); no shape break (F5c-T05, F5c-T04 green).
+- Known remaining (honest): enumeration walk repeats per request (no new cache
+  layer); evidence for this scope is Windows-only (Linux NOT_RUN by design);
+  F5b's own freshness contract relies on the pre-existing signature check
+  (verified by F5b-T05).
+
+## F5b-F5c-4. Verify gate outcome
+
+- `python tools/verify_acceptance.py --gate core --report artifacts/TEST_REPORT.json`
+  -> FAIL (expected/honest): all 131 canonical IDs present and 131
+  core-mandatory marked; F5b/F5c now PASS in the matrix with existing evidence
+  files; but `artifacts/TEST_REPORT.json` is still F1-era — F5b/F5c (and all
+  F2..INT) result rows missing and report hash
+  `sha256:ce11d08f...` != current `sha256:ffe64b48...` ->
+  "GATE CORE FAILED (132 problem(s))" (same honest count as the F5a/F6a step;
+  the report is rebuilt at the F8-close step). Log in
+  `artifacts/F5b-F5c-verify-core.windows.log`.
+- Remote operations: none (no push/merge/fetch). Process hygiene: all servers
+  `127.0.0.1:0`; only own PIDs/threads handled; no repo files left dirty
+  beyond the intended set (plus the cosmetic stat-dirty flag on the restored
+  `tests/test_synth_publish.py`, content proven equal).

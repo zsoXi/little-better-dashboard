@@ -776,6 +776,13 @@ def query_codex(force=False):
 CODEX_SYNTH = Path(__file__).with_name("codex_router_events.jsonl")
 _codex_ev_cache = {}
 _codex_ev_sig = None
+_codex_last_error = None  # F5a: last synth publish failure text
+_codex_last_ok = None  # F5a: path of the last successful publish
+# F6a: publish-stage lock only; thread scope within this process. It is not
+# held while parsing rollouts or writing the candidate tmp file.
+_SYNTH_LOCK = threading.Lock()
+_synth_tmp_active = set()
+_synth_tmp_seq = 0
 
 def _numi(v):
     try:
@@ -824,12 +831,7 @@ def _parse_codex_events(p):
                             "cache_write": _numi(u.get("cache_write_input_tokens"))})
     return evs
 
-def ensure_codex_synth(force=False):
-    global _codex_ev_cache, _codex_ev_sig
-    try:
-        files = sorted(CODEX_DIR.rglob("rollout-*.jsonl")) if CODEX_DIR.is_dir() else []
-    except OSError:
-        files = []
+def _synth_sig_of(files):
     tot = 0
     for p in files:
         try:
@@ -837,38 +839,110 @@ def ensure_codex_synth(force=False):
             tot += st.st_size + int(st.st_mtime)
         except OSError:
             pass
-    sig = (SYNTH_SCHEMA, len(files), tot)
-    if force or _codex_ev_sig != sig:
-        rows = {}
-        for p in files:
+    return (SYNTH_SCHEMA, len(files), tot)
+
+def _cleanup_synth_tmps():
+    # F6a: remove stale candidates matching our own naming pattern only.
+    # Candidates currently being written in this process are spared.
+    try:
+        pat = CODEX_SYNTH.name + ".tmp."
+        for p in CODEX_SYNTH.parent.glob(pat + "*"):
+            if p.name in _synth_tmp_active:
+                continue
             try:
-                st = p.stat()
+                if p.is_file():
+                    p.unlink()
             except OSError:
-                continue
-            key = str(p)
-            old = _codex_ev_cache.get(key)
-            if (not force and old is not None and old[0] == st.st_size
-                    and old[1] == int(st.st_mtime)):
-                rows[key] = old
-                continue
-            rows[key] = (st.st_size, int(st.st_mtime), _parse_codex_events(p))
-        _codex_ev_cache = rows
-        _codex_ev_sig = sig
+                pass
+    except OSError:
+        pass
+
+def _synth_next_seq():
+    global _synth_tmp_seq
+    _synth_tmp_seq += 1
+    return _synth_tmp_seq
+
+def ensure_codex_synth(force=False):
+    # F5a/F6a: the candidate generation is parsed and written to a unique
+    # tmp file, then published by os.replace under _SYNTH_LOCK; only after a
+    # successful swap do the signature and parse cache become committed.
+    # Returns (path, error): error is None on success; a publish failure
+    # keeps the previous generation and returns its error; with no usable
+    # previous generation a RuntimeError states the source is unavailable.
+    # Readers are lock-free: os.replace yields a complete A or B snapshot.
+    # Lock scope is thread-level within this process (single instance).
+    global _codex_ev_cache, _codex_ev_sig, _codex_last_error, _codex_last_ok
+    _cleanup_synth_tmps()
+    try:
+        files = sorted(CODEX_DIR.rglob("rollout-*.jsonl")) if CODEX_DIR.is_dir() else []
+    except OSError:
+        files = []
+    sig = _synth_sig_of(files)
+    if not force and _codex_ev_sig == sig and CODEX_SYNTH.is_file():
+        _codex_last_error = None
+        return str(CODEX_SYNTH), None
+    rows = {}
+    for p in files:
         try:
-            with open(CODEX_SYNTH, "w", encoding="utf-8") as f:
-                for key in sorted(rows):
-                    for e in rows[key][2]:
-                        f.write(json.dumps({"at": e["at"], "model": e["model"],
-                            "provider": e["provider"], "status": None,
-                            "outcome": "unknown",
-                            "inputTokens": e["ti"], "cachedInputTokens": e["cache"],
-                            "outputTokens": e["to"], "totalTokens": e["total"],
-                            "reasoningTokens": e.get("reasoning", 0),
-                            "cacheWriteInputTokens": e.get("cache_write", 0),
-                            "durationMs": None}) + "\n")
+            st = p.stat()
+        except OSError:
+            continue
+        key = str(p)
+        old = _codex_ev_cache.get(key)
+        if (not force and old is not None and old[0] == st.st_size
+                and old[1] == int(st.st_mtime)):
+            rows[key] = old
+            continue
+        rows[key] = (st.st_size, int(st.st_mtime), _parse_codex_events(p))
+    tmp = CODEX_SYNTH.with_name(CODEX_SYNTH.name + ".tmp.%d.%d.%d" % (
+        os.getpid(), threading.get_ident(), _synth_next_seq()))
+    _synth_tmp_active.add(tmp.name)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            for key in sorted(rows):
+                for e in rows[key][2]:
+                    f.write(json.dumps({"at": e["at"], "model": e["model"],
+                        "provider": e["provider"], "status": None,
+                        "outcome": "unknown",
+                        "inputTokens": e["ti"], "cachedInputTokens": e["cache"],
+                        "outputTokens": e["to"], "totalTokens": e["total"],
+                        "reasoningTokens": e.get("reasoning", 0),
+                        "cacheWriteInputTokens": e.get("cache_write", 0),
+                        "durationMs": None}) + "\n")
+            f.flush()
+        with _SYNTH_LOCK:
+            superseded = False
+            if not force:
+                if _codex_ev_sig == sig:
+                    superseded = CODEX_SYNTH.is_file()
+                elif _synth_sig_of(files) != sig and CODEX_SYNTH.is_file():
+                    superseded = True
+            if superseded:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                _codex_last_error = None
+                return str(CODEX_SYNTH), None
+            os.replace(str(tmp), str(CODEX_SYNTH))
+            _codex_ev_cache = rows
+            _codex_ev_sig = sig
+            _codex_last_ok = str(CODEX_SYNTH)
+            _codex_last_error = None
+            return str(CODEX_SYNTH), None
+    except OSError as e:
+        try:
+            if tmp.exists():
+                tmp.unlink()
         except OSError:
             pass
-    return str(CODEX_SYNTH)
+        msg = "codex synth publish failed: %s: %s" % (type(e).__name__, e)
+        _codex_last_error = msg
+        if CODEX_SYNTH.is_file():
+            return str(CODEX_SYNTH), msg
+        raise RuntimeError(msg) from e
+    finally:
+        _synth_tmp_active.discard(tmp.name)
 
 def router_events_path(handler_events):
     try:
@@ -878,7 +952,8 @@ def router_events_path(handler_events):
                 return str(rp), False
     except OSError:
         pass
-    return ensure_codex_synth(), True
+    path, _err = ensure_codex_synth()
+    return path, True
 
 def query_stats(con):
     totals = dict(

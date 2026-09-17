@@ -211,7 +211,8 @@ class TestF4UnknownOutcomes(unittest.TestCase):
         self.addCleanup(lambda: _restore_codex_env(d, saved))
         (codex_dir / "rollout-f4t01.jsonl").write_text(
             _codex_rollout_text(), encoding="utf-8")
-        out = d.ensure_codex_synth(force=True)
+        out, synth_err = d.ensure_codex_synth(force=True)
+        self.assertIsNone(synth_err)
         rows = Path(out).read_text(encoding="utf-8").strip().splitlines()
         self.assertEqual(len(rows), 1)
         synth_rec = _json.loads(rows[0])
@@ -322,7 +323,8 @@ class TestF4UnknownOutcomes(unittest.TestCase):
         try:
             (codex_dir / "rollout-f4t05.jsonl").write_text(
                 _codex_rollout_text(), encoding="utf-8")
-            out = d.ensure_codex_synth(force=True)
+            out, synth_err = d.ensure_codex_synth(force=True)
+            self.assertIsNone(synth_err)
             s2 = d.query_router_stats(out, None, None, True)
             self.assertIsNone(s2["totals"].get("success_rate"),
                               msg=f"synth with 0 known must be N/A: {s2['totals']}")
@@ -405,7 +407,8 @@ class TestF4UnknownOutcomes(unittest.TestCase):
         self.addCleanup(lambda: _restore_codex_env(d, saved))
         (codex_dir / "rollout-f4t09.jsonl").write_text(
             _codex_rollout_text(), encoding="utf-8")
-        out = d.ensure_codex_synth(force=True)
+        out, synth_err = d.ensure_codex_synth(force=True)
+        self.assertIsNone(synth_err)
         raw = [_json.loads(l) for l in Path(out).read_text(encoding="utf-8").splitlines() if l.strip()]
         self.assertTrue(raw)
         for r in raw:

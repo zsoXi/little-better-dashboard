@@ -110,10 +110,10 @@ one row per single environment (`windows` or `linux`).
 | F6e-T04 | F6e | tests/test_inspector.py::TestF6eInspector::test_f6e_t04_query_count_not_linear | windows | core+release | PASS | artifacts/F6e-GREEN.windows.log |
 | F6e-T05 | F6e | tests/test_inspector.py::TestF6eInspector::test_f6e_t05_bad_inputs_controlled_no_injection | windows | core+release | PASS | artifacts/F6e-GREEN.windows.log |
 | F6e-T06 | F6e | tests/test_inspector.py::TestF6eInspector::test_f6e_t06_inspector_parallel_with_stats | windows | core+release | PASS | artifacts/F6e-GREEN.windows.log |
-| F6f-T01 | F6f | tests/test_inspector.py::TestInspector::test_inspector_display_helpers_pure | windows+linux | core+release | NOT_RUN | - |
-| F6f-T02 | F6f | tests/test_inspector.py::TestInspector::test_inspector_display_helpers_pure | windows+linux | core+release | NOT_RUN | - |
-| F6f-T03 | F6f | tests/test_inspector.py::TestInspector::test_inspector_display_helpers_pure | windows+linux | core+release | NOT_RUN | - |
-| F6f-T04 | F6f | tests/test_inspector.py::TestInspector::test_inspector_display_helpers_pure | windows+linux | core+release | NOT_RUN | - |
+| F6f-T01 | F6f | tests/test_cache_and_git.py::TestF6fGitCalls::test_f6f_t01_refreshes_before_ttl_bounded_subprocesses | windows | core+release | PASS | artifacts/F6f-GREEN.windows.log |
+| F6f-T02 | F6f | tests/test_cache_and_git.py::TestF6fGitCalls::test_f6f_t02_timeout_or_non_repo_readable_state | windows | core+release | PASS | artifacts/F6f-GREEN.windows.log |
+| F6f-T03 | F6f | tests/test_cache_and_git.py::TestF6fGitCalls::test_f6f_t03_head_change_visible_after_ttl | windows | core+release | PASS | artifacts/F6f-GREEN.windows.log |
+| F6f-T04 | F6f | tests/test_cache_and_git.py::TestF6fGitCalls::test_f6f_t04_special_paths_argv_no_shell | windows | core+release | PASS | artifacts/F6f-GREEN.windows.log |
 | F7-T01 | F7 | tests/test_commit_attribution.py::TestF7CommitWindows::test_f7_t01_two_commits_share_window_not_additive | windows | core+release | PASS | artifacts/F7-GREEN.windows.log |
 | F7-T02 | F7 | tests/test_commit_attribution.py::TestF7CommitWindows::test_f7_t02_two_repos_global_scope | windows | core+release | PASS | artifacts/F7-GREEN.windows.log |
 | F7-T03 | F7 | tests/test_commit_attribution.py::TestF7CommitWindows::test_f7_t03_window_boundaries_inclusive | windows | core+release | PASS | artifacts/F7-GREEN.windows.log |

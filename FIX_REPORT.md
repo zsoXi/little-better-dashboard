@@ -1157,3 +1157,249 @@ Contract: spec §7 (`F3: aktywnosc historyczna nie jest stanem wykonania agenta`
 - Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
   only own PIDs/threads handled; no repo files left dirty beyond the intended
   set.
+
+# FIX_REPORT — F6f per-worktree git TTL cache, bounded refresh calls (RED -> GREEN)
+
+## F6f-1. Repo, base, tested SHA, worktree, environment
+
+- Repo: `D:\TESTY!\V3\little-better-dashboard`, branch `fix/audit-f1-f8`;
+  start HEAD `d477410` (F6e reports; F6e code `bb0e629`).
+- Worktree: 2 files — `opencode_dashboard.py` (modified),
+  `tests/test_cache_and_git.py` (modified). A cosmetic stat-dirty flag on
+  `tests/test_synth_publish.py` (external deletion incident, content proven
+  equal) is never staged; `HANDOFF.md` stays untracked.
+- Tested hashes: `opencode_dashboard.py`
+  `sha256:ae3991d6dab251bab27293dae6ac35ee7923ba2b7ee04b721fa717aa4b815068`;
+  `tests/test_cache_and_git.py`
+  `sha256:0806586ae638c38df6c72d2ac5ce17f4e2feb3203da5ab0ae06d17349cfc0737`.
+- Environment: Windows, `python` 3.14.3. Test servers `127.0.0.1:0` only
+  (never 8765/8766/8770); fixtures in temp dirs with isolated
+  HOME/USERPROFILE/LOCALAPPDATA.
+
+## F6f-2. Change (TODO -> REPRODUCED -> PATCHED -> VERIFIED -> DONE)
+
+- Contract: spec §17 — separate SQLite freshness from expensive git reads;
+  per-worktree TTL cache (~10 s) shared between parallel requests; every git
+  subprocess gets a timeout and a safe stale/unavailable fallback; argv
+  lists, no shell; no disk scans; no remote fetch.
+- REPRODUCED (RED): `artifacts/F6f-RED.windows.log` —
+  `python -m unittest tests.test_cache_and_git -v` -> Ran 17, FAILED
+  (failures=2, errors=1).
+- PATCHED: constants `GIT_TTL_SECONDS = 10.0`, `_GIT_LOCK`, `_HEADS_CACHE`,
+  `_COMMITS_CACHE`. `repo_heads(worktrees, force=False)` and
+  `collect_repo_commits(worktrees, per_repo=...)` are now served by
+  per-worktree entries `{head|commits, at, state}` refreshed under the shared
+  lock (double-checked): inside the TTL repeated refreshes spawn zero git
+  subprocesses; after the TTL a HEAD change flows into both the local and
+  router fingerprints, so panels update without a SQLite change and are
+  never frozen. `git rev-parse HEAD` keeps its 5 s timeout and
+  `git log --numstat` its 15 s timeout; on timeout/failure the last known
+  value is kept with state `stale` (`unavailable` when there is none) and
+  nothing raises. Invocations remain argv lists (no shell, no string
+  commands built from project names), only the known worktree set from the
+  project table is used, and no remote git operation is performed.
+- VERIFIED: `python -m unittest tests.test_cache_and_git -v` -> Ran 17, OK;
+  `python -m unittest discover -s tests` -> Ran 141, OK (118.1 s);
+  `py_compile` OK. Logs: `artifacts/F6f-GREEN.windows.log`. Jev gate
+  (jev-1.13.0, diff 15 407 chars): round 1 `touches_local_path` 0.13 LOW /
+  `per_worktree_ttl_cache_shared` 0.96 /
+  `bounded_subprocess_per_refresh` 0.49 / `timeout_safe_stale_fallback` 0.92 /
+  `argv_list_no_shell` 0.97 / `no_disk_scan_no_remote_fetch` 0.94; round 2
+  with the sharpened wording (subprocesses counted, not function calls)
+  `touches_local_path` 0.14 LOW / `bounded_subprocess_per_refresh` 0.87 and
+  the rest 0.96/0.92/0.97/0.93.
+- Matrix: F6f-T01..T04 rows -> real test IDs, env `windows`, PASS, evidence
+  `artifacts/F6f-GREEN.windows.log`.
+- Retries: none of note — single patch pass, green on the first run; one Jev
+  re-round for the ambiguous subprocess-count question.
+
+## F6f-3. Not changed (verified)
+
+- Local session-stats path untouched: `day_total`/`dayTotal`/`outMerged`,
+  token SUM SQL, cache-rate math unchanged (Jev `touches_local_path` 0.14
+  changed-lines-only; F1/F3/F4 suites unchanged).
+- User git repositories and history untouched; only read-only plumbing
+  (`rev-parse`, `log`) runs, never `fetch`/`pull` and never with shell
+  interpretation (paths with spaces/Unicode kept as single argv elements,
+  F6f-T04).
+- No disk scanning for repositories; only the worktree set already present in
+  the project table is consulted.
+- TTL stays 10 s (not inflated to hide cost); degraded git shows a readable
+  stale/unavailable state while tokens and the other sources keep working
+  (F6f-T02); the commit panel refreshes after the TTL (F6f-T03).
+
+## F6f-4. Verify gate outcome
+
+- `python tools/verify_acceptance.py --gate core --report artifacts/TEST_REPORT.json`
+  -> FAIL (expected/honest, exit 1): `artifacts/TEST_REPORT.json` is still
+  F1-era (F2..INT rows missing; report hash `sha256:ce11d08f...` != current
+  dashboard hash) -> same honest "GATE CORE FAILED (132 problem(s))" count as
+  the prior steps; the report is rebuilt at the F8-close step.
+  Log: `artifacts/F6f-verify-core.windows.log`.
+- Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
+  only own PIDs/threads handled; no repo files left dirty beyond the intended
+  set.
+
+# FIX_REPORT — F6f per-worktree git TTL cache, bounded refresh calls (RED -> GREEN)
+
+## F6f-1. Repo, base, tested SHA, worktree, environment
+
+- Repo: `D:\TESTY!\V3\little-better-dashboard`, branch `fix/audit-f1-f8`;
+  start HEAD `d477410` (F6e reports; F6e code `bb0e629`).
+- Worktree: 2 files — `opencode_dashboard.py` (modified),
+  `tests/test_cache_and_git.py` (modified). A cosmetic stat-dirty flag on
+  `tests/test_synth_publish.py` (external deletion incident, content proven
+  equal) is never staged; `HANDOFF.md` stays untracked.
+- Tested hashes: `opencode_dashboard.py`
+  `sha256:ae3991d6dab251bab27293dae6ac35ee7923ba2b7ee04b721fa717aa4b815068`;
+  `tests/test_cache_and_git.py`
+  `sha256:0806586ae638c38df6c72d2ac5ce17f4e2feb3203da5ab0ae06d17349cfc0737`.
+- Environment: Windows, `python` 3.14.3. Test servers `127.0.0.1:0` only
+  (never 8765/8766/8770); fixtures in temp dirs with isolated
+  HOME/USERPROFILE/LOCALAPPDATA.
+
+## F6f-2. Change (TODO -> REPRODUCED -> PATCHED -> VERIFIED -> DONE)
+
+- Contract: spec §17 — control expensive git calls on refresh: separate
+  SQLite freshness from git reads, per-worktree TTL cache shared between
+  parallel requests, timeout + stale fallback per subprocess, argv lists
+  (no shell), known worktree set only, HEAD visible after the TTL, no
+  remote fetch.
+- REPRODUCED (RED): `artifacts/F6f-RED.windows.log` —
+  `python -m unittest tests.test_cache_and_git -v` -> Ran 17, FAILED
+  (failures=2, errors=1).
+- PATCHED: `GIT_TTL_SECONDS = 10.0`, `_GIT_LOCK = threading.Lock()`,
+  `_HEADS_CACHE = {}`, `_COMMITS_CACHE = {}`; `_head_for(wt, now, force)`
+  and `_commits_for(name, wt, per_repo, now, force)` refresh under the lock
+  with double-checked freshness and keep `{"head"/"commits", "at", "state"}`
+  entries (`ok` / `stale` / `unavailable`). `repo_heads(worktrees)` and
+  `collect_repo_commits(worktrees)` are served from those caches, so
+  `cached_local_stats` and `cached_router_stats` fingerprints stop spawning
+  one git subprocess per worktree per request while a HEAD change still
+  flows into the fingerprint after the TTL. Every git call stays an argv
+  list with a timeout (5 s rev-parse, 15 s log), failures keep the last
+  value with the stale state and never raise; no disk scanning, no remote
+  fetch.
+- VERIFIED: `python -m unittest tests.test_cache_and_git -v` -> Ran 17, OK;
+  `python -m unittest discover -s tests` -> Ran 141, OK (118.1 s);
+  `py_compile` OK. Logs: `artifacts/F6f-GREEN.windows.log`. Jev gate
+  (jev-1.13.0, diff 15 407 chars): round 1 `touches_local_path` 0.13 LOW /
+  `per_worktree_ttl_cache_shared` 0.96 / `bounded_subprocess_per_refresh`
+  0.49 / `timeout_safe_stale_fallback` 0.92 / `argv_list_no_shell` 0.97 /
+  `no_disk_scan_no_remote_fetch` 0.94; round 2 with the wording sharpened
+  (the fingerprint still calls `repo_heads`, but the cache is what bounds
+  subprocesses) `touches_local_path` 0.14 LOW and
+  `bounded_subprocess_per_refresh` 0.87.
+- Matrix: F6f-T01..T04 rows -> real test IDs, env `windows`, PASS, evidence
+  `artifacts/F6f-GREEN.windows.log`.
+- Retries: one Jev wording round; otherwise RED captured, single patch
+  pass, GREEN on the first run.
+
+## F6f-3. Not changed (verified)
+
+- Local session-stats token formula, SQL and cache-rate math unchanged
+  (Jev `touches_local_path` 0.14 LOW, changed-lines-only; F1/F3/F4 suites
+  unchanged).
+- Git history and user repositories untouched; no write operations at all:
+  `rev-parse`/`log` only, argv lists, no `shell=True`, no quoting issues
+  (F6f-T04 covers spaces and Unicode).
+- No disk-wide repository scanning and no `git fetch`/`pull` anywhere in
+  the display path; only the known worktree set from the project table is
+  consulted.
+- TTL stays a bounded 10 s (not inflated); the commit panel updates after
+  the TTL without a SQLite change (F6f-T03); git being slow or absent
+  degrades to the previous data with a stale/unavailable state (F6f-T02).
+
+## F6f-4. Verify gate outcome
+
+- `python tools/verify_acceptance.py --gate core --report artifacts/TEST_REPORT.json`
+  -> FAIL (expected/honest, exit 1): `artifacts/TEST_REPORT.json` is still
+  F1-era (F2..INT rows missing; report hash `sha256:ce11d08f...` != current
+  dashboard hash) -> same honest "GATE CORE FAILED (132 problem(s))" count as
+  the prior steps; the report is rebuilt at the F8-close step.
+  Log: `artifacts/F6f-verify-core.windows.log`.
+- Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
+  only own PIDs/threads handled; no repo files left dirty beyond the intended
+  set.
+
+# FIX_REPORT — F6f per-worktree git TTL cache, bounded refresh calls (RED -> GREEN)
+
+## F6f-1. Repo, base, tested SHA, worktree, environment
+
+- Repo: `D:\TESTY!\V3\little-better-dashboard`, branch `fix/audit-f1-f8`;
+  start HEAD `d477410` (F6e reports; F6e code `bb0e629`).
+- Worktree: 2 files — `opencode_dashboard.py` (modified),
+  `tests/test_cache_and_git.py` (modified). A cosmetic stat-dirty flag on
+  `tests/test_synth_publish.py` (external deletion incident, content proven
+  equal) is never staged; `HANDOFF.md` stays untracked.
+- Tested hashes: `opencode_dashboard.py`
+  `sha256:ae3991d6dab251bab27293dae6ac35ee7923ba2b7ee04b721fa717aa4b815068`;
+  `tests/test_cache_and_git.py`
+  `sha256:0806586ae638c38df6c72d2ac5ce17f4e2feb3203da5ab0ae06d17349cfc0737`.
+- Environment: Windows, `python` 3.14.3. Test servers `127.0.0.1:0` only
+  (never 8765/8766/8770); synthetic git repos in temp dirs with isolated
+  HOME/USERPROFILE/LOCALAPPDATA.
+
+## F6f-2. Change (TODO -> REPRODUCED -> PATCHED -> VERIFIED -> DONE)
+
+- Contract: spec §17 — separate SQLite freshness from expensive git reads;
+  per-worktree TTL cache shared by parallel requests; every git subprocess
+  timed with a stale/unavailable fallback; argv lists only; no disk scan,
+  no remote fetch; HEAD changes visible after the TTL.
+- REPRODUCED (RED): `artifacts/F6f-RED.windows.log` —
+  `python -m unittest tests.test_cache_and_git -v` -> Ran 17, FAILED
+  (failures=2, errors=1).
+- PATCHED: `GIT_TTL_SECONDS = 10.0`, `_GIT_LOCK = threading.Lock()`,
+  `_HEADS_CACHE = {}`, `_COMMITS_CACHE = {}`. `_head_for(wt, now,
+  force=False)` and `_commits_for(name, wt, per_repo, now, force=False)`
+  double-check freshness under the lock: inside the TTL the cached value is
+  returned without touching git; outside it one subprocess refreshes
+  `git -C <wt> rev-parse HEAD` (timeout 5) or `git log -nN ... --numstat`
+  (timeout 15). Failures/timeouts keep the previous value with state
+  `stale` (or `unavailable` without a previous value) and never raise;
+  `repo_heads(worktrees, force=False)` and `collect_repo_commits(...)` now
+  serve from these caches, so the `cached_local_stats` and
+  `cached_router_stats` fingerprints stay cheap while a HEAD change still
+  invalidates them after the TTL. Argv lists only, no shell, no disk scan,
+  no remote fetch.
+- VERIFIED: `python -m unittest tests.test_cache_and_git -v` -> Ran 17, OK;
+  `python -m unittest discover -s tests` -> Ran 141, OK (118.1 s);
+  `py_compile` OK. Logs: `artifacts/F6f-GREEN.windows.log`. Jev gate
+  (jev-1.13.0, diff 15 407 chars): round 1 `touches_local_path` 0.13 LOW /
+  `per_worktree_ttl_cache_shared` 0.96 /
+  `bounded_subprocess_per_refresh` 0.49 (ambiguous wording) /
+  `timeout_safe_stale_fallback` 0.92 / `argv_list_no_shell` 0.97 /
+  `no_disk_scan_no_remote_fetch` 0.94; round 2 (sharpened:
+  "count spawned subprocesses, not function calls") `touches_local_path`
+  0.14 LOW, `bounded_subprocess_per_refresh` 0.87, others unchanged
+  (0.96/0.92/0.97/0.93).
+- Matrix: F6f-T01..T04 rows -> real test IDs, env `windows`, PASS, evidence
+  `artifacts/F6f-GREEN.windows.log`.
+- Retries: none of note — RED captured, single patch pass, GREEN on the
+  first run; one Jev re-round with sharper question wording.
+
+## F6f-3. Not changed (verified)
+
+- Local session-stats path untouched: `day_total`/`dayTotal`/`outMerged`,
+  token SUM SQL, cache-rate math unchanged (Jev `touches_local_path` 0.13
+  changed-lines-only; F1/F3/F4 suites unchanged).
+- No git history or user repos are modified; the dashboard only reads
+  HEAD/commits via argv lists with timeouts; no shell interpretation even
+  for paths with spaces/Unicode (`repo späce & $HOME ! (x)`, F6f-T04).
+- No disk-wide repository scanning (only the project table's worktree set),
+  no remote `git fetch`/`pull`, and the TTL stays a constant 10 s — not
+  inflated to hide cost.
+- Degraded git behaves readably: stale heads/commits are served with their
+  state while tokens and other sources keep working (F6f-T02).
+
+## F6f-4. Verify gate outcome
+
+- `python tools/verify_acceptance.py --gate core --report artifacts/TEST_REPORT.json`
+  -> FAIL (expected/honest, exit 1): `artifacts/TEST_REPORT.json` is still
+  F1-era (F2..INT rows missing; report hash `sha256:ce11d08f...` != current
+  dashboard hash) -> same honest "GATE CORE FAILED (132 problem(s))" count as
+  the prior steps; the report is rebuilt at the F8-close step.
+  Log: `artifacts/F6f-verify-core.windows.log`.
+- Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
+  only own PIDs/threads handled; no repo files left dirty beyond the intended
+  set.

@@ -1361,7 +1361,7 @@ def query_stats(con):
         if agents else "",
         f"Top subsystem: {subsys_rows[0][0]}, {subsys_rows[0][1]:,.0f} tokens across {subsys_rows[0][2]} sessions."
         if subsys_rows else "",
-        f"Priciest commit: “{(commit_rows[0][1] or '')[:60]}”, {commit_rows[0][7]:,.0f} tokens in the prior 24h."
+        f"Most usage before a commit: “{(commit_rows[0][1] or '')[:60]}”, {commit_rows[0][7]:,.0f} tokens in the 24h window (not commit cost)."
         if commit_rows and commit_rows[0][7] else "",
         f"Longest session: “{longest['title']}”, {fmt_dur_min(longest['mins'])}."
         if longest else "",
@@ -1398,6 +1398,7 @@ def query_stats(con):
         "subsystems": subsys_rows,
         "file_subsys": file_subsys,
         "commits": commit_rows,
+        "commit_windows": {"method": "time_window", "window_hours": COMMIT_WINDOW_HOURS, "scope": "project_time_window", "overlap_possible": True, "additive": False, "note": "Project-matched time window; windows overlap; rows must not be summed; not commit cost."},
         "session_files": session_files,
         "commit_sessions": commit_sessions,
         "days": day_entries,
@@ -2033,6 +2034,7 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         "days": day_entries,
         "hours": [hour_reqs.get(h, 0) for h in range(24)],
         "commits": r_commit_rows,
+        "commit_windows": {"method": "time_window", "window_hours": COMMIT_WINDOW_HOURS, "scope": "global", "overlap_possible": True, "additive": False, "note": "Global time window; may include other projects. Windows overlap. Rows must not be summed."},
         "activity": activity,
         "requests": recent,
         "rate_limits": limits,
@@ -2081,6 +2083,7 @@ def blank_router_stats(error=None):
         "days": [],
         "hours": [0] * 24,
         "commits": [],
+        "commit_windows": {"method": "time_window", "window_hours": COMMIT_WINDOW_HOURS, "scope": "global", "overlap_possible": True, "additive": False, "note": "Global time window; may include other projects. Windows overlap. Rows must not be summed."},
         "activity": zero_days_window(),
         "requests": [],
         "rate_limits": {},
@@ -2495,6 +2498,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       <div class="expmenu" id="expmenu">
         <button data-x="json">JSON <small>full stats payload</small></button>
         <button data-x="csv">CSV <small>per-day usage table</small></button>
+        <button data-x="csvc">CSV <small>commit windows · not additive</small></button>
       </div></span>
     <button class="tbtn" id="refresh">⟳ Refresh</button>
   </div>
@@ -2549,12 +2553,13 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       <div id="file-chart" class="crows"></div>
     </div>
     <div class="card chart-card">
-      <div class="ctitle">Tokens per commit <small id="commit-sub">prior 24h sessions · click to filter</small></div>
+      <div class="ctitle">Usage in the 24h before each commit <small id="commit-sub">project-matched window · not additive · click to filter</small></div>
       <div class="presets" style="margin:0 0 10px" role="group" aria-label="Commit order">
         <button class="pbtn active" data-cs="toks">By tokens</button>
         <button class="pbtn" data-cs="recent">Recent</button>
       </div>
       <div id="commit-chart" class="crows"></div>
+      <div class="hint" id="commit-note">Project-matched time window; windows overlap; rows must not be summed; not commit cost.</div>
     </div>
   </div>
 
@@ -2681,12 +2686,13 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       <div id="r-file-chart" class="crows"></div>
     </div>
     <div class="card chart-card">
-      <div class="ctitle">Tokens per commit <small id="r-commit-sub">prior 24h requests · time-matched</small></div>
+      <div class="ctitle">Usage in the 24h before each commit <small id="r-commit-sub">global window · not additive · time-matched</small></div>
       <div class="presets" style="margin:0 0 10px" role="group" aria-label="Commit order">
         <button class="pbtn active" data-rcs="toks">By tokens</button>
         <button class="pbtn" data-rcs="recent">Recent</button>
       </div>
       <div id="r-commit-chart" class="crows"></div>
+      <div class="hint" id="r-commit-note">Global time window; may include other projects. Windows overlap. Rows must not be summed.</div>
     </div>
   </div>
 
@@ -2951,7 +2957,7 @@ function renderCommitChart(){
   const el=$('commit-chart');if(!el)return;
   const rows=commitRows();
   const sub=$('commit-sub');
-  if(sub)sub.textContent='prior 24h sessions · click to filter';
+  if(sub)sub.textContent='project-matched window · not additive · click to filter';
   if(!rows.length){el.innerHTML='<div class="empty">No git commits found in tracked worktrees.</div>';return;}
   const t=T();
   const max=Math.max(...rows.map(r=>r[7]||0),1);
@@ -2961,7 +2967,7 @@ function renderCommitChart(){
     const tip='<b>'+ESC(msg)+'</b><span class=\'trow\'><span>SHA</span><b>'+ESC(sha.slice(0,12))+'</b></span>'+
       '<span class=\'trow\'><span>Date · project</span><b>'+date+' · '+ESC(proj)+'</b></span>'+
       '<span class=\'trow\'><span>Changed</span><b>'+nf+' files · +'+F(add)+' / -'+F(del)+'</b></span>'+
-      '<span class=\'trow\'><span>Tokens (prior 24h)</span><b>'+FN(toks)+' · '+ns+' sessions</b></span>';
+      '<span class=\'trow\'><span>Usage in the 24h before commit</span><b>'+FN(toks)+' · '+ns+' sessions</b></span>';
     return '<div class="model-row clickable'+(FSTATE.commit===sha?' active':'')+'" data-f="commit|'+sha+'" data-tip="'+tip+'">'+
       '<div><div class="mn">'+ESC(msg.length>44?msg.slice(0,44)+'…':msg)+'</div>'+
       '<div class="ms">'+sha.slice(0,7)+' · '+date+' · '+ESC(proj)+' · +'+F(add)+'/-'+F(del)+'</div></div>'+
@@ -3460,7 +3466,7 @@ function renderRouterCommitChart(){
   const el=$('r-commit-chart');if(!el)return;
   const rows=rCommitRows();
   const sub=$('r-commit-sub');
-  if(sub)sub.textContent='prior 24h requests · time-matched';
+  if(sub)sub.textContent='global window · not additive · time-matched';
   if(!rows.length){el.innerHTML='<div class="empty">No git commits found in tracked worktrees.</div>';return;}
   const t=T();
   const max=Math.max(...rows.map(r=>r[7]||0),1);
@@ -3470,7 +3476,8 @@ function renderRouterCommitChart(){
     const tip='<b>'+ESC(msg)+'</b><span class=\'trow\'><span>SHA</span><b>'+ESC(sha.slice(0,12))+'</b></span>'+
       '<span class=\'trow\'><span>Date · project</span><b>'+date+' · '+ESC(proj)+'</b></span>'+
       '<span class=\'trow\'><span>Changed</span><b>'+nf+' files · +'+F(add)+' / -'+F(del)+'</b></span>'+
-      '<span class=\'trow\'><span>Tokens (prior 24h)</span><b>'+FN(toks)+' · '+nq+' requests</b></span>';
+      '<span class=\'trow\'><span>Usage in the 24h before commit</span><b>'+FN(toks)+' · '+nq+' requests</b></span>'+
+      '<span class=\'trow\'><span>Scope</span><b>global window · windows overlap · not additive</b></span>';
     return '<div class="model-row" data-tip="'+tip+'">'+
       '<div><div class="mn">'+ESC(msg.length>44?msg.slice(0,44)+'…':msg)+'</div>'+
       '<div class="ms">'+sha.slice(0,7)+' · '+date+' · '+ESC(proj)+' · +'+F(add)+'/-'+F(del)+'</div></div>'+
@@ -3851,6 +3858,14 @@ function exportData(kind){
   if(kind==='json'){
     const b=new Blob([JSON.stringify(isR?R:S,null,2)],{type:'application/json'});
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=isR?'codex-tokens.json':'opencode-tokens.json';a.click();
+  }else if(kind==='csvc'){
+    const rows=(isR?(R.commits||[]):(S.commits||[]));
+    const meta=((isR?R:S).commit_windows)||{};
+    const head=['sha','subject','date','project','files','add','del','window_tokens','window_events','method','scope','overlap_possible','additive','window_hours','note'];
+    const q=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"';
+    const lines=[head.join(',')].concat(rows.map(r=>r.slice(0,9).join(',')+','+[meta.method||'',meta.scope||'',meta.overlap_possible===undefined?'':meta.overlap_possible,meta.additive===undefined?'':meta.additive,meta.window_hours==null?'':meta.window_hours,meta.note||''].map(q).join(',')));
+    const b=new Blob([lines.join('\n')],{type:'text/csv'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=isR?'codex-tokens-commits.csv':'opencode-tokens-commits.csv';a.click();
   }else if(isR){
     const rows=rPeriodDays();
     const head=['date','requests','ok','errors','unknown','tokens_in','tokens_out','tokens_cache','tokens_total','what_if_cost'];

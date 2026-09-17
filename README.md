@@ -64,6 +64,7 @@ It makes no network calls, collects no telemetry and needs no accounts.
 - The first start can take up to a minute on large databases while SQLite warms up.
 - Agent tiles group workers under their leads by filename convention (`tl-1`, `tl-1-w1`, and so on).
 - Child-session activity comes from session update recency (recent up to 2 minutes, no recent activity up to 15 minutes, older beyond; unknown when the timestamp is missing or uninterpretable). It is not agent execution status, and a parent_id link is a session relation, not proof of delegation.
+- "Usage in the 24h before each commit" covers a 24-hour window that is inclusive on both ends. On the Codex tab that window is global and may include other projects; windows overlap, so commit rows must not be summed.
 
 ## Project layout
 

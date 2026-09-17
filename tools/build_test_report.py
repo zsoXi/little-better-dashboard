@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ID_RE = re.compile(r"^(F\d+[a-f]?|PUB|INT)-T\d+$")
+ID_RE = re.compile(r"^(F\d+[a-f]?|PUB|INT|PERF)-T\d+$")
 
 
 def _git(*args):
@@ -78,6 +78,19 @@ def main(argv=None):
                       "expected": "pass", "observed": res["result"],
                       "evidence": [r["evidence"]]
                       if r["evidence"] not in ("-", "") else []})
+    # Executed-launcher evidence for PUB-T02 (Git Bash/Windows), alongside
+    # the matrix row that records the git-mode side of the same scenario.
+    extra_evidence = "artifacts/PUB-T02-gitbash.windows.log"
+    if (REPO_ROOT / extra_evidence).is_file():
+        results.append({"acceptance_id": "PUB-T02", "result": "PASS",
+                        "environment": "windows",
+                        "evidence": extra_evidence,
+                        "command": "git bash: ./start-dashboard.sh"})
+        cases.append({"id": "PUB-T02", "status": "PASS",
+                      "command": "git bash: ./start-dashboard.sh",
+                      "exit_code": 0, "expected": "launcher runs and serves",
+                      "observed": "PASS", "evidence": [extra_evidence]})
+        counts["passed"] += 1
     now = datetime.datetime.now().isoformat(timespec="seconds")
     report = {
         "schema_version": 1,

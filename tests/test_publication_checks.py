@@ -133,6 +133,146 @@ class TestPublicationChecks(unittest.TestCase):
         st = _git("status", "--porcelain")
         self.assertNotIn("?? ..", st.stdout)
 
+    def test_pub_t02b_gitbash_launcher_run(self):
+        """Real direct launcher run in the available shell (Git Bash/Win)."""
+        import http.client
+        import threading
+        import time as _time
+        bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+        if not bash.is_file():
+            self.skipTest("Git Bash not available for the launcher run")
+        tmp = Path(tempfile.mkdtemp(prefix="pub-t02b-")) / "git bash !(x) ünïcode"
+        self.addCleanup(shutil.rmtree, str(tmp.parent), True)
+        tmp.mkdir(parents=True)
+        shutil.copyfile(REPO_ROOT / "start-dashboard.sh", tmp / "start-dashboard.sh")
+        shutil.copyfile(REPO_ROOT / "opencode_dashboard.py", tmp / "opencode_dashboard.py")
+        home = tmp / "home"
+        home.mkdir()
+        userbase = tmp / "userbase"
+        userbase.mkdir()
+        (userbase / "usercustomize.py").write_text(
+            "try:\n"
+            "    import webbrowser\n"
+            "    webbrowser.open = lambda *a, **k: True\n"
+            "    webbrowser.open_new = lambda *a, **k: True\n"
+            "    webbrowser.open_new_tab = lambda *a, **k: True\n"
+            "except Exception:\n"
+            "    pass\n", encoding="utf-8")
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["USERPROFILE"] = str(home)
+        env["LOCALAPPDATA"] = str(home)
+        env["PYTHONUSERBASE"] = str(userbase)
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        unix_dir = str(tmp).replace("\\", "/")
+        pre = subprocess.run([str(bash), "-lc", "python3 --version"],
+                             capture_output=True, text=True, timeout=60,
+                             env=env)
+        if pre.returncode != 0:
+            self.skipTest("Git Bash has no python3: %r"
+                          % ((pre.stderr or pre.stdout) or "")[:200])
+        command = "cd \"%s\" && ./start-dashboard.sh --quiet --port 0" % unix_dir
+        proc = subprocess.Popen(
+            [str(bash), "-lc", command], stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+            errors="replace", env=env, cwd=str(tmp))
+        lines = []
+        port = None
+        token = None
+        import queue
+        q = queue.Queue()
+
+        def _reader():
+            try:
+                for raw in proc.stdout:
+                    q.put(raw.rstrip("\n"))
+            except Exception:
+                pass
+            q.put(None)
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+        try:
+            deadline = _time.time() + 40
+            while _time.time() < deadline:
+                try:
+                    line = q.get(timeout=1.0)
+                except queue.Empty:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                if line is None:
+                    break
+                lines.append(line)
+                m = re.search(r"127\.0\.0\.1:(\d+)", line)
+                if m:
+                    port = int(m.group(1))
+                mt = re.search(r"#token=([A-Za-z0-9_\-]+)", line)
+                if mt:
+                    token = mt.group(1)
+                if port and token:
+                    break
+            self.assertIsNotNone(port, "launcher must print the real URL: %r"
+                                 % lines[-5:])
+            self.assertIsNotNone(token, "launcher must print a token link")
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("GET", "/")
+            r = conn.getresponse()
+            public_status = r.status
+            r.read()
+            conn.close()
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("GET", "/api/stats", headers={
+                "Authorization": "Bearer " + token, "X-Window-Id": "gbtab"})
+            r = conn.getresponse()
+            auth_status = r.status
+            body = r.read()
+            conn.close()
+            self.assertTrue(body)
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("GET", "/api/stats", headers={"X-Window-Id": "gbtab"})
+            r = conn.getresponse()
+            anon_status = r.status
+            r.read()
+            conn.close()
+            self.assertEqual(public_status, 200)
+            self.assertEqual(auth_status, 200)
+            self.assertEqual(anon_status, 401)
+            log = REPO_ROOT / "artifacts" / "PUB-T02-gitbash.windows.log"
+            log.parent.mkdir(exist_ok=True)
+            log.write_text(
+                "environment=GitBash-Windows (not Linux, not macOS)\n"
+                "bash=%s\n"
+                "command=%s\n"
+                "instrumentation=PYTHONUSERBASE usercustomize silences "
+                "webbrowser.open only; PYTHONUNBUFFERED=1 and "
+                "PYTHONIOENCODING=utf-8 only make the real launcher flush its "
+                "stdout to the capturing pipe; real launcher, real runtime, "
+                "real HTTP\n"
+                "port=%d\n"
+                "GET / -> %d\n"
+                "GET /api/stats (Bearer, redacted) -> %d\n"
+                "GET /api/stats (no token) -> %d\n"
+                "launcher-run=gitbash-executed\n"
+                % (bash, command, port, public_status, auth_status,
+                   anon_status), encoding="utf-8")
+        finally:
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("POST", "/api/close?wid=gbtab", headers={
+                    "Authorization": "Bearer " + (token or ""),
+                    "X-Window-Id": "gbtab"})
+                conn.getresponse().read()
+                conn.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=15)
+            except Exception:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                               capture_output=True, timeout=30)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -61,8 +61,16 @@ runner headless on Ubuntu (the `browser` job in
 ## Benchmarks
 
 ```powershell
-python tools/benchmark_dashboard.py --scenario ci
+python tools/benchmark_dashboard.py --scenario ci      # deterministic small (10k) + large (100k)
+python tools/benchmark_dashboard.py --scenario small
 ```
 
-The performance measurements required by spec section 22 are still pending;
-this command honestly reports NOT_IMPLEMENTED and exits 2.
+The runner generates deterministic synthetic fixtures (fixed seed 20260917),
+extracts the baseline runtime with `git show df23258:opencode_dashboard.py`
+and measures both runtimes on identical data: cold/warm refresh time, bytes
+actually read (raw vs derived), parser calls, git subprocess calls around the
+TTL window, restart/checkpoint behaviour, rotation correctness against an
+independent oracle and `tracemalloc` tracked memory. Raw samples and the
+summary land in `artifacts/performance/`; the per-ID evidence logs are
+`artifacts/PERF-T01..T06.windows.log`. No speed promises are made - the
+acceptance is bounded reads and explicit correctness checks.

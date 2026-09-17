@@ -52,7 +52,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MATRIX = REPO_ROOT / "docs" / "ACCEPTANCE_MATRIX.md"
 DEFAULT_CODE = REPO_ROOT / "opencode_dashboard.py"
 
-ID_RE = re.compile(r"^(F\d+[a-f]?|PUB|INT)-T\d+$")
+ID_RE = re.compile(r"^(F\d+[a-f]?|PUB|INT|PERF)-T\d+$")
 
 
 def canonical_ids():
@@ -63,7 +63,7 @@ def canonical_ids():
         ("F6a", 8), ("F6b", 8), ("F6c", 10), ("F6d", 10),
         ("F6e", 6), ("F6f", 4),
         ("F7", 6), ("F8", 6),
-        ("PUB", 7), ("INT", 12),
+        ("PUB", 7), ("INT", 12), ("PERF", 6),
     ]
     ids = []
     for fam, n in families:
@@ -335,6 +335,56 @@ def main(argv=None):
         print("(6) OK: no PASS rests on workflow-file presence alone.")
     else:
         print("(6) FAIL: CI presence used as execution.")
+
+    # (7) PUB-T02: the executable mode alone does not prove the launcher ran;
+    # one PASS entry must carry the executed-launcher marker in its evidence.
+    launcher_ok = False
+    if "PUB-T02" in mandatory_ids:
+        marker = "launcher-run=gitbash-executed"
+        for e in by_id.get("PUB-T02", []):
+            if str(e.get("result", "")).strip().upper() != "PASS":
+                continue
+            ev = str(e.get("evidence", "")).strip()
+            if not ev or ev in ("-", "TBD", "N/A"):
+                continue
+            ev_path = (REPO_ROOT / ev) if not Path(ev).is_absolute() else Path(ev)
+            try:
+                if ev_path.is_file() and marker in ev_path.read_text(
+                        encoding="utf-8", errors="replace"):
+                    launcher_ok = True
+                    break
+            except OSError:
+                continue
+        if not launcher_ok:
+            failures.append(
+                "(7) PUB-T02: no PASS entry proves an executed launcher run "
+                "(marker 'launcher-run=gitbash-executed' absent); the "
+                "executable mode alone does not satisfy the launcher scenario."
+            )
+            print("(7) FAIL: PUB-T02 executed-launcher evidence missing.")
+        else:
+            print("(7) OK: PUB-T02 executed-launcher marker present.")
+    else:
+        print("(7) OK: PUB-T02 not mandatory for this gate.")
+
+    # (8) The result environment must match the matrix requirement.
+    match_ok = True
+    for aid in mandatory_ids:
+        row_env = str(matrix[aid].get("required_environment", "")).strip().lower()
+        if row_env not in ("windows", "linux"):
+            continue
+        for e in by_id.get(aid, []):
+            env = str(e.get("environment", "")).strip().lower()
+            if env in ("windows", "linux") and env != row_env:
+                failures.append(
+                    f"(8) {aid}: report environment '{env}' does not match "
+                    f"the matrix requirement '{row_env}'."
+                )
+                match_ok = False
+    if match_ok:
+        print("(8) OK: report environments match the matrix requirements.")
+    else:
+        print("(8) FAIL: environment mismatch between matrix and report.")
 
     if failures:
         print(f"\nGATE {args.gate.upper()} FAILED ({len(failures)} problem(s)):")

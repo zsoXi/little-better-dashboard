@@ -145,3 +145,9 @@ one row per single environment (`windows` or `linux`).
 | INT-T10 | INT | tests/test_integration.py::TestIntIntegration::test_int_t10_real_router_replaces_synthesis | windows | core+release | PASS | artifacts/INT-GREEN.windows.log |
 | INT-T11 | INT | tests/test_codex_incremental.py::TestF6cIncrementalRead::test_f6c_t08_restart_uses_valid_checkpoint | windows | core+release | PASS | artifacts/F6c-GREEN.windows.log |
 | INT-T12 | INT | tests/test_integration.py::TestIntIntegration::test_int_t12_clean_checkout_quick_start | windows | core+release | PASS | artifacts/INT-GREEN.windows.log |
+| PERF-T01 | PERF | tools/benchmark_dashboard.py --scenario ci | windows | core+release | PASS | artifacts/PERF-T01.windows.log |
+| PERF-T02 | PERF | tools/benchmark_dashboard.py (baseline vs final cold/refresh) | windows | core+release | PASS | artifacts/PERF-T02.windows.log |
+| PERF-T03 | PERF | tools/benchmark_dashboard.py (warm/append bytes+parser) | windows | core+release | PASS | artifacts/PERF-T03.windows.log |
+| PERF-T04 | PERF | tools/benchmark_dashboard.py (rotation + restart checkpoint) | windows | core+release | PASS | artifacts/PERF-T04.windows.log |
+| PERF-T05 | PERF | tools/benchmark_dashboard.py (git before/after TTL) | windows | core+release | PASS | artifacts/PERF-T05.windows.log |
+| PERF-T06 | PERF | tools/benchmark_dashboard.py (memory + long lines) | windows | core+release | PASS | artifacts/PERF-T06.windows.log |

@@ -20,4 +20,7 @@
 ### Known limitations
 - Real CI runs are pending: the workflow exists in the repository, but nothing was pushed and no CI job has executed (CI_PENDING). A workflow file alone is not CI evidence.
 - Only Windows with Python 3.14.3 was verified on this machine; Linux and macOS runs are still pending.
-- The spec section 22 performance measurements are not recorded yet (the benchmark tool honestly reports NOT_IMPLEMENTED).
+- Performance measurements from spec section 22 are recorded for Windows:
+  deterministic small (10k) and large (100k) scenarios, baseline vs final,
+  with bytes-read, parser, git-subprocess and tracemalloc data under
+  `artifacts/performance/` and `artifacts/PERF-T01..T06.windows.log`.

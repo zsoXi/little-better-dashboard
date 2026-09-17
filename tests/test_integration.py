@@ -485,9 +485,11 @@ class TestF8Evidence(unittest.TestCase):
 
     ARTIFACTS = REPO_ROOT / "artifacts"
 
-    def _run_verifier(self, report_path, gate="core"):
+    def _run_verifier(self, report_path, gate="core", matrix_path=None):
         cmd = [sys.executable, str(REPO_ROOT / "tools" / "verify_acceptance.py"),
                "--report", str(report_path), "--gate", gate]
+        if matrix_path is not None:
+            cmd += ["--matrix", str(matrix_path)]
         cp = subprocess.run(cmd, capture_output=True, text=True,
                             encoding="utf-8", errors="replace",
                             cwd=str(REPO_ROOT), timeout=120)
@@ -569,6 +571,74 @@ class TestF8Evidence(unittest.TestCase):
                       "missing mandatory ids must be reported")
         self.assertIn("evidence", low,
                       "missing evidence files must be reported")
+
+    def test_f8_t07_pub_t02_mode_only_is_not_a_launcher_run(self):
+        import hashlib
+        with open(REPO_ROOT / "opencode_dashboard.py", "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        no_marker = self.ARTIFACTS / "F8-T07-no-marker.windows.log"
+        no_marker.write_text("mode=100755 only; launcher not executed\n",
+                             encoding="utf-8")
+        report = {
+            "code_hash": "sha256:" + digest,
+            "results": [{"acceptance_id": "PUB-T02", "result": "PASS",
+                         "environment": "windows",
+                         "evidence": "artifacts/F8-T07-no-marker.windows.log"}],
+        }
+        tmp = Path(tempfile.mkdtemp(prefix="f8-t07-"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        rp = Path(tmp) / "mode_only.json"
+        rp.write_text(json.dumps(report), encoding="utf-8")
+        rc, out = self._run_verifier(rp)
+        self._write_log("F8-T07-mode-only.windows.log", out)
+        self.assertNotEqual(rc, 0, "a mode-only PUB-T02 must be rejected")
+        self.assertIn("(7) PUB-T02", out,
+                      "the executed-launcher rule must name PUB-T02")
+
+    def test_f8_t08_missing_perf_entries_block_acceptance(self):
+        import hashlib
+        with open(REPO_ROOT / "opencode_dashboard.py", "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        report = {"code_hash": "sha256:" + digest, "results": []}
+        tmp = Path(tempfile.mkdtemp(prefix="f8-t08-"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        rp = Path(tmp) / "no_perf.json"
+        rp.write_text(json.dumps(report), encoding="utf-8")
+        rc, out = self._run_verifier(rp)
+        self._write_log("F8-T08-missing-perf.windows.log", out)
+        self.assertNotEqual(rc, 0, "missing PERF entries must block the gate")
+        self.assertIn("PERF-T01", out, "PERF-T01 must be reported missing")
+
+    def test_f8_t09_windows_result_cannot_fill_linux_row(self):
+        import hashlib
+        with open(REPO_ROOT / "opencode_dashboard.py", "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        matrix_src = (REPO_ROOT / "docs" / "ACCEPTANCE_MATRIX.md").read_text(
+            encoding="utf-8")
+        out_lines = []
+        for line in matrix_src.splitlines():
+            if line.startswith("| PUB-T02 |"):
+                cells = line.split("|")
+                cells[4] = " linux "
+                line = "|".join(cells)
+            out_lines.append(line)
+        tmp = Path(tempfile.mkdtemp(prefix="f8-t09-"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        mp = Path(tmp) / "matrix_linux.md"
+        mp.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        report = {
+            "code_hash": "sha256:" + digest,
+            "results": [{"acceptance_id": "PUB-T02", "result": "PASS",
+                         "environment": "windows",
+                         "evidence": "artifacts/PUB-T02-gitbash.windows.log"}],
+        }
+        rp = Path(tmp) / "windows_result.json"
+        rp.write_text(json.dumps(report), encoding="utf-8")
+        rc, out = self._run_verifier(rp, matrix_path=mp)
+        self._write_log("F8-T09-env-mismatch.windows.log", out)
+        self.assertNotEqual(rc, 0, "an environment mismatch must be rejected")
+        self.assertIn("(8) PUB-T02", out,
+                      "the environment-match rule must name PUB-T02")
 
 
 if __name__ == "__main__":

@@ -286,5 +286,193 @@ class TestF6dRefresh(unittest.TestCase):
                          "the parse ran once for two concurrent callers")
 
 
+# ---------------------------------------------------------------------------
+# F6f (spec INSTRUKCJA ch.17): expensive git calls must be TTL-cached per
+# worktree, bounded per refresh, resilient to timeouts and non-repos, and
+# always executed with list argv (never through a shell). The baseline runs
+# git on every freshness check; these tests pin the cache + fallback shape.
+# ---------------------------------------------------------------------------
+import shutil as _shutil
+import sqlite3 as _sqlite3
+import subprocess as _subprocess
+import unittest.mock as _mock
+
+
+_F6F_SCHEMA = """
+CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, agent TEXT, model TEXT,
+ directory TEXT, parent_id TEXT, time_created INTEGER, time_updated INTEGER,
+ tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER,
+ tokens_cache_read INTEGER, tokens_cache_write INTEGER, cost REAL,
+ project_id TEXT);
+CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT,
+ time_created INTEGER);
+CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+ data TEXT, time_created INTEGER);
+CREATE TABLE project (id TEXT PRIMARY KEY, directory TEXT, worktree TEXT,
+ path TEXT, vcs TEXT, name TEXT);
+CREATE TABLE session_input (session_id TEXT, prompt TEXT, time_created INTEGER);
+CREATE TABLE router (id TEXT PRIMARY KEY);
+"""
+
+
+def _f6f_make_db(path, worktree):
+    con = _sqlite3.connect(str(path))
+    con.executescript(_F6F_SCHEMA)
+    con.execute(
+        "INSERT INTO project VALUES ('proj-1',?,?,NULL,'git','work')",
+        (str(worktree), str(worktree)))
+    con.commit()
+    con.close()
+
+
+def _f6f_git_env():
+    env = dict(os.environ)
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+        "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    })
+    return env
+
+
+def _f6f_git(args, cwd, env):
+    out = _subprocess.run(["git"] + args, cwd=str(cwd),
+                          capture_output=True, text=True, timeout=30, env=env)
+    if out.returncode != 0:
+        raise RuntimeError("git %r failed: %s" % (args, out.stderr[:200]))
+    return out
+
+
+def _f6f_repo(root, name):
+    d = root / name
+    d.mkdir(parents=True)
+    env = _f6f_git_env()
+    _f6f_git(["init", "-q"], cwd=d, env=env)
+    (d / "a.txt").write_text("one", encoding="utf-8")
+    _f6f_git(["add", "a.txt"], cwd=d, env=env)
+    _f6f_git(["commit", "-q", "-m", "one"], cwd=d, env=env)
+    return d, env
+
+
+class TestF6fGitCalls(unittest.TestCase):
+    def setUp(self):
+        if not _shutil.which("git"):
+            self.skipTest("git not available")
+        self._old_env = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE", "LOCALAPPDATA")}
+        self._tmp = tempfile.TemporaryDirectory(prefix="dash-f6f-")
+        self.addCleanup(self._tmp.cleanup)
+        os.environ["HOME"] = self._tmp.name
+        os.environ["USERPROFILE"] = self._tmp.name
+        os.environ["LOCALAPPDATA"] = self._tmp.name
+        self.d = _load_dashboard()
+        try:
+            self.d.LOCAL_CACHE.clear()
+        except Exception:
+            pass
+
+    def tearDown(self):
+        for k, v in self._old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _counting(self):
+        real = _subprocess.run
+        calls = []
+
+        def counting(cmd, *a, **k):
+            calls.append((cmd, k))
+            return real(cmd, *a, **k)
+        return calls, counting
+
+    def test_f6f_t01_refreshes_before_ttl_bounded_subprocesses(self):
+        d = self.d
+        repo, _env = _f6f_repo(Path(self._tmp.name), "repo-one")
+        db = Path(self._tmp.name) / "f6f1.db"
+        _f6f_make_db(db, repo)
+        wts = [(repo.name, str(repo))]
+        calls, counting = self._counting()
+        with _mock.patch.object(d.subprocess, "run", side_effect=counting):
+            for _ in range(5):
+                d.repo_heads(wts)
+            for _ in range(5):
+                d.collect_repo_commits(wts)
+            for _ in range(3):
+                d.cached_local_stats(str(db))
+        git_calls = [c for c, _ in calls if isinstance(c, list) and c and c[0] == "git"]
+        self.assertLessEqual(
+            len(git_calls), 3,
+            "git must be TTL-cached, got %d calls: %r" % (len(git_calls), git_calls))
+
+    def test_f6f_t02_timeout_or_non_repo_readable_state(self):
+        d = self.d
+        repo, _env = _f6f_repo(Path(self._tmp.name), "repo-two")
+        wts = [(repo.name, str(repo))]
+        head1 = dict(d.repo_heads(wts))[str(repo)]
+        self.assertTrue(head1, "warm head expected")
+        entry = d._HEADS_CACHE[str(repo)]
+        entry["at"] -= 3600
+
+        def boom(cmd, *a, **k):
+            raise _subprocess.TimeoutExpired(cmd, 5)
+
+        with _mock.patch.object(d.subprocess, "run", side_effect=boom):
+            heads2 = dict(d.repo_heads(wts))
+        self.assertEqual(heads2[str(repo)], head1,
+                         "the last known head must survive a timeout")
+        self.assertEqual(d._HEADS_CACHE[str(repo)]["state"], "stale")
+
+        plain = Path(self._tmp.name) / "not-a-repo"
+        plain.mkdir()
+        with _mock.patch.object(d.subprocess, "run", side_effect=boom):
+            heads3 = dict(d.repo_heads([("plain", str(plain))]))
+        self.assertIsNone(heads3[str(plain)])
+        self.assertEqual(d._HEADS_CACHE[str(plain)]["state"], "unavailable")
+
+        db = Path(self._tmp.name) / "f6f2.db"
+        _f6f_make_db(db, repo)
+        with _mock.patch.object(d.subprocess, "run", side_effect=boom):
+            stats = d.cached_local_stats(str(db))
+        self.assertIsInstance(stats, dict)
+        self.assertIn("totals", stats)
+
+    def test_f6f_t03_head_change_visible_after_ttl(self):
+        d = self.d
+        repo, env = _f6f_repo(Path(self._tmp.name), "repo-three")
+        wts = [(repo.name, str(repo))]
+        head1 = dict(d.repo_heads(wts))[str(repo)]
+        self.assertTrue(head1)
+        (repo / "b.txt").write_text("two", encoding="utf-8")
+        _f6f_git(["add", "b.txt"], cwd=repo, env=env)
+        _f6f_git(["commit", "-q", "-m", "two"], cwd=repo, env=env)
+        cached = dict(d.repo_heads(wts))[str(repo)]
+        self.assertEqual(cached, head1,
+                         "inside the TTL the cached head is served")
+        d._HEADS_CACHE[str(repo)]["at"] -= 3600
+        head2 = dict(d.repo_heads(wts))[str(repo)]
+        self.assertNotEqual(head2, head1,
+                            "after the TTL the new HEAD must be visible")
+
+    def test_f6f_t04_special_paths_argv_no_shell(self):
+        d = self.d
+        weird = "repo sp\u00e4ce & $HOME ! (x)"
+        repo, _env = _f6f_repo(Path(self._tmp.name), weird)
+        wts = [(weird, str(repo))]
+        calls, counting = self._counting()
+        with _mock.patch.object(d.subprocess, "run", side_effect=counting):
+            heads = dict(d.repo_heads(wts))
+            commits = d.collect_repo_commits(wts)
+        self.assertTrue(heads[str(repo)])
+        self.assertTrue(commits)
+        self.assertTrue(calls)
+        for cmd, kwargs in calls:
+            self.assertIsInstance(cmd, list, "git argv must be a list")
+            self.assertTrue(kwargs.get("shell") in (None, False),
+                            "shell must never be used for git")
+            self.assertIn(str(repo), cmd,
+                          "the exact path must be one argv element")
+
+
 if __name__ == "__main__":
     unittest.main()

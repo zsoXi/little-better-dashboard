@@ -298,87 +298,141 @@ def db_worktrees(db_path):
         return []
 
 
-def repo_heads(worktrees):
-    """Current HEAD per worktree, cheap git fingerprint for cache invalidation."""
-    heads = []
-    seen = set()
-    for _, wt in worktrees or []:
-        if not wt or wt in seen:
-            continue
-        seen.add(wt)
-        try:
-            if not Path(wt).is_dir():
-                heads.append((wt, None))
-                continue
+# F6f: per-worktree TTL caches for the expensive git calls. SQLite stats
+# freshness stays cheap; HEAD/commit reads are shared between parallel
+# requests and refreshed at most once per TTL window. Failures keep the last
+# known value with a stale state; a fresh failure without history reads as
+# unavailable. Args are always a list; nothing is shell-interpreted.
+GIT_TTL_SECONDS = 10.0
+_GIT_LOCK = threading.Lock()
+_HEADS_CACHE = {}
+_COMMITS_CACHE = {}
+
+
+def _head_for(wt, now, force=False):
+    with _GIT_LOCK:
+        entry = _HEADS_CACHE.get(wt)
+        if entry is not None and not force and (now - entry["at"]) < GIT_TTL_SECONDS:
+            return entry["head"]
+    head = None
+    state = "unavailable"
+    try:
+        if Path(wt).is_dir():
             out = subprocess.run(
                 ["git", "-C", wt, "rev-parse", "HEAD"],
                 capture_output=True, text=True, timeout=5,
             )
-            heads.append((wt, out.stdout.strip() if out.returncode == 0 else None))
-        except (OSError, ValueError, subprocess.SubprocessError):
-            heads.append((wt, None))
+            if out.returncode == 0 and out.stdout.strip():
+                head = out.stdout.strip()
+                state = "ok"
+    except (OSError, ValueError, subprocess.SubprocessError):
+        state = "unavailable"
+    with _GIT_LOCK:
+        prev = _HEADS_CACHE.get(wt)
+        if state != "ok" and prev is not None and prev.get("head"):
+            _HEADS_CACHE[wt] = {"head": prev["head"], "at": now,
+                                "state": "stale"}
+            return prev["head"]
+        _HEADS_CACHE[wt] = {"head": head, "at": now, "state": state}
+        return head
+
+
+def repo_heads(worktrees, force=False):
+    """Current HEAD per worktree, served from the per-worktree TTL cache."""
+    heads = []
+    seen = set()
+    now = time.time()
+    for _, wt in worktrees or []:
+        if not wt or wt in seen:
+            continue
+        seen.add(wt)
+        heads.append((wt, _head_for(wt, now, force)))
     return tuple(heads)
 
 
+def _parse_repo_log(stdout, name):
+    commits = []
+    cur = None
+    for line in stdout.splitlines():
+        if "\x1f" in line:
+            if cur:
+                commits.append(cur)
+            parts = line.split("\x1f")
+            try:
+                ts = int(parts[2])
+            except (ValueError, IndexError):
+                cur = None
+                continue
+            cur = {
+                "sha": parts[0],
+                "subject": parts[1] if len(parts) > 1 else "",
+                "time": ts * 1000,
+                "date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d"),
+                "project": name,
+                "files": 0,
+                "add": 0,
+                "del": 0,
+            }
+        elif cur and line.strip():
+            bits = line.split()
+            if len(bits) >= 3:
+                cur["files"] += 1
+                try:
+                    cur["add"] += int(bits[0])
+                except ValueError:
+                    pass
+                try:
+                    cur["del"] += int(bits[1])
+                except ValueError:
+                    pass
+    if cur:
+        commits.append(cur)
+    return commits
+
+
+def _commits_for(name, wt, per_repo, now, force=False):
+    with _GIT_LOCK:
+        entry = _COMMITS_CACHE.get(wt)
+        if entry is not None and not force and (now - entry["at"]) < GIT_TTL_SECONDS:
+            return entry["commits"]
+    parsed = []
+    state = "unavailable"
+    try:
+        if Path(wt).is_dir():
+            out = subprocess.run(
+                ["git", "-C", wt, "log", f"-n{per_repo}",
+                 "--format=%H\x1f%s\x1f%ct", "--numstat"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if out.returncode == 0:
+                state = "ok"
+                parsed = _parse_repo_log(out.stdout, name)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    with _GIT_LOCK:
+        prev = _COMMITS_CACHE.get(wt)
+        if state != "ok" and prev is not None and prev.get("commits"):
+            _COMMITS_CACHE[wt] = {"commits": prev["commits"], "at": now,
+                                  "state": "stale"}
+            return prev["commits"]
+        _COMMITS_CACHE[wt] = {"commits": parsed, "at": now, "state": state}
+        return parsed
+
+
 def collect_repo_commits(worktrees, per_repo=MAX_COMMITS_PER_REPO):
-    """Recent commits per worktree: sha/subject/date/files/+/-.
+    """Recent commits per worktree, served from the per-worktree TTL cache.
 
     Skips missing dirs and non-git worktrees silently, the panels simply
     show fewer repos. Never raises for git failures.
     """
     commits = []
     seen = set()
+    now = time.time()
     for name, wt in worktrees or []:
         if not wt or wt in seen:
             continue
         seen.add(wt)
-        try:
-            if not Path(wt).is_dir():
-                continue
-            out = subprocess.run(
-                ["git", "-C", wt, "log", f"-n{per_repo}",
-                 "--format=%H\x1f%s\x1f%ct", "--numstat"],
-                capture_output=True, text=True, timeout=15,
-            )
-            if out.returncode != 0:
-                continue
-        except (OSError, ValueError, subprocess.SubprocessError):
-            continue
-        cur = None
-        for line in out.stdout.splitlines():
-            if "\x1f" in line:
-                if cur:
-                    commits.append(cur)
-                parts = line.split("\x1f")
-                try:
-                    ts = int(parts[2])
-                except (ValueError, IndexError):
-                    cur = None
-                    continue
-                cur = {
-                    "sha": parts[0],
-                    "subject": parts[1] if len(parts) > 1 else "",
-                    "time": ts * 1000,
-                    "date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d"),
-                    "project": name,
-                    "files": 0,
-                    "add": 0,
-                    "del": 0,
-                }
-            elif cur and line.strip():
-                bits = line.split()
-                if len(bits) >= 3:
-                    cur["files"] += 1
-                    try:
-                        cur["add"] += int(bits[0])
-                    except ValueError:
-                        pass
-                    try:
-                        cur["del"] += int(bits[1])
-                    except ValueError:
-                        pass
-        if cur:
-            commits.append(cur)
+        commits.extend(_commits_for(name, wt, per_repo, now))
     return commits
 
 

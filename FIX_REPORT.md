@@ -566,3 +566,111 @@
   `127.0.0.1:0`; only own PIDs/threads handled; no repo files left dirty
   beyond the intended set (plus the cosmetic stat-dirty flag on the restored
   `tests/test_synth_publish.py`, content proven equal).
+
+# FIX_REPORT — F3 session activity separation (RED -> GREEN)
+
+## F3-1. Repo, base, tested SHA, worktree, environment
+
+- Repo: `D:\TESTY!\V3\little-better-dashboard`, branch `fix/audit-f1-f8`,
+  start HEAD `fa729c7` (F5b/F5c report-only commit).
+- Worktree during test: three intended modified files — `opencode_dashboard.py`,
+  `README.md`, `tests/test_local_regressions.py` (`git diff --stat`:
+  178 insertions / 34 deletions) — plus the pre-existing cosmetic stat-dirty
+  flag on `tests/test_synth_publish.py` (content proven equal, not touched).
+- Tested code hashes (SHA-256): `opencode_dashboard.py`
+  `sha256:ad5368d738f7f13c4e4c33a6a366f0ff15380f11a4271485327a35b433cb717c`,
+  `tests/test_local_regressions.py`
+  `sha256:28d97371676f84914222d53e3268cbb0cda27ff78fd760ab7b1257e9a45be8d8`,
+  `README.md`
+  `sha256:7e4409dd3bce4d920d945c1d6874e5cae47c08db445a101e421b3e2d7edd9c19`.
+- Environment: Windows, Python 3.14.3 via `python`. All test servers bound
+  `127.0.0.1:0` only; never 8765/8766/8770 (the user's live dashboard on 8770
+  was not touched). Fixtures: per-test temp dirs with isolated
+  HOME/USERPROFILE/LOCALAPPDATA; tests close their own servers/threads.
+
+## F3-2. Change (TODO -> REPRODUCED -> PATCHED -> VERIFIED -> DONE)
+
+Contract: spec §7 (`F3: aktywnosc historyczna nie jest stanem wykonania agenta`).
+
+- REPRODUCED (RED): new evidence tests
+  `tests/test_local_regressions.py::TestF3ActivityStates` (6 cases, T01..T06)
+  -> `artifacts/F3-RED.windows.log`: `Ran 9 tests ... FAILED (failures=2,
+  errors=4)`; the 3 skeleton `TestLocalRegressions` tests stayed green.
+  Concrete old-code failures: T01/T04 `KeyError: 'activity_state'`; T02
+  `TypeError: unsupported operand type(s) for -: 'int' and 'str'`
+  (old `opencode_dashboard.py:472`); T03 `'bulk-000' != 'veteran'` (old
+  ORDER BY time_created); T05 `KeyError: 'runtime_status'`; T06 source scan
+  found no activity labels.
+- PATCHED (single pass, no follow-up fixes):
+  - Backend `query_agents`: `activity_state` in recent/quiet/stale/unknown
+    with exact boundaries (0..120 s recent, >120..900 s quiet, >900 s stale;
+    missing/invalid/zero/future timestamps -> unknown, never clamped to
+    recent); `runtime_status` kept `'unknown'`; `relation: 'child_session'`;
+    SQL `ORDER BY s.time_updated DESC, s.id DESC LIMIT 100` with the old
+    Python re-sort by `time_created` removed; new counters `listed_count`,
+    `total_child_sessions`, `limit`, `truncated`, `activity_counts`;
+    `status_counts`/`running_sec`/`idle_sec` removed.
+  - `/api/agents` error fallback extended with the new keys (0/100/False/zeros).
+  - Frontend: exact labels `Recent activity` / `No recent activity` /
+    `Older activity` / `Unknown` + adjacent `Based on session updates; not
+    execution status`; dot classes `.dot.recent/.dot.quiet/.dot.stale/
+    .dot.unknown`; pulsing green live dot and `running NOW` hint removed;
+    expanded row shows `Activity:` instead of `Status:`; table headers
+    `Activity` / `Child session`.
+  - README: "What it shows" now says session activity (recent, no recent
+    activity, older or unknown — based on session updates, not execution
+    status; auto-refreshed); Notes bullet rewritten (recency boundaries,
+    unknown case, not execution status, parent_id = session relation).
+  - Test-side: none needed after RED capture (all RED failures were product
+    defects the contract demands fixing).
+- VERIFIED (GREEN): `python -m py_compile opencode_dashboard.py` OK;
+  `python -m unittest tests.test_local_regressions -v` -> `Ran 9 tests` `OK`;
+  full suite `python -m unittest discover -s tests` -> `Ran 97 tests` `OK`
+  (was 91; +6 new). Evidence log `artifacts/F3-GREEN.windows.log`
+  (target-file verbose run + full discover). Skeleton
+  `TestLocalRegressions` tests untouched and still green.
+- Jev gate (before commit, on `git diff` of `opencode_dashboard.py` +
+  `tests/test_local_regressions.py` + `README.md`; jev-1.13.0,
+  DIFF_CHARS=22317): `touches_local_path` 0.12 (low — required),
+  `activity_state_separation` 0.99, `boundary_contract_exact` 0.96,
+  `ui_language_updated` 0.96, `limit_counters_present` 0.96.
+- Matrix: F3-T01..T06 -> PASS (windows,
+  `artifacts/F3-GREEN.windows.log`); placeholder names replaced with real
+  test IDs.
+- `node --check` not applicable: no separate frontend file changed (the JS
+  lives inside `opencode_dashboard.py`); the embedded JS is covered by the
+  source-scan test F3-T06.
+- Retries: one RED-to-GREEN cycle (single patch pass); no report row faked —
+  every claim maps to a log.
+
+## F3-3. Not changed (verified)
+
+- Local session-stats token path untouched (Jev `touches_local_path` 0.12):
+  `day_total`/`dayTotal`/`outMerged`, token SUM SQL, cache-rate and KPI
+  derivation unchanged; skeleton regression tests still assert them.
+- Session relation tree untouched: `parent_id` semantics and joins unchanged;
+  no session deletion, no agent restart/kill, no new worker-monitoring
+  promise; the view is described as child & related sessions.
+- View limit stays 100 (not raised); internal `child_runs`/`child_agents`
+  names kept for compatibility; config tiles (`subagents | click to expand`)
+  untouched.
+- Known remaining (honest): activity horizon constants (120/900 s) remain
+  fixed in code; Linux evidence NOT_RUN by design (matrix rows env
+  `windows`); age is recomputed per request from `time_updated` (no caching
+  freeze) — covered by F3-T04.
+- F2-T09 close-window race fix from the F5b/F5c step stays in place; the F2
+  matrix row is unchanged (test untouched, still green).
+
+## F3-4. Verify gate outcome
+
+- `python tools/verify_acceptance.py --gate core --report artifacts/TEST_REPORT.json`
+  -> FAIL (expected/honest): all 131 canonical IDs present in the matrix and
+  131 core-mandatory marked; F3 now PASS with existing evidence files; but
+  `artifacts/TEST_REPORT.json` is still F1-era (F2..INT result rows missing,
+  report hash `sha256:ce11d08f...` != current `sha256:ad5368d7...`) ->
+  "GATE CORE FAILED (132 problem(s))" (same honest count as the F5a/F6a and
+  F5b/F5c steps; the report is rebuilt at the F8-close step).
+  Log: `artifacts/F3-verify-core.windows.log`.
+- Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
+  only own PIDs/threads handled; no repo files left dirty beyond the intended
+  set.

@@ -28,7 +28,7 @@ LOCAL_CACHE = {"key": None, "stats": None}
 ROUTER_CACHE = {"key": None, "stats": None}
 MAX_ROUTER_EVENTS = 30000  # most-recent lines scanned from usage-events.jsonl
 MAX_ROUTER_ROWS = 400  # recent requests kept in the /api/router payload
-SYNTH_SCHEMA = 2  # bump to force codex-synth rebuild when the writer changes
+SYNTH_SCHEMA = 3  # bump to force codex-synth rebuild when the writer changes
 
 # What-if paid pricing per 1M tokens (input, output) for known *-free models.
 # Actual free cost is always $0; this estimates what the same tokens would cost.
@@ -859,7 +859,8 @@ def ensure_codex_synth(force=False):
                 for key in sorted(rows):
                     for e in rows[key][2]:
                         f.write(json.dumps({"at": e["at"], "model": e["model"],
-                            "provider": e["provider"], "status": 200,
+                            "provider": e["provider"], "status": None,
+                            "outcome": "unknown",
                             "inputTokens": e["ti"], "cachedInputTokens": e["cache"],
                             "outputTokens": e["to"], "totalTokens": e["total"],
                             "reasoningTokens": e.get("reasoning", 0),
@@ -1427,14 +1428,61 @@ def _router_token(value, present):
     return float(value), True
 
 
-def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
+def _router_outcome(status_value, status_present, outcome_value=None):
+    """Classify a router record into success/error/unknown -> (status, outcome).
+
+    Router-path only. Strict: only a real JSON int (never bool) in 200-299
+    observed from the router is success, 400-599 is error. Missing, null,
+    0, bools, floats, strings, lists/dicts, informational (1xx) and
+    redirects (3xx) without a final result are unknown. An explicit
+    ``outcome`` field of success/error/unknown wins when present (the
+    codex synth writer emits status None + outcome unknown). Status is an
+    int or None; never the string "unknown" and never a coerced 0 that
+    would read as success. Callers must branch on outcome, never on
+    ``not ok`` alone, because a third state exists.
+    """
+    if isinstance(outcome_value, str) and outcome_value in ("success", "error", "unknown"):
+        if isinstance(status_value, bool):
+            st = None
+        elif isinstance(status_value, int):
+            st = status_value if status_value != 0 else None
+        else:
+            st = None
+        # Unknown must never carry a fake 200; success/error keep real codes.
+        if outcome_value == "unknown" and st == 200:
+            # Only trust an explicit unknown with a null/missing status as
+            # honest; a bare 200 without provenance is handled by the
+            # synth-context override in the caller, not here.
+            pass
+        return st, outcome_value
+    if isinstance(status_value, bool):
+        return None, "unknown"
+    if not status_present or status_value is None:
+        return None, "unknown"
+    if isinstance(status_value, int):
+        v = status_value
+        if 200 <= v <= 299:
+            return v, "success"
+        if 400 <= v <= 599:
+            return v, "error"
+        if v == 0:
+            return None, "unknown"
+        return v, "unknown"
+    return None, "unknown"
+
+
+def parse_router_events(path, limit=MAX_ROUTER_EVENTS, synth_context=False):
     """Read usage-events.jsonl tail; return (events, problems).
 
-    Each event: {at, date, hour, model, short, provider, status, ok,
-    ti, cache, to, total, reasoning, cache_write, ms, free, what_if,
-    total_reported, usage_partial}. Missing token fields on
-    error rows (401/429/500) become 0 and are counted as errors, never
-    estimated, actuals only.
+    Each event: {at, date, hour, model, short, provider, status, outcome,
+    ok, ti, cache, to, total, reasoning, cache_write, ms, free, what_if,
+    total_reported, usage_partial, usage_known}. Status is an int or None;
+    outcome is success/error/unknown. ``ok`` is kept as outcome==success
+    for compatibility but must not be used as ``not ok`` == error because
+    a third state exists. usage_known separates measurement availability
+    from outcome: a correct token read in an unknown event still counts
+    toward usage; known usage in an error event is not erased. Missing
+    token fields become 0 and are never estimated, actuals only.
 
     Total contract (router path): total = inputTokens + outputTokens.
     Cached input is a subset of input, reasoning a subset of output --
@@ -1445,6 +1493,11 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
     with usage_partial=True (components are never invented). problems also
     carries invalid_records (records with a present-but-invalid token
     field, sanitized to 0 without aborting the read).
+
+    When synth_context is True (codex-synth generation), records without
+    an explicit success/error outcome are forced to unknown even if they
+    carry a legacy status 200, so a stale pre-migration index can never
+    read as confirmed successes.
     """
     p = Path(path)
     try:
@@ -1468,11 +1521,15 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
             continue
         model = e.get("model") or "-"
         short = router_short(model)
-        try:
-            status = int(e.get("status", 0))
-        except (TypeError, ValueError):
-            status = 0
-        ok = status in (0, 200) or 200 <= status < 300
+        raw_status = e.get("status")
+        status_present = "status" in e
+        raw_outcome = e.get("outcome")
+        status, outcome = _router_outcome(raw_status, status_present, raw_outcome)
+        if synth_context and raw_outcome not in ("success", "error"):
+            # Synth has no confirmed HTTP outcomes; never trust a legacy
+            # baked-in 200 from a pre-migration index.
+            status, outcome = None, "unknown"
+        ok = outcome == "success"
         ti, ti_ok = _router_token(e.get("inputTokens"), "inputTokens" in e)
         cache, cache_ok = _router_token(e.get("cachedInputTokens"), "cachedInputTokens" in e)
         to, to_ok = _router_token(e.get("outputTokens"), "outputTokens" in e)
@@ -1485,15 +1542,19 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
         has_to = "outputTokens" in e and e.get("outputTokens") is not None
         has_total = "totalTokens" in e and e.get("totalTokens") is not None
         usage_partial = False
+        usage_known = False
         if ti_ok and to_ok and has_ti and has_to:
             total = ti + to
+            usage_known = True
             if total_ok and has_total and total_declared != total:
                 problems["total_conflicts"] += 1
         elif total_ok and has_total:
             total = total_declared
+            usage_known = True
             usage_partial = True
         else:
             total = 0.0
+            usage_known = False
             usage_partial = True
         try:
             ms = float(e.get("durationMs") or 0)
@@ -1511,6 +1572,7 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
                 "short": short,
                 "provider": str(e.get("provider") or "-"),
                 "status": status,
+                "outcome": outcome,
                 "ok": ok,
                 "ti": ti,
                 "cache": cache,
@@ -1523,6 +1585,7 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
                 "what_if": what_if_cost(short, ti, to),
                 "total_reported": total_declared if total_ok and has_total else None,
                 "usage_partial": usage_partial,
+                "usage_known": usage_known,
             }
         )
     return events, problems
@@ -1576,56 +1639,63 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         raise RuntimeError(f"Router usage file not found: {events_path}")
     if full_scan:
         truncated = False
-        scanned_events, problems = parse_router_events(events_path, None)
+        scanned_events, problems = parse_router_events(events_path, None, synth_context=full_scan)
     else:
         truncated = total_lines > MAX_ROUTER_EVENTS
-        scanned_events, problems = parse_router_events(events_path, MAX_ROUTER_EVENTS)
-    # Successful responses that carried no token fields (local/unmetered
-    # models, image calls) are excluded from every count and average -
+        scanned_events, problems = parse_router_events(events_path, MAX_ROUTER_EVENTS, synth_context=full_scan)
+    # Events with no usage measurement (usage_known False: explicit zero
+    # counts as measured) are excluded from every count and average -
     # never estimated, and reported separately as `unmetered`.
-    unmetered = sum(1 for e in scanned_events if e["ok"] and not e["total"])
-    events = [e for e in scanned_events if not e["ok"] or e["total"]]
-    ok_events = [e for e in events if e["ok"]]
-    err_events = [e for e in events if not e["ok"]]
+    # F4: three outcomes. usage_known (a real token read) is independent
+    # of outcome, so unknown/error events with tokens still count.
+    events = list(scanned_events)
+    ok_events = [e for e in events if e["outcome"] == "success"]
+    err_events = [e for e in events if e["outcome"] == "error"]
+    measured = [e for e in events if e.get("usage_known")]
+    unmetered = sum(1 for e in events if not e.get("usage_known"))
     err429 = sum(1 for e in events if e["status"] == 429)
-    err500 = sum(1 for e in events if e["status"] >= 500)
+    err500 = sum(1 for e in events if type(e["status"]) is int and e["status"] >= 500)
 
-    ti = sum(e["ti"] for e in ok_events)
-    cache = sum(e["cache"] for e in ok_events)
-    to = sum(e["to"] for e in ok_events)
+    ti = sum(e["ti"] for e in measured)
+    cache = sum(e["cache"] for e in measured)
+    to = sum(e["to"] for e in measured)
     # Headline usage is the normalized per-event total (ti + to for complete
     # records, the reported sum for total-only records), so every aggregate
     # below shares one definition.
-    toks_total = sum(e["total"] for e in ok_events)
-    tr = sum(e.get("reasoning", 0) for e in ok_events)
-    cw = sum(e.get("cache_write", 0) for e in ok_events)
-    what_if = round(sum(e["what_if"] for e in ok_events), 4)
-    free_unpriced = sum(1 for e in ok_events if e["free"] and not e["what_if"])
+    toks_total = sum(e["total"] for e in measured)
+    tr = sum(e.get("reasoning", 0) for e in measured)
+    cw = sum(e.get("cache_write", 0) for e in measured)
+    what_if = round(sum(e["what_if"] for e in measured), 4)
+    free_unpriced = sum(1 for e in measured if e["free"] and not e["what_if"])
     # Latency over successful requests only: fast 429/401 rejects would
     # otherwise drag the average down and misrepresent model speed.
-    ms_vals = [e["ms"] for e in ok_events if e["ms"] > 0]
-    avg_ms = round(sum(ms_vals) / len(ms_vals), 1) if ms_vals else 0
+    ms_vals = [e["ms"] for e in measured if e["ms"] > 0]
+    avg_ms = round(sum(ms_vals) / len(ms_vals), 1) if ms_vals else None
 
     by_model = {}
     for e in events:
         m = by_model.setdefault(
             e["model"],
             {"provider": e["provider"], "reqs": 0, "ok": 0, "err": 0,
+             "unknown": 0,
              "ti": 0.0, "to": 0.0, "cache": 0.0, "total": 0.0,
              "reasoning": 0.0,
              "what_if": 0.0, "ms": 0.0, "free": e["free"]},
         )
         m["reqs"] += 1
-        if e["ok"]:
+        if e["outcome"] == "success":
             m["ok"] += 1
+        elif e["outcome"] == "error":
+            m["err"] += 1
+        else:
+            m["unknown"] += 1
+        if e.get("usage_known"):
             m["ti"] += e["ti"]
             m["to"] += e["to"]
             m["cache"] += e["cache"]
             m["total"] += e["total"]
             m["reasoning"] += e.get("reasoning", 0)
             m["what_if"] += e["what_if"]
-        else:
-            m["err"] += 1
         m["ms"] += e["ms"]
 
     model_rows = []
@@ -1635,14 +1705,16 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
             [name, m["reqs"], tot, m["ti"], m["to"], m["cache"], m["ok"], m["err"],
              round(tot / m["ok"], 0) if m["ok"] else 0,
              router_cache_rate(m["ti"], m["cache"]), m["provider"],
-             m["free"], round(m["what_if"], 4), round(m["reasoning"], 1)]
+             m["free"], round(m["what_if"], 4), round(m["reasoning"], 1),
+             m["unknown"]]
         )
     model_rows.sort(key=lambda r: -r[2])
 
     by_provider = defaultdict(lambda: {"reqs": 0, "toks": 0.0})
-    for e in ok_events:
+    for e in events:
         by_provider[e["provider"]]["reqs"] += 1
-        by_provider[e["provider"]]["toks"] += e["total"]
+        if e.get("usage_known"):
+            by_provider[e["provider"]]["toks"] += e["total"]
 
     day_buckets = {}
     hour_reqs = defaultdict(int)
@@ -1650,29 +1722,32 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     for e in events:
         if e["hour"] is not None:
             hour_reqs[e["hour"]] += 1
-            if e["ok"]:
+            if e.get("usage_known"):
                 hour_tokens[e["hour"]] += e["total"]
         if not e["date"]:
             continue
         b = day_buckets.setdefault(
-            e["date"], {"reqs": 0, "ok": 0, "err": 0, "err429": 0, "err500": 0, "ti": 0.0, "to": 0.0,
+            e["date"], {"reqs": 0, "ok": 0, "err": 0, "unknown": 0, "err429": 0, "err500": 0, "ti": 0.0, "to": 0.0,
                         "cache": 0.0, "tr": 0.0, "total": 0.0, "what_if": 0.0}
         )
         b["reqs"] += 1
         if e["status"] == 429:
             b["err429"] += 1
-        if e["status"] >= 500:
+        if type(e["status"]) is int and e["status"] >= 500:
             b["err500"] += 1
-        if e["ok"]:
+        if e["outcome"] == "success":
             b["ok"] += 1
+        elif e["outcome"] == "error":
+            b["err"] += 1
+        else:
+            b["unknown"] += 1
+        if e.get("usage_known"):
             b["ti"] += e["ti"]
             b["to"] += e["to"]
             b["cache"] += e["cache"]
             b["tr"] += e.get("reasoning", 0)
             b["total"] += e["total"]
             b["what_if"] += e["what_if"]
-        else:
-            b["err"] += 1
 
     day_entries = []
     for d in sorted(day_buckets):
@@ -1684,7 +1759,7 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         tot = b["total"]
         day_entries.append(
             {"date": d, "msgs": b["reqs"], "sessions": b["ok"], "reqs": b["reqs"],
-             "ok": b["ok"], "err": b["err"], "err429": b["err429"], "err500": b["err500"],
+             "ok": b["ok"], "err": b["err"], "unknown": b["unknown"], "err429": b["err429"], "err500": b["err500"],
              "ti": round(b["ti"], 1),
              "to": round(b["to"], 1), "tr": round(b["tr"], 1), "cache": round(b["cache"], 1),
              "cost": round(b["what_if"], 4), "what_if": round(b["what_if"], 4),
@@ -1726,11 +1801,16 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     r_commit_rows.sort(key=lambda r: -r[7])
     r_commit_rows = r_commit_rows[:MAX_COMMIT_ROWS]
 
-    avg_per_session = round(toks_total / len(ok_events), 0) if ok_events else 0
+    avg_per_session = round(toks_total / len(measured), 0) if measured else 0
+    known = len(ok_events) + len(err_events)
     totals = {
         "requests": len(events),
         "ok": len(ok_events),
         "errors": len(err_events),
+        "unknown": len(events) - known,
+        "known_outcomes": known,
+        "success_rate": round(len(ok_events) / known, 4) if known else None,
+        "coverage": {"known": known, "total": len(events)},
         "err429": err429,
         "err500": err500,
         "unmetered": unmetered,
@@ -1759,7 +1839,7 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     top_model = model_rows[0] if model_rows else None
     biggest_req = max(ok_events, key=lambda e: e["total"]) if ok_events else None
     peak_hour = max(range(24), key=lambda h: hour_tokens.get(h, 0)) if any(hour_tokens.values()) else None
-    req_word = "model calls" if full_scan else "requests"
+    req_word = "Usage events" if full_scan else "requests"
     insights = [
         f"Codex made {len(events):,} {req_word} across {len(by_model)} models, {len(ok_events):,} ok, {len(err_events):,} errors.",
         (f"Top model: {router_short(top_model[0])}, {top_model[2]:,.0f} tokens over {top_model[1]:,} requests."
@@ -1771,8 +1851,8 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         insights.append(f"{err429} requests hit 429 rate limits, usually free-model capacity, not token size.")
     if unmetered:
         insights.append(
-            f"{unmetered:,} successful requests reported no token counts "
-            f"(local / unmetered models), excluded from all counts and averages."
+            f"{unmetered:,} requests reported no usage measurement "
+            f"(unmetered), excluded from all counts and averages."
         )
     if free_unpriced:
         insights.append(
@@ -1832,7 +1912,10 @@ def blank_router_stats(error=None):
     stats = {
         "source": "router",
         "source_label": "Codex data",
-        "totals": {"requests": 0, "ok": 0, "errors": 0, "err429": 0, "err500": 0,
+        "totals": {"requests": 0, "ok": 0, "errors": 0, "unknown": 0,
+                   "known_outcomes": 0, "success_rate": None,
+                   "coverage": {"known": 0, "total": 0},
+                   "err429": 0, "err500": 0,
                    "unmetered": 0,
                    "invalid_records": 0, "total_conflicts": 0,
                    "tokens_input": 0, "tokens_output": 0, "tokens_reasoning": 0,
@@ -2468,7 +2551,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       <input class="search" id="r-search" placeholder="Filter by model or provider…" aria-label="Filter codex requests">
       <select class="filter" id="r-provider-f"><option value="">All providers</option></select>
       <select class="filter" id="r-model-f"><option value="">All models</option></select>
-      <select class="filter" id="r-status-f"><option value="">All statuses</option><option value="ok">OK only</option><option value="err">Errors only</option><option value="429">429 only</option></select>
+      <select class="filter" id="r-status-f"><option value="">All statuses</option><option value="ok">OK only</option><option value="err">Errors only</option><option value="unknown">Unknown only</option><option value="429">429 only</option></select>
       <span class="badge" id="r-req-count"></span>
     </div>
     <div id="r-fbar" class="fbar" style="display:none"></div>
@@ -3121,8 +3204,8 @@ function rCutDate(){
 function rInPeriod(day){const c=rCutDate();return !c||day.date>=c;}
 function rPeriodDays(){return (R&&R.days?R.days:[]).filter(rInPeriod);}
 function rSumDays(list){
-  const t={reqs:0,ok:0,err:0,err429:0,err500:0,ti:0,to:0,tr:0,cache:0,total:0,what_if:0};
-  list.forEach(d=>{t.reqs+=d.reqs||0;t.ok+=d.ok||0;t.err+=d.err||0;t.err429+=d.err429||0;t.err500+=d.err500||0;t.ti+=d.ti||0;t.to+=d.to||0;t.tr+=d.tr||0;t.cache+=d.cache||0;t.total+=rDayTokenTotal(d);t.what_if+=d.what_if||0;});
+  const t={reqs:0,ok:0,err:0,unknown:0,err429:0,err500:0,ti:0,to:0,tr:0,cache:0,total:0,what_if:0};
+  list.forEach(d=>{t.reqs+=d.reqs||0;t.ok+=d.ok||0;t.err+=d.err||0;t.unknown+=d.unknown||0;t.err429+=d.err429||0;t.err500+=d.err500||0;t.ti+=d.ti||0;t.to+=d.to||0;t.tr+=d.tr||0;t.cache+=d.cache||0;t.total+=rDayTokenTotal(d);t.what_if+=d.what_if||0;});
   return t;
 }
 function rDayTip(d){
@@ -3261,6 +3344,7 @@ function renderRouterStatus(pc){
     ['Errors',v('err'),(v('err')?'var(--bad)':'var(--subtle)'),'err'],
     ['429 rate-limited',v('err429'),(v('err429')?'var(--bad)':'var(--subtle)'),'429'],
     ['5xx upstream',v('err500'),'var(--bad)','err'],
+    ['Unknown outcome',v('unknown'),'var(--subtle)','unknown'],
   ];
   $('r-status').innerHTML=items.map(([l,v,cc,k])=>'<span class="chip'+(RFSTATE.status===k?' active':'')+'" data-rs="'+k+'" data-tip="<b>'+l+'</b><span class=\'trow\'><span>Requests</span><b>'+F(v)+'</b></span>">'+
     '<i style="width:9px;height:9px;border-radius:3px;background:'+cc+';display:inline-block"></i>'+l+' · '+F(v)+'</span>').join('');
@@ -3440,8 +3524,9 @@ function routerRequestRows(){
       const ms0=Date.parse(r.at||'');
       if(!ms0||new Date(ms0).toLocaleDateString('en-CA')!==RFSTATE.day)return false;
     }
-    if(st==='ok'&&!r.ok)return false;
-    if(st==='err'&&r.ok)return false;
+    if(st==='ok'&&r.outcome!=='success')return false;
+    if(st==='err'&&r.outcome!=='error')return false;
+    if(st==='unknown'&&r.outcome!=='unknown')return false;
     if(st==='429'&&r.status!==429)return false;
     if(cut){
       const ms=Date.parse(r.at||'');
@@ -3458,13 +3543,13 @@ function renderRouterRequests(){
   const rt=(R&&R.totals)||{};
   $('r-req-hint').textContent=(rf?'filtered by '+rf+' criteria · ':'')+'newest '+F(rows.length)+' of '+F(rt.requests||0)+' counted'+
     (R&&R.truncated?' (file capped at recent '+F(R.scanned||0)+')':'')+
-    ' · '+F(rt.unmetered||0)+' unmetered excluded · errors show 0 tokens (actuals only)';
+    ' · '+F(rt.unmetered||0)+' unmetered excluded · errors show 0 tokens (actuals only) · '+F(rt.unknown||0)+' outcome unavailable';
   const tb=$('r-tbl').querySelector('tbody');
   tb.innerHTML=rows.map(r=>{
     const ok=r.ok;
     return '<tr><td class="mono" style="font-size:11.5px;color:var(--muted)">'+ESC((r.at||'').replace('T',' ').slice(0,19))+'</td>'+
     '<td><div class="t" style="font-size:12.5px">'+ESC(rModelShort(r.model))+'</div><div class="badges"><span class="badge">'+ESC(r.provider)+'</span></div></td>'+
-    '<td><span class="'+(ok?'status-ok':'status-err')+' mono" style="font-size:12px">'+r.status+'</span></td>'+
+    +(r.outcome==='unknown'?'<td><span class="mono" style="font-size:12px;color:var(--subtle)">Outcome unavailable</span></td>':'<td><span class="'+(ok?'status-ok':'status-err')+' mono" style="font-size:12px">'+r.status+'</span></td>')+
     '<td class="num">'+FN(r.ti||0)+'</td><td class="num">'+FN(r.to||0)+'</td><td class="num">'+FN(r.cache||0)+'</td>'+
     '<td class="num" style="font-weight:700">'+FN(r.total||0)+'</td><td class="num" style="color:var(--subtle)">'+F(r.ms||0)+'</td></tr>';}).join('')
     ||'<tr><td colspan="8"><div class="empty">No requests match.</div></td></tr>';
@@ -3615,8 +3700,8 @@ function exportData(kind){
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=isR?'codex-tokens.json':'opencode-tokens.json';a.click();
   }else if(isR){
     const rows=rPeriodDays();
-    const head=['date','requests','ok','errors','tokens_in','tokens_out','tokens_cache','tokens_total','what_if_cost'];
-    const lines=[head.join(',')].concat(rows.map(d=>[d.date,d.reqs,d.ok,d.err,Math.round(d.ti),Math.round(d.to),Math.round(d.cache),Math.round(rDayTokenTotal(d)),(d.what_if||0)].join(',')));
+    const head=['date','requests','ok','errors','unknown','tokens_in','tokens_out','tokens_cache','tokens_total','what_if_cost'];
+    const lines=[head.join(',')].concat(rows.map(d=>[d.date,d.reqs,d.ok,d.err,(d.unknown||0),Math.round(d.ti),Math.round(d.to),Math.round(d.cache),Math.round(rDayTokenTotal(d)),(d.what_if||0)].join(',')));
     const b=new Blob([lines.join('\n')],{type:'text/csv'});
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='codex-tokens-days.csv';a.click();
   }else{

@@ -19,3 +19,14 @@ usage with an ambiguous outcome bucket. Rollups, streaks, and cost
 estimates must consult the two axes separately so unmetered or
 error-only days do not inflate token totals and error-only activity
 does not fabricate usage streaks.
+
+## Codex read cache and restart checkpoint
+
+Incremental Codex parsing keeps per-file state (fingerprint, byte
+offset, tail anchor, model/provider context) in memory and persists a
+restart checkpoint at `.cache/codex_index.json` beside the dashboard
+script. The checkpoint is a derived cache: it is tied to the published
+generation (sha256 of `codex_router_events.jsonl`) and is rejected
+wholesale when missing, corrupt, or mismatched. It is safe to delete
+at any time, it is never a source of truth, and a failed checkpoint
+write must never fail a publish.

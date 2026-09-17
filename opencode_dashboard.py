@@ -687,6 +687,14 @@ CODEX_DIR = _HOME / ".codex" / "sessions"
 _codex_cache = {}
 _codex_sig = None
 
+CODEX_PARSER_VERSION = 1
+CODEX_CACHE_DIR = Path(__file__).with_name(".cache")
+CODEX_INDEX = CODEX_CACHE_DIR / "codex_index.json"
+_codex_file_state = {}
+_codex_ev_state = {}
+_codex_index_note = None
+_CODEX_ANCHOR_LEN = 64
+
 # F5b: one shared rollout enumeration for diagnostics, the session list and
 # the synth reader - same root, same name pattern, same states.
 CODEX_ROLLOUT_GLOB = "rollout-*.jsonl"
@@ -745,116 +753,341 @@ def _ctext(blocks):
             out.append(b["text"])
     return " ".join(out)
 
-def _parse_codex_file(p, st):
-    row = {"file": str(p), "name": p.stem, "n": 0, "tok": 0, "tools": {},
-           "previews": [], "model": "", "provider": "", "cwd": "",
-           "sid": "", "first": "", "last": "",
-           "_sz": st.st_size, "_mt": int(st.st_mtime),
-           "_invalid": 0, "_err": False}
+def _codex_new_row(p, st):
+    return {"file": str(p), "name": p.stem, "n": 0, "tok": 0, "tools": {},
+            "previews": [], "model": "", "provider": "", "cwd": "",
+            "sid": "", "first": "", "last": "",
+            "_sz": st.st_size, "_mt": int(st.st_mtime),
+            "_invalid": 0, "_err": False}
+
+
+def _codex_finish(row):
+    out = dict(row)
+    out["tools"] = sorted(row["tools"].items(), key=lambda kv: kv[1],
+                          reverse=True)[:8]
+    return out
+
+
+def _codex_consume(row, line):
+    line = line.strip()
+    if not line:
+        return
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(rec, dict):
+        row["_invalid"] += 1
+        return
+    t = rec.get("type")
+    pl = rec.get("payload")
+    if not isinstance(pl, dict):
+        pl = {}
+    ts = rec.get("timestamp") or ""
+    if ts:
+        if not row["first"]:
+            row["first"] = ts
+        row["last"] = ts
+    if t == "session_meta":
+        row["sid"] = pl.get("id") or row["sid"]
+        row["cwd"] = pl.get("cwd") or row["cwd"]
+        row["provider"] = pl.get("model_provider") or row["provider"]
+    elif t == "event_msg":
+        row["n"] += 1
+        txt = _ctext((pl.get("item") or {}).get("content"))
+        if txt and len(row["previews"]) < 3:
+            row["previews"].append(txt[:200])
+    elif t == "response_item":
+        nm = pl.get("name")
+        if nm:
+            row["tools"][nm] = row["tools"].get(nm, 0) + 1
+        txt = _ctext(pl.get("content"))
+        if txt and len(row["previews"]) < 3:
+            row["previews"].append(txt[:200])
+    elif t == "turn_context":
+        if not row["model"] and pl.get("model"):
+            row["model"] = pl["model"]
+    elif t == "token_usage_record":
+        u = pl.get("usage") or {}
+        try:
+            row["tok"] += int(u.get("total_tokens") or 0)
+        except (TypeError, ValueError):
+            pass
+
+
+def _parse_codex_file(p, st, row=None):
+    if row is None:
+        row = _codex_new_row(p, st)
     try:
         fh = open(p, encoding="utf-8", errors="replace")
     except OSError:
         row["_err"] = True
-        return row
+        return _codex_finish(row)
     with fh:
         for line in fh:
-            line = line.strip()
-            if not line:
+            _codex_consume(row, line)
+    row["_sz"] = st.st_size
+    row["_mt"] = int(st.st_mtime)
+    return _codex_finish(row)
+
+
+def _codex_files_sig(files, schema=None):
+    parts = []
+    for p in files:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        parts.append((str(p), st.st_size, st.st_mtime_ns,
+                      getattr(st, "st_ino", 0)))
+    if schema is None:
+        return (CODEX_PARSER_VERSION, tuple(sorted(parts)))
+    return (schema, CODEX_PARSER_VERSION, tuple(sorted(parts)))
+
+
+def _codex_split(data):
+    lines = []
+    start = 0
+    while True:
+        nl = data.find(b"\n", start)
+        if nl < 0:
+            break
+        lines.append(data[start:nl].decode("utf-8", "replace"))
+        start = nl + 1
+    return lines, start
+
+
+def _codex_full_read(p, fp):
+    with open(p, "rb") as fh:
+        data = fh.read()
+    lines, used = _codex_split(data)
+    tail = data[max(0, used - _CODEX_ANCHOR_LEN):used]
+    return lines, used, fp, True, tail
+
+
+def _codex_anchor_ok(p, off, tail):
+    want = (tail or b"")[-_CODEX_ANCHOR_LEN:]
+    begin = off - len(want)
+    if begin < 0 or not want:
+        return False
+    with open(p, "rb") as fh:
+        fh.seek(begin)
+        got = fh.read(len(want))
+    return got == want
+
+
+def _codex_read_since(p, state):
+    st = p.stat()
+    fp = (st.st_size, st.st_mtime_ns, getattr(st, "st_ino", 0))
+    if state is None:
+        return _codex_full_read(p, fp)
+    old_fp = state.get("fp") or (0, 0, 0)
+    old_off = int(state.get("offset") or 0)
+    old_tail = state.get("tail")
+    rebuild = (old_tail is None or fp[0] < old_off or fp[2] != old_fp[2]
+               or (old_fp[1] is not None and fp[1] < (old_fp[1] or 0)))
+    if not rebuild and fp != old_fp and old_off > 0:
+        if fp[0] == old_off:
+            rebuild = True
+        else:
+            rebuild = not _codex_anchor_ok(p, old_off, old_tail)
+    if rebuild:
+        return _codex_full_read(p, fp)
+    if fp[0] == old_off:
+        return [], old_off, fp, False, old_tail
+    with open(p, "rb") as fh:
+        fh.seek(old_off)
+        data = fh.read()
+    lines, used = _codex_split(data)
+    tail = (old_tail + data[:used])[-_CODEX_ANCHOR_LEN:] if used else old_tail
+    return lines, old_off + used, fp, False, tail
+
+
+def _codex_update_row(p, st, state):
+    cur_fp = (st.st_size, st.st_mtime_ns, getattr(st, "st_ino", 0))
+    if state is not None and state.get("fp") == cur_fp:
+        return state
+    try:
+        lines, off, fp, rebuild, tail = _codex_read_since(p, state)
+    except OSError:
+        row = _codex_new_row(p, st)
+        row["_err"] = True
+        return {"fp": cur_fp,
+                "offset": int((state or {}).get("offset") or 0),
+                "row": row, "tail": (state or {}).get("tail") or b""}
+    if state is not None and not rebuild:
+        row = state["row"]
+    else:
+        row = _codex_new_row(p, st)
+    for line in lines:
+        _codex_consume(row, line)
+    row["_sz"] = st.st_size
+    row["_mt"] = int(st.st_mtime)
+    return {"fp": fp, "offset": off, "row": row, "tail": tail}
+
+
+def _file_sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_codex_index(rows):
+    # Checkpoint is a restart optimization, never a source of truth: a write
+    # failure must not fail the publish or roll back published data.
+    global _codex_index_note
+    tmp = None
+    try:
+        CODEX_INDEX.parent.mkdir(parents=True, exist_ok=True)
+        generation = _file_sha256(CODEX_SYNTH) if CODEX_SYNTH.is_file() else None
+        files_doc = {}
+        for key, state in _codex_ev_state.items():
+            try:
+                st = Path(key).stat()
+            except OSError:
+                continue
+            files_doc[key] = {
+                "size": st.st_size,
+                "mtime_ns": st.st_mtime_ns,
+                "ino": getattr(st, "st_ino", 0),
+                "offset": int(state.get("offset") or 0),
+                "model": state.get("model", ""),
+                "provider": state.get("provider", "?"),
+                "tail": (state.get("tail") or b"").hex(),
+                "events": state.get("events", []),
+            }
+        doc = {"version": CODEX_PARSER_VERSION, "schema": SYNTH_SCHEMA,
+               "generation": generation, "files": files_doc}
+        tmp = CODEX_INDEX.with_name(CODEX_INDEX.name + ".tmp.%d.%d" % (
+            os.getpid(), threading.get_ident()))
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(doc, f)
+            f.flush()
+        os.replace(str(tmp), str(CODEX_INDEX))
+        _codex_index_note = None
+        return True
+    except OSError:
+        if tmp is not None:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+        _codex_index_note = "codex index write failed (restart optimization lost)"
+        return False
+
+
+def _load_codex_index(files):
+    # Adopt a checkpoint only when it matches the published generation and the
+    # sources still line up; otherwise reject the checkpoint (never the user
+    # logs) and let the caller rebuild from scratch.
+    if _codex_ev_state:
+        return False
+    try:
+        doc = json.loads(CODEX_INDEX.read_bytes().decode("utf-8"))
+        if doc.get("version") != CODEX_PARSER_VERSION:
+            return False
+        if doc.get("schema") != SYNTH_SCHEMA:
+            return False
+        if not CODEX_SYNTH.is_file():
+            return False
+        if doc.get("generation") != _file_sha256(CODEX_SYNTH):
+            return False
+        entries = doc.get("files")
+        if not isinstance(entries, dict):
+            return False
+        adopted = {}
+        for p in files:
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            e = entries.get(str(p))
+            if not isinstance(e, dict):
                 continue
             try:
-                rec = json.loads(line)
+                off = int(e.get("offset") or 0)
+            except (TypeError, ValueError):
+                continue
+            if off < 0 or st.st_size < off:
+                continue
+            saved_ino = e.get("ino") or 0
+            ino = getattr(st, "st_ino", 0)
+            if saved_ino and ino and saved_ino != ino:
+                continue
+            raw_tail = e.get("tail")
+            if not isinstance(raw_tail, str):
+                continue
+            try:
+                tail = bytes.fromhex(raw_tail)
             except ValueError:
                 continue
-            if not isinstance(rec, dict):
-                row["_invalid"] += 1
-                continue
-            t = rec.get("type")
-            pl = rec.get("payload")
-            if not isinstance(pl, dict):
-                pl = {}
-            ts = rec.get("timestamp") or ""
-            if ts:
-                if not row["first"]:
-                    row["first"] = ts
-                row["last"] = ts
-            if t == "session_meta":
-                row["sid"] = pl.get("id") or row["sid"]
-                row["cwd"] = pl.get("cwd") or row["cwd"]
-                row["provider"] = pl.get("model_provider") or row["provider"]
-            elif t == "event_msg":
-                row["n"] += 1
-                txt = _ctext((pl.get("item") or {}).get("content"))
-                if txt and len(row["previews"]) < 3:
-                    row["previews"].append(txt[:200])
-            elif t == "response_item":
-                nm = pl.get("name")
-                if nm:
-                    row["tools"][nm] = row["tools"].get(nm, 0) + 1
-                txt = _ctext(pl.get("content"))
-                if txt and len(row["previews"]) < 3:
-                    row["previews"].append(txt[:200])
-            elif t == "turn_context":
-                if not row["model"] and pl.get("model"):
-                    row["model"] = pl["model"]
-            elif t == "token_usage_record":
-                u = pl.get("usage") or {}
-                try:
-                    row["tok"] += int(u.get("total_tokens") or 0)
-                except (TypeError, ValueError):
-                    pass
-    tl = row.pop("tools")
-    row["tools"] = sorted(tl.items(), key=lambda kv: kv[1], reverse=True)[:8]
-    return row
+            adopted[str(p)] = {
+                "fp": (int(e.get("size") or 0), int(e.get("mtime_ns") or 0),
+                       saved_ino or ino),
+                "offset": off,
+                "model": str(e.get("model") or ""),
+                "provider": str(e.get("provider") or "?"),
+                "events": list(e.get("events") or []),
+                "tail": tail,
+            }
+        if not adopted:
+            return False
+        _codex_ev_state.update(adopted)
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
 
 def query_codex(force=False):
     global _codex_cache, _codex_sig
     files, _cstate, cskip = _codex_rollout_files()
     skipped = cskip
-    tot = 0
-    for p in files:
-        try:
-            s = p.stat()
-            tot += s.st_size + int(s.st_mtime)
-        except OSError:
-            skipped += 1
-    sig = (len(files), tot)
+    sig = _codex_files_sig(files)
     if force or _codex_sig != sig:
-        rows = {}
+        new_states = {}
         for p in files:
             try:
                 st = p.stat()
             except OSError:
                 continue
             key = str(p)
-            old = _codex_cache.get(key)
-            if (not force and old and old.get("_sz") == st.st_size
-                    and old.get("_mt") == int(st.st_mtime)):
-                rows[key] = old
-                continue
-            rows[key] = _parse_codex_file(p, st)
-        _codex_cache = rows
+            new_states[key] = _codex_update_row(
+                p, st, None if force else _codex_file_state.get(key))
+        _codex_file_state.clear()
+        _codex_file_state.update(new_states)
         _codex_sig = sig
-    sess = [r for r in _codex_cache.values() if r.get("n")]
-    sess.sort(key=lambda r: r.get("last") or "", reverse=True)
-    models = {}
-    t_tok = 0
-    t_msg = 0
+    sess = []
     invalid = 0
-    for r in _codex_cache.values():
-        invalid += int(r.get("_invalid") or 0)
-        if r.get("_err"):
+    for key in sorted(_codex_file_state):
+        row = _codex_file_state[key]["row"]
+        if row.get("_err"):
             skipped += 1
-    for r in sess:
-        m = r.get("model") or r.get("provider") or "?"
-        e = models.setdefault(m, {"n": 0, "tok": 0})
-        e["n"] += 1
-        e["tok"] += r.get("tok", 0)
-        t_tok += r.get("tok", 0)
-        t_msg += r.get("n", 0)
-    return {"ok": True, "total": len(sess), "files": len(files),
-            "tokens": t_tok, "msgs": t_msg, "models": models,
-            "invalid_records": invalid, "partial": bool(skipped),
-            "sessions": sess[:200]}
+        invalid += row.get("_invalid", 0)
+        if row.get("n") or row.get("tok"):
+            sess.append(_codex_finish(row))
+    sess.sort(key=lambda r: r.get("last") or "", reverse=True)
+    models = sorted({(r.get("model") or r.get("provider") or "?") for r in sess})
+    tokens = sum(r.get("tok", 0) for r in sess)
+    msgs = sum(r.get("n", 0) for r in sess)
+    return {
+        "ok": True,
+        "total": len(sess),
+        "files": len(files),
+        "tokens": tokens,
+        "msgs": msgs,
+        "models": models,
+        "invalid_records": invalid,
+        "partial": bool(skipped),
+        "sessions": sess[:200],
+    }
+
 
 CODEX_SYNTH = Path(__file__).with_name("codex_router_events.jsonl")
 _codex_ev_cache = {}
@@ -874,55 +1107,68 @@ def _numi(v):
         return 0
 
 def _parse_codex_events(p):
-    evs = []
-    provider = "?"
-    model = ""
+    key = str(p)
+    state = _codex_ev_state.get(key)
     try:
-        fh = open(p, "r", encoding="utf-8", errors="replace")
+        st = p.stat()
     except OSError:
-        return evs
-    with fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
+        return []
+    fp = (st.st_size, st.st_mtime_ns, getattr(st, "st_ino", 0))
+    if state is not None and state.get("fp") == fp:
+        return list(state["events"])
+    try:
+        lines, off, fp, rebuild, tail = _codex_read_since(p, state)
+    except OSError:
+        return []
+    if state is not None and not rebuild:
+        model = state.get("model", "")
+        provider = state.get("provider", "?")
+        events = state["events"]
+    else:
+        model = ""
+        provider = "?"
+        events = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        pay = rec.get("payload")
+        if not isinstance(pay, dict):
+            continue
+        t = rec.get("type")
+        if t == "session_meta":
+            provider = str(pay.get("model_provider") or pay.get("provider")
+                           or provider)
+        elif t == "turn_context":
+            model = str(pay.get("model") or model)
+        elif t == "token_usage_record":
+            u = pay.get("usage")
+            if not isinstance(u, dict):
                 continue
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(rec, dict):
-                continue
-            pay = rec.get("payload")
-            if not isinstance(pay, dict):
-                continue
-            t = rec.get("type")
-            if t == "session_meta":
-                provider = str(pay.get("model_provider") or pay.get("provider") or provider)
-            elif t == "turn_context":
-                model = str(pay.get("model") or model)
-            elif t == "token_usage_record":
-                u = pay.get("usage")
-                if not isinstance(u, dict):
-                    continue
-                evs.append({"at": rec.get("timestamp"), "model": model,
-                            "provider": provider,
-                            "ti": _numi(u.get("input_tokens")),
-                            "cache": _numi(u.get("cached_input_tokens")),
-                            "to": _numi(u.get("output_tokens")),
-                            "total": _numi(u.get("total_tokens")),
-                            "reasoning": _numi(u.get("reasoning_output_tokens")),
-                            "cache_write": _numi(u.get("cache_write_input_tokens"))})
-    return evs
+            events.append({"at": rec.get("timestamp"), "model": model,
+                           "provider": provider,
+                           "ti": _numi(u.get("input_tokens")),
+                           "cache": _numi(u.get("cached_input_tokens")),
+                           "to": _numi(u.get("output_tokens")),
+                           "total": _numi(u.get("total_tokens")),
+                           "reasoning": _numi(u.get("reasoning_output_tokens")),
+                           "cache_write": _numi(u.get("cache_write_input_tokens"))})
+    _codex_ev_state[key] = {"fp": fp, "offset": off, "model": model,
+                            "provider": provider, "events": events,
+                            "tail": tail}
+    return list(events)
+
 
 def _synth_sig_of(files):
-    tot = 0
-    for p in files:
-        try:
-            st = p.stat()
-            tot += st.st_size + int(st.st_mtime)
-        except OSError:
-            pass
-    return (SYNTH_SCHEMA, len(files), tot)
+    # Non-additive per-file fingerprint: identity, size, mtime_ns, inode.
+    return _codex_files_sig(files, schema=SYNTH_SCHEMA)
+
 
 def _cleanup_synth_tmps():
     # F6a: remove stale candidates matching our own naming pattern only.
@@ -957,6 +1203,7 @@ def ensure_codex_synth(force=False):
     global _codex_ev_cache, _codex_ev_sig, _codex_last_error, _codex_last_ok
     _cleanup_synth_tmps()
     files, _cstate, _cskip = _codex_rollout_files()
+    _load_codex_index(files)
     sig = _synth_sig_of(files)
     if not force and _codex_ev_sig == sig and CODEX_SYNTH.is_file():
         _codex_last_error = None
@@ -968,11 +1215,6 @@ def ensure_codex_synth(force=False):
         except OSError:
             continue
         key = str(p)
-        old = _codex_ev_cache.get(key)
-        if (not force and old is not None and old[0] == st.st_size
-                and old[1] == int(st.st_mtime)):
-            rows[key] = old
-            continue
         rows[key] = (st.st_size, int(st.st_mtime), _parse_codex_events(p))
     tmp = CODEX_SYNTH.with_name(CODEX_SYNTH.name + ".tmp.%d.%d.%d" % (
         os.getpid(), threading.get_ident(), _synth_next_seq()))
@@ -1009,6 +1251,7 @@ def ensure_codex_synth(force=False):
             _codex_ev_sig = sig
             _codex_last_ok = str(CODEX_SYNTH)
             _codex_last_error = None
+            _write_codex_index(rows)
             return str(CODEX_SYNTH), None
     except OSError as e:
         try:

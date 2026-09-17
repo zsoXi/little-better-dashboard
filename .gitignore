@@ -4,3 +4,4 @@ __pycache__/
 codex_router_events.jsonl
 artifacts/
 checkpoints/
+.cache/

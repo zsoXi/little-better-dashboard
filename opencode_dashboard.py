@@ -28,6 +28,9 @@ LOCAL_CACHE = {"key": None, "stats": None}
 ROUTER_CACHE = {"key": None, "stats": None}
 MAX_ROUTER_EVENTS = 30000  # most-recent lines scanned from usage-events.jsonl
 MAX_ROUTER_ROWS = 400  # recent requests kept in the /api/router payload
+MAX_ROUTER_RECORD_BYTES = 8 * 1024 * 1024  # F6b: per-record read cap
+_ROUTER_READ_BLOCK = 65536  # F6b: byte block size for tail reads/counts
+_ROUTER_COUNT_CACHE = {}  # F6b: str(path) -> line count + fingerprint
 SYNTH_SCHEMA = 3  # bump to force codex-synth rebuild when the writer changes
 
 # What-if paid pricing per 1M tokens (input, output) for known *-free models.
@@ -1624,6 +1627,178 @@ def _router_outcome(status_value, status_present, outcome_value=None):
     return None, "unknown"
 
 
+class _Unterminated(str):
+    """A source line that reached EOF without a trailing newline."""
+
+
+class _OverlongLine(object):
+    """Marker for a source line above MAX_ROUTER_RECORD_BYTES."""
+
+
+_OVERLONG = _OverlongLine()
+
+
+def _router_count_lines(path):
+    """Exact physical line count for the usage file, cached and incremental.
+
+    Returns (lines, cached). Cold reads stream the file in bounded chunks
+    (never ``readlines``); a warm read with an unchanged fingerprint reuses
+    the count; an append counts only the newly written byte range; a shrink
+    or an identity change (rotation) falls back to a cold recount.
+    """
+    p = Path(path)
+    key = str(p)
+    try:
+        st = p.stat()
+    except OSError:
+        raise RuntimeError(f"Router usage file not found: {path}")
+    size, mtime = st.st_size, st.st_mtime_ns
+    ent = _ROUTER_COUNT_CACHE.get(key)
+    if ent and ent["size"] == size and ent["mtime_ns"] == mtime:
+        return ent["lines"], True
+    block = _ROUTER_READ_BLOCK
+    cached = False
+    newlines = 0
+    last = b""
+    try:
+        with open(str(p), "rb") as f:
+            if ent and getattr(st, "st_ino", 0) == ent.get("ino") and size > ent["size"]:
+                added = size - ent["size"]
+                f.seek(ent["size"])
+                while added > 0:
+                    chunk = f.read(block if block < added else added)
+                    if not chunk:
+                        break
+                    added -= len(chunk)
+                    newlines += chunk.count(b"\n")
+                    last = chunk[-1:]
+                newlines += ent["newlines"]
+                cached = True
+            else:
+                while True:
+                    chunk = f.readline(block)
+                    if not chunk:
+                        break
+                    newlines += chunk.count(b"\n")
+                    last = chunk[-1:]
+    except OSError:
+        raise RuntimeError(f"Router usage file not found: {path}")
+    lines = newlines + (1 if size > 0 and last != b"\n" else 0)
+    _ROUTER_COUNT_CACHE[key] = {
+        "size": size, "mtime_ns": mtime, "ino": getattr(st, "st_ino", 0),
+        "newlines": newlines, "lines": lines,
+    }
+    return lines, cached
+
+
+def _router_read_tail(path, limit, cap):
+    """Last ``limit`` physical source lines of the usage file, as text.
+
+    Reads backwards in bounded byte blocks (never ``readlines``), assembles
+    complete lines before decoding (CRLF and multibyte safe across chunk
+    boundaries), and marks an unterminated final line so callers can treat
+    it as pending. Lines above ``cap`` bytes yield the _OVERLONG marker
+    instead of their content. meta records partial_head (the byte window
+    started mid-line, so the leading fragment is not a candidate) and
+    ends_with_newline.
+    """
+    p = Path(path)
+    meta = {"partial_head": False, "ends_with_newline": True}
+    try:
+        size = p.stat().st_size
+    except OSError:
+        raise RuntimeError(f"Router usage file not found: {path}")
+    if not size:
+        return [], meta
+    block = _ROUTER_READ_BLOCK
+    buf = b""
+    pos = size
+    try:
+        with open(str(p), "rb") as f:
+            while pos > 0 and buf.count(b"\n") <= limit:
+                step = block if pos >= block else pos
+                pos -= step
+                f.seek(pos)
+                buf = f.read(step) + buf
+            f.seek(size - 1)
+            meta["ends_with_newline"] = f.read(1) == b"\n"
+            if pos > 0:
+                f.seek(pos - 1)
+                meta["partial_head"] = f.read(1) != b"\n"
+    except OSError:
+        raise RuntimeError(f"Router usage file not found: {path}")
+    parts = buf.split(b"\n")
+    if buf.endswith(b"\n"):
+        parts = parts[:-1]
+    parts = parts[-limit:]
+    out = []
+    for i, raw in enumerate(parts):
+        if len(raw) > cap:
+            out.append(_OVERLONG)
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        if i == len(parts) - 1 and not meta["ends_with_newline"]:
+            text = _Unterminated(text)
+        out.append(text)
+    return out, meta
+
+
+def _router_stream_lines(path, cap):
+    """Lazily yield every physical source line of the usage file as text.
+
+    Memory stays bounded: blocks are read at a fixed size and lines are
+    assembled before decoding; a line above ``cap`` bytes yields _OVERLONG
+    once and the remainder of that line is discarded. The final line, when
+    EOF is reached without a newline, yields _Unterminated text. Returns
+    (generator, meta); meta['last_terminated'] mirrors the newline state.
+    """
+    p = Path(path)
+    meta = {"last_terminated": True, "partial_head": False}
+    try:
+        f = open(str(p), "rb")
+    except OSError:
+        raise RuntimeError(f"Router usage file not found: {path}")
+
+    def gen():
+        buf = b""
+        overlong = False
+        block = _ROUTER_READ_BLOCK
+        try:
+            while True:
+                chunk = f.readline(block)
+                if not chunk:
+                    break
+                buf += chunk
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        if len(buf) > cap and not overlong:
+                            overlong = True
+                            yield _OVERLONG
+                            buf = b""
+                        break
+                    line = buf[:nl]
+                    buf = buf[nl + 1:]
+                    if overlong:
+                        overlong = False
+                        continue
+                    if len(line) > cap:
+                        yield _OVERLONG
+                    else:
+                        yield line.decode("utf-8", errors="replace")
+            if buf:
+                meta["last_terminated"] = False
+                if not overlong:
+                    if len(buf) > cap:
+                        yield _OVERLONG
+                    else:
+                        yield _Unterminated(buf.decode("utf-8", errors="replace"))
+        finally:
+            f.close()
+
+    return gen(), meta
+
+
 def parse_router_events(path, limit=MAX_ROUTER_EVENTS, synth_context=False):
     """Read usage-events.jsonl tail; return (events, problems).
 
@@ -1651,24 +1826,57 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS, synth_context=False):
     an explicit success/error outcome are forced to unknown even if they
     carry a legacy status 200, so a stale pre-migration index can never
     read as confirmed successes.
+
+    Reading is bounded (F6b): a numeric ``limit`` scans only that many
+    physical source lines read from the end of the file in byte blocks
+    (never ``readlines`` of the whole file); ``limit=None`` streams the
+    whole file for synthesis. ``problems`` carries read metadata beside the
+    token problem counters: ``candidate_lines`` (source lines considered in
+    the scanned window), ``valid_records`` (parsed events),
+    ``oversize_records`` (lines above MAX_ROUTER_RECORD_BYTES, skipped but
+    counted), ``pending_tail_line`` (an unterminated trailing fragment that
+    is not valid JSON yet), ``partial_head``, ``window_mode``
+    ('full'|'physical_tail'), ``lines_total`` and ``count_cached``.
     """
     p = Path(path)
-    try:
-        with open(p, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
-        raise RuntimeError(f"Router usage file not found: {path}")
-    if limit and len(lines) > limit:
-        lines = lines[-limit:]
-    problems = {"invalid_records": 0, "total_conflicts": 0}
+    problems = {
+        "invalid_records": 0,
+        "total_conflicts": 0,
+        "candidate_lines": 0,
+        "valid_records": 0,
+        "oversize_records": 0,
+        "pending_tail_line": False,
+        "partial_head": False,
+        "window_mode": "full",
+        "lines_total": 0,
+        "count_cached": False,
+    }
+    lines_total, count_cached = _router_count_lines(p)
+    problems["lines_total"] = lines_total
+    problems["count_cached"] = count_cached
     events = []
+    if limit:
+        lines, meta = _router_read_tail(p, limit, MAX_ROUTER_RECORD_BYTES)
+        problems["partial_head"] = meta["partial_head"]
+        problems["window_mode"] = (
+            "full" if len(lines) >= lines_total else "physical_tail")
+    else:
+        lines, meta = _router_stream_lines(p, MAX_ROUTER_RECORD_BYTES)
     for line in lines:
+        if line is _OVERLONG:
+            problems["oversize_records"] += 1
+            problems["candidate_lines"] += 1
+            continue
+        unterminated = isinstance(line, _Unterminated)
+        problems["candidate_lines"] += 1
         line = line.strip()
         if not line:
             continue
         try:
             e = json.loads(line)
         except ValueError:
+            if unterminated:
+                problems["pending_tail_line"] = True
             continue
         if not isinstance(e, dict):
             continue
@@ -1741,6 +1949,7 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS, synth_context=False):
                 "usage_known": usage_known,
             }
         )
+    problems["valid_records"] = len(events)
     return events, problems
 
 
@@ -1785,17 +1994,12 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     events carry no project info, so attribution is timestamp-only, request
     tokens in the 24h window before each commit.
     """
-    try:
-        with open(events_path, "r", encoding="utf-8", errors="replace") as f:
-            total_lines = sum(1 for _ in f)
-    except OSError:
-        raise RuntimeError(f"Router usage file not found: {events_path}")
     if full_scan:
-        truncated = False
-        scanned_events, problems = parse_router_events(events_path, None, synth_context=full_scan)
+        scanned_events, problems = parse_router_events(events_path, None, synth_context=True)
     else:
-        truncated = total_lines > MAX_ROUTER_EVENTS
-        scanned_events, problems = parse_router_events(events_path, MAX_ROUTER_EVENTS, synth_context=full_scan)
+        scanned_events, problems = parse_router_events(events_path, MAX_ROUTER_EVENTS, synth_context=False)
+    total_lines = problems["lines_total"]
+    truncated = (not full_scan) and problems["window_mode"] == "physical_tail"
     # Events with no usage measurement (usage_known False: explicit zero
     # counts as measured) are excluded from every count and average -
     # never estimated, and reported separately as `unmetered`.
@@ -2056,6 +2260,10 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         "scanned": len(scanned_events),
         "total_lines": total_lines,
         "truncated": truncated,
+        "window_mode": problems["window_mode"],
+        "candidate_lines": problems["candidate_lines"],
+        "pending_tail_line": problems["pending_tail_line"],
+        "oversize_records": problems["oversize_records"],
     }
     return stats
 
@@ -2101,6 +2309,10 @@ def blank_router_stats(error=None):
         "scanned": 0,
         "total_lines": 0,
         "truncated": False,
+        "window_mode": "full",
+        "candidate_lines": 0,
+        "pending_tail_line": False,
+        "oversize_records": 0,
     }
     if error:
         stats["error"] = error

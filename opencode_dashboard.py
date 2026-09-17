@@ -1099,6 +1099,11 @@ _codex_last_ok = None  # F5a: path of the last successful publish
 _SYNTH_LOCK = threading.Lock()
 _synth_tmp_active = set()
 _synth_tmp_seq = 0
+# F6d: single-build gate. Concurrent callers share one parse: waiters block
+# on the builder's condition (bounded to 30 s) and then reuse the published
+# snapshot; heavy work never multiplies per client request.
+_CODEX_BUILD_LOCK = threading.Condition()
+_codex_build_in_progress = False
 
 def _numi(v):
     try:
@@ -1201,6 +1206,7 @@ def ensure_codex_synth(force=False):
     # Readers are lock-free: os.replace yields a complete A or B snapshot.
     # Lock scope is thread-level within this process (single instance).
     global _codex_ev_cache, _codex_ev_sig, _codex_last_error, _codex_last_ok
+    global _codex_build_in_progress
     _cleanup_synth_tmps()
     files, _cstate, _cskip = _codex_rollout_files()
     _load_codex_index(files)
@@ -1208,64 +1214,86 @@ def ensure_codex_synth(force=False):
     if not force and _codex_ev_sig == sig and CODEX_SYNTH.is_file():
         _codex_last_error = None
         return str(CODEX_SYNTH), None
-    rows = {}
-    for p in files:
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        key = str(p)
-        rows[key] = (st.st_size, int(st.st_mtime), _parse_codex_events(p))
-    tmp = CODEX_SYNTH.with_name(CODEX_SYNTH.name + ".tmp.%d.%d.%d" % (
-        os.getpid(), threading.get_ident(), _synth_next_seq()))
-    _synth_tmp_active.add(tmp.name)
+    if not force:
+        deadline = time.time() + 30.0
+        with _CODEX_BUILD_LOCK:
+            while True:
+                if _codex_ev_sig == sig and CODEX_SYNTH.is_file():
+                    _codex_last_error = None
+                    return str(CODEX_SYNTH), None
+                if not _codex_build_in_progress:
+                    _codex_build_in_progress = True
+                    break
+                if time.time() > deadline:
+                    msg = "codex synth build still in progress after 30 s"
+                    _codex_last_error = msg
+                    raise RuntimeError(msg)
+                _CODEX_BUILD_LOCK.wait(
+                    timeout=min(5.0, max(0.05, deadline - time.time())))
     try:
-        with open(tmp, "w", encoding="utf-8", newline="") as f:
-            for key in sorted(rows):
-                for e in rows[key][2]:
-                    f.write(json.dumps({"at": e["at"], "model": e["model"],
-                        "provider": e["provider"], "status": None,
-                        "outcome": "unknown",
-                        "inputTokens": e["ti"], "cachedInputTokens": e["cache"],
-                        "outputTokens": e["to"], "totalTokens": e["total"],
-                        "reasoningTokens": e.get("reasoning", 0),
-                        "cacheWriteInputTokens": e.get("cache_write", 0),
-                        "durationMs": None}) + "\n")
-            f.flush()
-        with _SYNTH_LOCK:
-            superseded = False
-            if not force:
-                if _codex_ev_sig == sig:
-                    superseded = CODEX_SYNTH.is_file()
-                elif _synth_sig_of(files) != sig and CODEX_SYNTH.is_file():
-                    superseded = True
-            if superseded:
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
-                _codex_last_error = None
-                return str(CODEX_SYNTH), None
-            os.replace(str(tmp), str(CODEX_SYNTH))
-            _codex_ev_cache = rows
-            _codex_ev_sig = sig
-            _codex_last_ok = str(CODEX_SYNTH)
-            _codex_last_error = None
-            _write_codex_index(rows)
-            return str(CODEX_SYNTH), None
-    except OSError as e:
+        rows = {}
+        for p in files:
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            key = str(p)
+            rows[key] = (st.st_size, int(st.st_mtime), _parse_codex_events(p))
+        tmp = CODEX_SYNTH.with_name(CODEX_SYNTH.name + ".tmp.%d.%d.%d" % (
+            os.getpid(), threading.get_ident(), _synth_next_seq()))
+        _synth_tmp_active.add(tmp.name)
         try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
-        msg = "codex synth publish failed: %s: %s" % (type(e).__name__, e)
-        _codex_last_error = msg
-        if CODEX_SYNTH.is_file():
-            return str(CODEX_SYNTH), msg
-        raise RuntimeError(msg) from e
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                for key in sorted(rows):
+                    for e in rows[key][2]:
+                        f.write(json.dumps({"at": e["at"], "model": e["model"],
+                            "provider": e["provider"], "status": None,
+                            "outcome": "unknown",
+                            "inputTokens": e["ti"], "cachedInputTokens": e["cache"],
+                            "outputTokens": e["to"], "totalTokens": e["total"],
+                            "reasoningTokens": e.get("reasoning", 0),
+                            "cacheWriteInputTokens": e.get("cache_write", 0),
+                            "durationMs": None}) + "\n")
+                f.flush()
+            with _SYNTH_LOCK:
+                superseded = False
+                if not force:
+                    if _codex_ev_sig == sig:
+                        superseded = CODEX_SYNTH.is_file()
+                    elif _synth_sig_of(files) != sig and CODEX_SYNTH.is_file():
+                        superseded = True
+                if superseded:
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+                    _codex_last_error = None
+                    return str(CODEX_SYNTH), None
+                os.replace(str(tmp), str(CODEX_SYNTH))
+                _codex_ev_cache = rows
+                _codex_ev_sig = sig
+                _codex_last_ok = str(CODEX_SYNTH)
+                _codex_last_error = None
+                _write_codex_index(rows)
+                return str(CODEX_SYNTH), None
+        except OSError as e:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            msg = "codex synth publish failed: %s: %s" % (type(e).__name__, e)
+            _codex_last_error = msg
+            if CODEX_SYNTH.is_file():
+                return str(CODEX_SYNTH), msg
+            raise RuntimeError(msg) from e
+        finally:
+            _synth_tmp_active.discard(tmp.name)
     finally:
-        _synth_tmp_active.discard(tmp.name)
+        if not force:
+            with _CODEX_BUILD_LOCK:
+                _codex_build_in_progress = False
+                _CODEX_BUILD_LOCK.notify_all()
 
 def router_events_path(handler_events):
     try:
@@ -2948,6 +2976,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="brand"><img class="brand-logo" src="/logo.png" alt="">OpenCode<small>· usage</small></div>
     <div class="spacer"></div>
     <span id="status"></span>
+    <span id="src-status" style="font-size:11px;opacity:.75;margin-left:10px;max-width:46ch;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></span>
     <button class="tbtn" id="theme">◐&nbsp; Light</button>
     <span class="export-wrap"><button class="tbtn" id="export">⤓ Export</button>
       <div class="expmenu" id="expmenu">
@@ -3244,6 +3273,34 @@ try{
 function authHeaders(extra){var h={'X-Window-Id':WID};if(AUTH_TOKEN)h['Authorization']='Bearer '+AUTH_TOKEN;if(extra)for(var k in extra)h[k]=extra[k];return h;}
 function authFetch(url,opts){opts=opts||{};if(String(url).indexOf('/api/')!==0)return fetch(url,opts);
   opts.headers=authHeaders(opts.headers||{});return fetch(url,opts);}
+/* F6d: shared JSON fetch. Auth comes from authFetch (token only for
+   local /api/ URLs, never arbitrary hosts). The AbortController deadline
+   covers receiving headers AND reading the whole body AND parsing it:
+   the timer is cleared only in finally, after the parse. HTTP 200 with
+   {error:...} / {ok:false} or invalid JSON is an explicit section error. */
+async function fetchJson(url,opts){
+  opts=opts||{};
+  var ms=(window.__ocdTimeouts&&window.__ocdTimeouts.fetchMs)||10000;
+  var started=Date.now();
+  var ac=('AbortController' in window)?new AbortController():null;
+  var fopts={};for(var k in opts)fopts[k]=opts[k];
+  if(ac)fopts.signal=ac.signal;
+  if(opts.signal&&ac){try{opts.signal.addEventListener('abort',function(){try{ac.abort();}catch(_){}});}catch(_){}}
+  var timer=null;
+  var deadline=new Promise(function(_,rej){timer=setTimeout(function(){rej(new Error('timeout after '+ms+' ms'));try{if(ac)ac.abort();}catch(_){}},ms);});
+  try{
+    var resp=await Promise.race([authFetch(url,fopts),deadline]);
+    var text=await Promise.race([resp.text(),deadline]);
+    if(Date.now()-started>ms)throw new Error('timeout after '+ms+' ms');
+    if(resp.status===401)throw Object.assign(new Error('unauthorized'),{status:401});
+    if(!resp.ok)throw Object.assign(new Error('HTTP '+resp.status),{status:resp.status});
+    var data=null;
+    if(text){try{data=JSON.parse(text);}catch(_){throw new Error('invalid JSON (status '+resp.status+')');}}
+    if(data&&data.error)throw new Error('source error: '+data.error);
+    if(data&&data.ok===false)throw new Error('source reported ok:false');
+    return data;
+  }finally{clearTimeout(timer);}
+}
 function showAuthLock(on){var el=document.getElementById('auth-lock');if(el)el.hidden=!on;
   var st=document.getElementById('status');if(on&&st)st.textContent='Authorization required — reopen via the launcher link';}
 function noteAuthFailure(){if(AUTH_FAILED)return;AUTH_FAILED=true;showAuthLock(true);}
@@ -4206,12 +4263,11 @@ function openSession(s){
   +'<div id="modal-prompts"><div class="empty">Loading prompts…</div></div></div>';
   $('overlay').classList.add('open');
   const x=$('modal').querySelector('.modal-x');if(x)x.focus();
-  authFetch('/api/session/'+encodeURIComponent(s.id)).then(r=>{if(r.status===401){noteAuthFailure();throw new Error('auth');}return r.json();}).then(pj=>{
+  fetchJson('/api/session/'+encodeURIComponent(s.id)).then(pj=>{
     const el=$('modal-prompts');if(!el)return;
-    if(pj&&pj.error){el.innerHTML='<div class="empty">'+ESC(pj.error)+'</div>';return;}
     const list=(pj&&pj.prompts)||[];
     el.innerHTML=list.length?list.slice().reverse().map(p=>'<div class="prompt"><span class="mono" style="font-size:10.5px;color:var(--subtle)">'+DT(p.t)+'</span><br>'+ESC(p.p)+'</div>').join(''):'<div class="empty">No prompts recorded.</div>';
-  }).catch(()=>{const el=$('modal-prompts');if(el)el.innerHTML='<div class="empty">Could not load prompts.</div>';});
+  }).catch(e=>{if(e&&e.status===401)noteAuthFailure();const el=$('modal-prompts');if(el)el.innerHTML='<div class="empty">'+(e&&e.status===401?'Authorization required — reopen via the launcher link':ESC('Could not load prompts: '+((e&&e.message)||'error')+' (reopen the session to retry).'))+'</div>';});
 }
 /* interactions */
 let lastFocus=null;
@@ -4359,53 +4415,92 @@ document.addEventListener('keydown',e=>{
     else if(!e.shiftKey&&document.activeElement===els[els.length-1]){e.preventDefault();els[0].focus();}
   }
 });
-/* boot */
-let loading=false;
+/* boot (F6d): independent per-section refresh, deadline and honest status */
+let loading=false,pendingRefresh=false;
+const SEC=window.__ocdState={sections:{},cycle:{}};
+const SECTIONS=[
+ {key:'stats',url:'/api/stats',validate:d=>d&&typeof d==='object'&&!d.error&&('totals' in d||'days' in d||'day_total' in d),render:d=>{S=d;renderAll();}},
+ {key:'router',url:'/api/router',validate:d=>d&&typeof d==='object'&&!d.error&&('totals' in d||'days' in d||'day_total' in d),render:d=>{R=d;renderRouter();}},
+ {key:'agents',url:'/api/agents',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.child_runs),render:d=>{SA=d;renderSubagents();renderConfig();}},
+ {key:'graph',url:'/api/graph',validate:d=>d&&typeof d==='object'&&!d.error&&d.nodes&&Array.isArray(d.roots),render:d=>{G=d;renderGraph();}},
+ {key:'sessions',url:'/api/sessions',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.rows),render:d=>{SB=d;renderSSTable();}},
+ {key:'projects',url:'/api/projects',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.rows),render:d=>{PJ=d;renderProjects();}},
+ {key:'signals',url:'/api/signals',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.signals),render:d=>{SG=d;renderSignals();}},
+ {key:'codex',url:'/api/codex',validate:d=>d&&d.ok===true&&Array.isArray(d.sessions),render:d=>{CX=d;renderCodex();}}
+];
+function secUnavailable(key,msg){
+  var tb=(key==='sessions')?document.querySelector('#sstbl tbody'):((key==='projects')?document.querySelector('#projtbl tbody'):null);
+  if(tb)tb.innerHTML='<tr><td colspan="5">unavailable: '+ESC(msg)+'</td></tr>';
+  if(key==='graph'){var g=document.getElementById('graph');if(g)g.textContent='unavailable: '+msg;}
+  if(key==='signals'){var s=document.getElementById('sig-chips');if(s)s.textContent='unavailable: '+msg;}
+  if(key==='codex'){var c=document.querySelector('#cx-tbl tbody');if(c)c.innerHTML='<tr><td colspan="6">unavailable: '+ESC(msg)+'</td></tr>';}
+}
+function secStrip(){
+  var sts=SEC.sections,parts=[];
+  SECTIONS.forEach(function(s){var st=sts[s.key];if(!st)return;var t=s.key+': '+st.state;
+    if((st.state==='stale'||st.state==='error')&&st.error)t+=' ('+st.error+')';
+    if((st.state==='stale'||st.state==='error')&&st.lastSuccess)t+=' last ok '+new Date(st.lastSuccess).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+    parts.push(t);});
+  var el=document.getElementById('src-status');if(el){el.textContent=parts.join(' · ');el.title=parts.join('; ');}
+}
 async function load(){
-  if(loading||AUTH_FAILED)return;
+  if(loading){pendingRefresh=true;return;}
+  if(AUTH_FAILED)return;
   if(!AUTH_TOKEN){showAuthLock(true);return;}
-  loading=true;$('refresh').disabled=true;
+  loading=true;pendingRefresh=false;$('refresh').disabled=true;
+  SEC.cycle={started:Date.now(),ok:0,failed:0,total:SECTIONS.length};
+  var results=await Promise.allSettled(SECTIONS.map(runSection));
+  var ok=0;for(var i=0;i<results.length;i++){if(results[i].status==='fulfilled'&&results[i].value)ok++;}
+  SEC.cycle.finished=Date.now();SEC.cycle.ok=ok;SEC.cycle.failed=SECTIONS.length-ok;
+  if(ok===SECTIONS.length&&!AUTH_FAILED){$('status').textContent='Updated '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
+  else{var bad=[];SECTIONS.forEach(function(s){var st=SEC.sections[s.key];if(st&&st.state!=='success')bad.push(s.key);});
+    $('status').textContent='Partial update: '+ok+'/'+SECTIONS.length+' sources'+(bad.length?(' (failed: '+bad.join(', ')+')'):'');}
+  secStrip();
+  loading=false;$('refresh').disabled=false;
+  if(pendingRefresh&&!AUTH_FAILED){pendingRefresh=false;load();}
+}
+async function runSection(s){
+  var st=SEC.sections[s.key];
+  if(!st){st=SEC.sections[s.key]={state:'idle',gen:0,inFlight:false,lastSuccess:0,error:null,data:null,ac:null};}
+  if(st.inFlight)return true;
+  st.inFlight=true;st.gen++;var gen=st.gen;
+  st.state=st.lastSuccess?'stale':'pending';
+  var ac=('AbortController' in window)?new AbortController():null;st.ac=ac;
   try{
-    const [r1,r2,r3,r4,r5,r6,r7,r8]=await Promise.all([
-      authFetch('/api/stats?_='+Date.now()),
-      authFetch('/api/router?_='+Date.now()),
-      authFetch('/api/agents?_='+Date.now()),
-      authFetch('/api/graph?_='+Date.now()),
-      authFetch('/api/sessions?_='+Date.now()),
-      authFetch('/api/projects?_='+Date.now()),
-      authFetch('/api/signals?_='+Date.now()),
-      authFetch('/api/codex?_='+Date.now()),
-    ]);
-    for(const _r of [r1,r2,r3,r4,r5,r6,r7,r8]){if(_r.status===401){noteAuthFailure();return;}}
-    if(!r1.ok)throw new Error('HTTP '+r1.status);
-    S=await r1.json();renderAll();
-    try{if(r3.ok){SA=await r3.json();renderSubagents();renderConfig();}}catch(_){}
-    try{if(r4.ok){G=await r4.json();renderGraph();}}catch(_){}
-    try{if(r5.ok){SB=await r5.json();renderSSTable();}}catch(_){}
-    try{if(r6.ok){PJ=await r6.json();renderProjects();}}catch(_){}
-    try{if(r7.ok){SG=await r7.json();renderSignals();}}catch(_){}
-    try{if(r8.ok){CX=await r8.json();renderCodex();}}catch(_){}
-    try{if(r2.ok){R=await r2.json();if(TAB==='router')renderRouter();else renderRouter();}}catch(_){}
-    $('status').textContent='Updated '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-  }catch(e){$('status').textContent='Failed: '+e.message;}
-  finally{loading=false;$('refresh').disabled=false;}
+    var d=await fetchJson(s.url+((s.url.indexOf('?')<0)?'?':'&')+'_='+Date.now(),ac?{signal:ac.signal}:{});
+    if(!s.validate(d))throw new Error('unexpected payload shape');
+    if(gen!==st.gen)return true;
+    st.data=d;st.state='success';st.lastSuccess=Date.now();st.error=null;
+    s.render(d);
+    return true;
+  }catch(e){
+    if(e&&e.status===401){noteAuthFailure();return false;}
+    if(gen!==st.gen)return true;
+    st.error=(e&&e.message)?e.message:String(e);
+    if(st.lastSuccess){st.state='stale';}else{st.state='error';}
+    if(!st.lastSuccess)secUnavailable(s.key,st.error);
+    console.warn('ocd source '+s.key+' failed: '+st.error);
+    return false;
+  }finally{st.inFlight=false;st.ac=null;}
 }
 var G=null,SB=null,PJ=null,SG=null;
 function agoMs(v){if(v==null)return '?';var ms=(v>1e12)?v:(v*1000);var s=Math.max(0,Math.floor((Date.now()-ms)/1000));if(s<60)return s+' s ago';var m=Math.floor(s/60);if(m<60)return m+' min ago';var h=Math.floor(m/60);if(h<48)return h+' h ago';return Math.floor(h/24)+' d ago';}
 function fmtT(v){if(v==null)return '?';var ms=(v>1e12)?v:(v*1000);try{return new Date(ms).toLocaleString([],{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}catch(_){return String(v);}}
 function renderGraph(){var el=document.getElementById('graph');if(!el)return;if(!G||G.error){el.textContent=(G&&G.error)?('ERR '+G.error):'no data';return;}var H='',count=0;function walk(id,depth){if(count>300||depth>5)return;var n=G.nodes[id];if(!n)return;count++;H+='<div data-sid="'+n.id+'" style="padding-left:'+(depth*18)+'px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><b>'+ESC(n.agent)+'</b> <span style="opacity:.65">'+ESC(n.title)+' · '+agoMs(n.updated)+'</span></div>';var kids=G.kids[id]||[];for(var i=0;i<kids.length;i++)walk(kids[i],depth+1);}for(var i=0;i<G.roots.length&&count<=300;i++)walk(G.roots[i],0);el.innerHTML='<div style="opacity:.65;margin-bottom:6px">'+G.roots.length+' roots, nodes: '+Object.keys(G.nodes).length+'</div>'+H;}
 function renderSSTable(){var tb=document.querySelector('#sstbl tbody');if(!tb)return;if(!SB||SB.error){tb.innerHTML='<tr><td colspan="5">ERR</td></tr>';return;}var H='';for(var i=0;i<SB.rows.length;i++){var r=SB.rows[i];H+='<tr data-sid="'+r.id+'" style="cursor:pointer"><td>'+ESC(r.title)+'</td><td>'+ESC(r.agent||'')+'</td><td>'+ESC(r.model||'')+'</td><td>'+ESC(r.directory||'')+'</td><td>'+fmtT(r.time_created)+'</td></tr>';}if(!H)H='<tr><td colspan="5">no results</td></tr>';tb.innerHTML=H;}
-async function fetchSessions(){var p='q='+encodeURIComponent(document.getElementById('ss-q').value)+'&agent='+encodeURIComponent(document.getElementById('ss-agent').value)+'&model='+encodeURIComponent(document.getElementById('ss-model').value);try{var r=await authFetch('/api/sessions?'+p+'&_='+Date.now());if(r.status===401){noteAuthFailure();return;}if(r.ok){SB=await r.json();renderSSTable();}}catch(_){}}
+var _ssGen=0;
+async function fetchSessions(){var p='q='+encodeURIComponent($('ss-q').value)+'&agent='+encodeURIComponent($('ss-agent').value)+'&model='+encodeURIComponent($('ss-model').value);var g=++_ssGen;try{var d=await fetchJson('/api/sessions?'+p);if(g!==_ssGen)return;SB=d;renderSSTable();}catch(e){if(e&&e.status===401){noteAuthFailure();return;}if(g!==_ssGen)return;console.warn('ocd sessions search failed: '+((e&&e.message)||e));}}
 function renderProjects(){var tb=document.querySelector('#projtbl tbody');if(!tb)return;if(!PJ||PJ.error){tb.innerHTML='<tr><td colspan="5">ERR</td></tr>';return;}var H='';for(var i=0;i<PJ.rows.length;i++){var r=PJ.rows[i];var nm=r.name||r.directory||r.worktree||r.id;H+='<tr><td>'+ESC(nm)+'</td><td>'+ESC(r.directory||r.worktree||'')+'</td><td>'+ESC(r.vcs||'')+'</td><td class="num">'+(r.sessions||0)+'</td><td>'+fmtT(r.last)+'</td></tr>';}if(!H)H='<tr><td colspan="5">no projects</td></tr>';tb.innerHTML=H;}
 function renderSignals(){var el=document.getElementById('sig-chips');if(!el)return;if(!SG||SG.error){el.textContent='ERR';return;}var H='';for(var i=0;i<SG.signals.length;i++){var s=SG.signals[i];var c=(s.level==='warn')?'#a6761d':((s.level==='err')?'#c00':'#16a34a');H+='<span style="display:inline-block;padding:2px 10px;border:1px solid '+c+';border-radius:12px;margin:2px;color:'+c+'">'+ESC(s.text)+'</span>';}if(!H)H='<span>all clear</span>';el.innerHTML=H;}
-async function inspect(sid){var box=document.getElementById('insp');if(!box)return;box.hidden=false;box.textContent='loading '+sid+' ...';try{var r=await authFetch('/api/inspect?id='+encodeURIComponent(sid)+'&_='+Date.now());if(r.status===401){noteAuthFailure();box.textContent='Authorization required — reopen via the launcher link';return;}var d=await r.json();if(!d||!d.found){box.textContent='not found '+sid;return;}var H='<b>'+ESC(d.title||sid)+'</b> <span style="opacity:.65">'+ESC(d.agent||'')+' / '+ESC(d.model||'')+' / '+ESC(d.directory||'')+'</span>';for(var i=0;i<d.messages.length;i++){var m=d.messages[i];H+='<div style="margin-top:8px"><b>'+ESC(m.role)+'</b> <span style="opacity:.65">'+ESC(m.agent||'')+' '+ESC(m.model||'')+' · '+m.parts.length+' parts</span>';if(m.summary)H+='<div>'+ESC(m.summary)+'</div>';for(var j=0;j<m.parts.length;j++){var p=m.parts[j];H+='<div style="margin-left:12px;opacity:.85">['+ESC(p.type)+'] '+p.size+' B'+(p.preview?(', '+ESC(String(p.preview).slice(0,300))):'')+'</div>';}H+='</div>';}box.innerHTML=H;box.scrollIntoView();}catch(e){box.textContent='ERR '+e.message;}}
+var _inspGen=0;
+async function inspect(sid){var box=document.getElementById('insp');if(!box)return;box.hidden=false;var g=++_inspGen;box.textContent='loading '+sid+' ...';try{var d=await fetchJson('/api/inspect?id='+encodeURIComponent(sid)+'&_='+Date.now());if(g!==_inspGen)return;if(!d||!d.found){box.textContent='not found '+sid+' (click the row to retry)';return;}var H='<b>'+ESC(d.title||sid)+'</b> <span style="opacity:.65">'+ESC(d.agent||'')+' / '+ESC(d.model||'')+' / '+ESC(d.directory||'')+'</span>';for(var i=0;i<d.messages.length;i++){var m=d.messages[i];H+='<div style="margin-top:8px"><b>'+ESC(m.role)+'</b> <span style="opacity:.65">'+ESC(m.agent||'')+' '+ESC(m.model||'')+' · '+m.parts.length+' parts</span>';if(m.summary)H+='<div>'+ESC(m.summary)+'</div>';for(var j=0;j<m.parts.length;j++){var p=m.parts[j];H+='<div style="margin-left:12px;opacity:.85">['+ESC(p.type)+'] '+p.size+' B'+(p.preview?(', '+ESC(String(p.preview).slice(0,300))):'')+'</div>';}H+='</div>';}box.innerHTML=H;box.scrollIntoView();}catch(e){if(e&&e.status===401){noteAuthFailure();box.textContent='Authorization required — reopen via the launcher link';return;}if(g!==_inspGen)return;box.textContent='ERR '+e.message+' (click the row to retry)';}}
 if(!window.__p1wire){window.__p1wire=1;document.addEventListener('click',function(e){var t=(e.target&&e.target.closest)?e.target.closest('[data-sid]'):null;if(t)inspect(t.getAttribute('data-sid'));});['ss-q','ss-agent','ss-model'].forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener('input',function(){if(window.__p1t)clearTimeout(window.__p1t);window.__p1t=setTimeout(fetchSessions,350);});});}
 $('refresh').onclick=()=>{if(AUTH_FAILED)return;load();};
 $('search').addEventListener('input',renderSessions);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!AUTH_FAILED)load();});
-setInterval(()=>{if(!document.hidden&&!AUTH_FAILED)load();},30000);
+setInterval(()=>{if(!document.hidden&&!AUTH_FAILED)load();},((window.__ocdTimeouts&&window.__ocdTimeouts.refreshMs)||30000));
 try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'){setTab('router');}}catch(_){}
-if(S){renderAll();$('status').textContent='Updated just now';}
+if(S){renderAll();}
 if(R){renderRouter();}
 if(AUTH_TOKEN){load();}else{showAuthLock(true);}
 </script>

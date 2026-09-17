@@ -86,25 +86,54 @@ SESSIONS_B = {"rows": [{"id": "row-b", "title": "ROW-B-MARKER",
                         "time_created": 1800000000000}], "limit": 50}
 
 
-def _write_fixture(root):
+def _write_fixture(root, mode="canary", xss=False):
     db_path = root / "synthetic.db"
     con = sqlite3.connect(str(db_path))
     con.executescript(FIXTURE_SCHEMA)
     for sql, args in FIXTURE_ROWS:
         con.execute(sql, args)
+    if xss:
+        con.execute(
+            "INSERT INTO session VALUES ('sid-xss',"
+            "'<script>window.__xss=1</script>"
+            "<img src=x onerror=window.__xss=2>','build','muse-spark',"
+            "'C:/work',NULL,1800000000000,1800000300000,0,0,0,0,0,0.0,'proj-1')")
     con.commit()
     con.close()
-    today = datetime.date.today().isoformat()
-    events_path = root / "usage-events.jsonl"
-    rec = {"at": today + "T12:00:00", "model": CANARY_MODEL,
-           "provider": "codex", "status": 200,
-           "inputTokens": 100, "outputTokens": 20,
-           "cachedInputTokens": 40, "reasoningTokens": 5,
-           "totalTokens": 120, "durationMs": 5}
-    events_path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
     codex_dir = root / "codex-sessions"
     codex_dir.mkdir()
-    return {"db": str(db_path), "events": str(events_path),
+    events_path = root / "usage-events.jsonl"
+    if mode == "synth":
+        recs = [
+            {"type": "session_meta", "timestamp": "2026-09-16T12:00:00",
+             "payload": {"id": "f8-synth", "cwd": "C:/work",
+                         "model_provider": "codex"}},
+            {"type": "turn_context", "timestamp": "2026-09-16T12:00:00",
+             "payload": {"model": "muse-spark-1.3-contributor-free"}},
+            {"type": "token_usage_record", "timestamp": "2026-09-16T12:00:00",
+             "payload": {"usage": {"input_tokens": 100,
+                                   "cached_input_tokens": 40,
+                                   "output_tokens": 20,
+                                   "total_tokens": 120,
+                                   "reasoning_output_tokens": 5,
+                                   "cache_write_input_tokens": 0}}},
+        ]
+        rollout = codex_dir / "nested" / "rollout-f8.jsonl"
+        rollout.parent.mkdir(parents=True)
+        with open(rollout, "w", encoding="utf-8", newline="") as f:
+            for rec in recs:
+                f.write(json.dumps(rec) + "\n")
+        events = None
+    else:
+        today = datetime.date.today().isoformat()
+        rec = {"at": today + "T12:00:00", "model": CANARY_MODEL,
+               "provider": "codex", "status": 200,
+               "inputTokens": 100, "outputTokens": 20,
+               "cachedInputTokens": 40, "reasoningTokens": 5,
+               "totalTokens": 120, "durationMs": 5}
+        events_path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+        events = str(events_path)
+    return {"db": str(db_path), "events": events,
             "codex_dir": codex_dir, "root": root}
 
 
@@ -285,6 +314,8 @@ class Ctx:
         self.console = []
         self.warns = []
         self.pageerrors = []
+        self.dialogs = []
+        self.external = []
         self.shot_seq = 0
 
     # -- browser ---------------------------------------------------------
@@ -302,6 +333,23 @@ class Ctx:
                 self.warns.append(m.text)
         self.page.on("console", _on_console)
         self.page.on("pageerror", lambda e: self.pageerrors.append(str(e)))
+
+        def _on_dialog(d):
+            self.dialogs.append(d.message)
+            try:
+                d.dismiss()
+            except Exception:
+                pass
+        self.page.on("dialog", _on_dialog)
+
+        def _on_request(req):
+            try:
+                host = urlparse(req.url).hostname
+            except Exception:
+                host = None
+            if host not in (None, "127.0.0.1", "localhost"):
+                self.external.append(req.url)
+        self.page.on("request", _on_request)
         return self.page
 
     def goto(self):
@@ -643,14 +691,188 @@ def case_t09(ctx):
     return ctx.shot("inspect-search-prompts-timeout")
 
 
+def case_b01(ctx):
+    """OpenCode/Codex tabs, the shared 120 sum and the reasoning toggle."""
+    ctx.new_page()
+    ctx.goto()
+    ctx.cycle_finished()
+    ctx.page.evaluate("setTab('router')")
+    data = ctx.page.evaluate("window.__ocdState.sections.router.data")
+    _assert(data, "router payload must be present")
+    _assert(data["totals"]["tokens_total"] == 120,
+            "shared scope must show 120 tokens, got %r"
+            % data["totals"]["tokens_total"])
+    _assert((ctx.text("#r-headline") or "").strip(),
+            "codex headline must render")
+    before = ctx.page.evaluate(
+        "document.getElementById('r-split-btn').getAttribute('aria-pressed')")
+    ctx.page.evaluate("document.getElementById('r-split-btn').click()")
+    after = ctx.page.evaluate(
+        "document.getElementById('r-split-btn').getAttribute('aria-pressed')")
+    _assert(before != after, "reasoning toggle must flip aria-pressed")
+    ctx.page.evaluate("setTab('opencode')")
+    rows = ctx.page.evaluate(
+        "document.querySelectorAll('#tbl tbody tr').length")
+    _assert(rows > 0, "opencode tab must render session rows")
+    return ctx.shot("tabs-120-reasoning")
+
+
+def case_b02(ctx):
+    """Search filters, a chip filter, a range preset, restored tab."""
+    ctx.new_page()
+    ctx.goto()
+    ctx.cycle_finished()
+    ctx.page.evaluate(
+        "(v)=>{const el=document.getElementById('search');el.value=v;"
+        "el.dispatchEvent(new Event('input',{bubbles:true}));}", "child")
+    ctx.page.wait_for_timeout(200)
+    first = ctx.page.evaluate(
+        "document.querySelector('#tbl tbody tr td')"
+        " ? document.querySelector('#tbl tbody tr td').textContent : null")
+    _assert(first and "child" in first.lower(),
+            "search must filter the session table, got %r" % first)
+    ctx.page.evaluate(
+        "()=>{const sel=document.getElementById('r-provider-f');"
+        "if(sel&&sel.options.length>1){sel.value=sel.options[1].value;"
+        "sel.dispatchEvent(new Event('change',{bubbles:true}));}}")
+    ctx.page.evaluate(
+        "()=>{const p=document.getElementById('r-presets');"
+        "if(p&&p.children.length){p.children[0].click();}}")
+    ctx.page.evaluate("setTab('router')")
+    ctx.page.reload(wait_until="domcontentloaded")
+    ctx.page.wait_for_function(
+        "window.__ocdState && window.__ocdState.cycle"
+        " && window.__ocdState.cycle.finished", timeout=20000)
+    saved = ctx.page.evaluate("sessionStorage.getItem('ocd-tab')")
+    _assert(saved == "router",
+            "selected tab must be restored after reload, got %r" % saved)
+    return ctx.shot("search-filters-tab")
+
+
+def case_b03(ctx):
+    """Synth scope: one unknown outcome counted, no fake ok."""
+    ctx.new_page()
+    ctx.goto()
+    ctx.cycle_finished()
+    data = ctx.page.evaluate("window.__ocdState.sections.router.data")
+    totals = data["totals"]
+    _assert(totals["unknown"] == 1,
+            "one unknown outcome expected, got %r" % totals)
+    _assert(totals["ok"] == 0,
+            "no request may be claimed ok, got %r" % totals)
+    chips = (ctx.text("#r-status") or "").lower()
+    _assert("unknown" in chips,
+            "status chips must surface unknown, got %r" % chips)
+    return ctx.shot("unknown-no-fake-success")
+
+
+def case_b04(ctx):
+    """Child sessions carry recency labels and stay within the cap."""
+    ctx.new_page()
+    ctx.goto()
+    ctx.cycle_finished()
+    agents = ctx.page.evaluate("window.__ocdState.sections.agents.data")
+    _assert(agents, "agents payload must be present")
+    rows = agents.get("child_runs", [])
+    labels = {"recent", "quiet", "stale", "unknown"}
+    states = [r.get("activity_state") for r in rows]
+    _assert(states, "fixture must expose at least one child session")
+    _assert(all(s in labels for s in states),
+            "child rows must carry recency labels, got %r" % states)
+    _assert(isinstance(agents.get("limit"), int)
+            and len(rows) <= agents["limit"],
+            "the child list must stay capped")
+    return ctx.shot("recency-child-cap")
+
+
+def case_b05(ctx):
+    """Inspector renders with the bounded-paging footer."""
+    ctx.new_page()
+    ctx.goto()
+    ctx.cycle_finished()
+    clicked = ctx.page.evaluate(
+        "()=>{const rows=document.querySelectorAll('#sstbl tbody tr[data-sid]');"
+        "for(const tr of rows){const td=tr.querySelector('td');"
+        "if(td&&td.textContent.indexOf('Synthetic session')>=0){"
+        "tr.dispatchEvent(new MouseEvent('click',{bubbles:true}));return true;}}"
+        "return false;}")
+    _assert(clicked, "a session row must exist in the sessions table")
+    ctx.page.wait_for_function(
+        "() => {const el=document.getElementById('insp');"
+        "return el && el.textContent.indexOf('messages shown')>=0;}",
+        timeout=6000)
+    insp = ctx.text("#insp")
+    _assert("hello" in insp,
+            "inspected content must render, got %r" % insp)
+    return ctx.shot("inspector-bounded-footer")
+
+
+def case_b06(ctx):
+    """Legal auth, two tabs, and the 401 path after a token restart."""
+    ctx.new_page()
+    ctx.goto()
+    ctx.cycle_finished()
+    page2 = ctx.context.new_page()
+    url = "http://127.0.0.1:%d/#token=%s" % (ctx.port, ctx.token)
+    page2.goto(url, wait_until="domcontentloaded")
+    page2.wait_for_function(
+        "window.__ocdState && window.__ocdState.cycle"
+        " && window.__ocdState.cycle.finished", timeout=20000)
+    ctx.page.close()
+    page2.evaluate("load()")
+    page2.wait_for_function(
+        "window.__ocdState.cycle.finished > 0"
+        " && window.__ocdState.cycle.ok > 0", timeout=20000)
+    ctx.server.auth_token = secrets.token_urlsafe(32)
+    page2.evaluate("load()")
+    page2.wait_for_function(
+        "() => {const el=document.getElementById('auth-lock');"
+        "return el && el.hidden === false;}", timeout=10000)
+    page2.close()
+    return None
+
+
+def case_b07(ctx):
+    """Synthetic HTML/JS never executes; no console noise, no externals."""
+    ctx.new_page()
+    ctx.goto()
+    ctx.cycle_finished()
+    ctx.page.wait_for_timeout(300)
+    xss = ctx.page.evaluate("window.__xss")
+    _assert(xss is None,
+            "synthetic script must not execute, got %r" % xss)
+    _assert(not ctx.dialogs,
+            "no dialog may appear, got %r" % ctx.dialogs)
+    body = ctx.page.evaluate("document.body.innerText")
+    _assert("window.__xss" in body,
+            "the payload must render as visible text")
+    _assert(not ctx.console,
+            "no console errors expected, got %r" % ctx.console[:5])
+    _assert(not ctx.external,
+            "no external requests allowed, got %r" % ctx.external[:5])
+    return ctx.shot("no-xss-no-console-no-external")
+
+
 CASES = [
     ("F6d-T01", "7 sections render while the 8th never sends headers", case_t01),
     ("F6d-T02", "200 headers, body never ends -> deadline still fires", case_t02),
     ("F6d-T04", "error after success keeps data + last_success + stale", case_t04),
     ("F6d-T06", "late older response A never overwrites newer B", case_t06),
     ("F6d-T09", "inspect/search/prompts timeout, no hang, retry works", case_t09),
+    ("F8-B01", "tabs + 120 sum + reasoning toggle", case_b01),
+    ("F8-B02", "search filters, chip filter, range preset, restored tab", case_b02),
+    ("F8-B03", "unknown outcome counted, no fake success", case_b03),
+    ("F8-B04", "recency labels + child-session list cap", case_b04),
+    ("F8-B05", "inspector paging footer + content", case_b05),
+    ("F8-B06", "legal auth + two tabs + 401 after restart", case_b06),
+    ("F8-B07", "no synthetic script execution, console, externals", case_b07),
 ]
 BROWSER_CASES = [c[0] for c in CASES]
+
+FIXTURE_MODES = {
+    "F8-B03": {"mode": "synth"},
+    "F8-B07": {"xss": True},
+}
 
 
 # --------------------------------------------------------------------------
@@ -688,7 +910,8 @@ def _run_case(case_id, desc, fn, d, artifacts_dir, shots_dir, browser, log):
     tmp = tempfile.TemporaryDirectory(prefix="f6d-browser-")
     server = thread = ctx = None
     try:
-        fixture = _write_fixture(Path(tmp.name))
+        fixture = _write_fixture(Path(tmp.name),
+                                 **FIXTURE_MODES.get(case_id, {}))
         d.Handler.db_path = fixture["db"]
         d.Handler.router_events = fixture["events"]
         d.Handler.router_limits = None
@@ -763,6 +986,8 @@ def main(argv=None):
                         help="run the browser headful (debugging)")
     parser.add_argument("--artifacts-dir", default=str(DEFAULT_ARTIFACTS),
                         help="directory for logs, JSON and screenshots")
+    parser.add_argument("--log-prefix", default="F6d-browser",
+                        help="artifact name prefix (default F6d-browser)")
     args = parser.parse_args(argv)
 
     if args.list:
@@ -782,8 +1007,8 @@ def main(argv=None):
     shots_dir = artifacts / SHOTS_DIRNAME
     shots_dir.mkdir(parents=True, exist_ok=True)
     stamp = "windows"
-    log_path = artifacts / ("F6d-browser.%s.log" % stamp)
-    json_path = artifacts / ("F6d-browser.%s.json" % stamp)
+    log_path = artifacts / ("%s.%s.log" % (args.log_prefix, stamp))
+    json_path = artifacts / ("%s.%s.json" % (args.log_prefix, stamp))
     log = _Log(log_path)
     log("browser runner start %s; cases: %s"
         % (datetime.datetime.now().isoformat(timespec="seconds"),

@@ -1,55 +1,68 @@
-# Testing (skeleton)
+# Testing
 
-All tests use `unittest` from the standard library only. No new runtime
-or dev dependencies are installed. `requirements-dev.txt` stays
-comment-only (Playwright is allowed as a dev-only dependency later, but
-do not install anything for the skeleton).
+All tests are standard-library `unittest` suites and use synthetic fixtures
+with an isolated HOME/USERPROFILE/LOCALAPPDATA. HTTP tests bind `127.0.0.1`
+on ephemeral ports (port 0) only and clean up their servers, threads, timers
+and temp directories even on failure. The browser runner is the only dev
+dependency; the dashboard itself never needs it.
 
-## Windows commands (exact)
+## Backend suites (Windows: use the installed interpreter, e.g. `py -3.14`)
 
-Use `py -3.14` on Windows. Do not assume a bare `python` on PATH.
-
-```bat
-py -3.14 -m py_compile opencode_dashboard.py
-py -3.14 -m unittest discover -s tests -p "test_*.py"
-py -3.14 tools/verify_acceptance.py --help
-py -3.14 tools/run_browser_tests.py --list
-py -3.14 tools/benchmark_dashboard.py --scenario ci
+```powershell
+python -m py_compile opencode_dashboard.py
+python -m unittest discover -s tests -p "test_*.py" -v
+python -m unittest tests.test_integration -v
 ```
 
-## How to run the skeleton
+## Acceptance report and gates
 
-1. `py -3.14 -m py_compile opencode_dashboard.py` must still pass
-   (the dashboard file itself is untouched).
-2. `py -3.14 -m unittest discover -s tests -p "test_*.py"` runs the
-   skeleton suites. Each `test_*.py` contains a discovery smoke test
-   plus at least one real pure-helper check that imports from
-   `opencode_dashboard.py` without starting a server. Some tests may
-   pass; none fake results.
-3. Fixtures are synthetic only: every test builds its files in
-   `tempfile.TemporaryDirectory` with an isolated `HOME` /
-   `USERPROFILE` / `LOCALAPPDATA` (saved in `setUp`, restored in
-   `tearDown`). Tests never read the real user HOME, never touch
-   `D:\TESTY!\Dashboard`, and never bind fixed ports (HTTP helpers use
-   `127.0.0.1` with port `0` and clean up servers/threads/dirs via
-   `tearDown`/`addCleanup`).
-4. `py -3.14 tools/verify_acceptance.py --help` explains gate checks.
-   Until a real `TEST_REPORT.json` with PASS rows, existing evidence
-   files, and a matching code hash exists, every gate fails (honest
-   `NOT_RUN`, non-zero exit).
+```powershell
+python tools/build_test_report.py --out artifacts/TEST_REPORT.json
+python tools/verify_acceptance.py --report artifacts/TEST_REPORT.json --gate core
+python tools/verify_acceptance.py --report artifacts/TEST_REPORT.json --gate release
+```
 
-## Browser-test policy
+`--require` is an alias for `--gate`. The `core` gate verifies the locally
+available mandatory set; `release` additionally requires the real CI jobs and
+keeps failing with a single `CI_PENDING` entry until the GitHub workflow has
+actually run (a workflow file alone never passes a gate).
 
-Browser tests require a real, usable browser. The stub runner
-`tools/run_browser_tests.py` checks for an importable Playwright and
-otherwise marks every browser case `NOT_RUN` with a reason and exits
-`2`. It never fakes a pass and never installs anything. Actual CI runs
-are `CI_PENDING` until a workflow run with evidence exists; workflow
-file presence alone is not execution (see check 6 in
-`tools/verify_acceptance.py`).
+## Browser tests (dev-only; Playwright)
 
-## Benchmark policy
+Install the pinned dev dependency into an isolated venv (never a runtime
+dependency):
 
-`tools/benchmark_dashboard.py --scenario ci` reports `NOT_IMPLEMENTED`
-and exits `2` until benchmark scenarios exist. No numbers are
-fabricated.
+```powershell
+python -m venv .venv
+.venv\Scripts\pip install -r requirements-dev.txt   # Windows
+.venv/bin/pip install -r requirements-dev.txt       # POSIX
+```
+
+`requirements-dev.txt` pins `playwright==1.62.0`. Browser provisioning:
+
+- Windows with Edge installed: the runner uses `channel="msedge"` headless.
+- Otherwise: `python -m playwright install chromium` (add `--with-deps` on
+  Linux CI).
+
+```powershell
+python tools/run_browser_tests.py --list
+python tools/run_browser_tests.py --log-prefix F6d-browser --cases F6d-T01,F6d-T02,F6d-T04,F6d-T06,F6d-T09
+python tools/run_browser_tests.py --log-prefix F8-browser
+```
+
+The runner starts the real dashboard server on synthetic sources in-process
+and drives a real browser; screenshots and JSON/log evidence land in
+`artifacts/` (gitignored). Without a usable browser every case is reported
+NOT_RUN and the process exits 2 - it never fakes a pass. CI runs the same
+runner headless on Ubuntu (the `browser` job in
+`.github/workflows/tests.yml`); real CI execution is still pending
+(CI_PENDING) because nothing was pushed.
+
+## Benchmarks
+
+```powershell
+python tools/benchmark_dashboard.py --scenario ci
+```
+
+The performance measurements required by spec section 22 are still pending;
+this command honestly reports NOT_IMPLEMENTED and exits 2.

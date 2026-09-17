@@ -140,7 +140,9 @@ def main(argv=None):
     )
     parser.add_argument("--matrix", default=str(DEFAULT_MATRIX), help="path to ACCEPTANCE_MATRIX.md")
     parser.add_argument("--report", default="TEST_REPORT.json", help="path to TEST_REPORT.json")
-    parser.add_argument("--gate", choices=["core", "release"], default="release", help="gate to verify")
+    parser.add_argument("--gate", "--require", dest="gate",
+                        choices=["core", "release"], default="release",
+                        help="gate to verify (alias: --require)")
     parser.add_argument(
         "--code",
         default=str(DEFAULT_CODE),

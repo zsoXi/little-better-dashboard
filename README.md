@@ -16,9 +16,18 @@ Everything is read from files already on your machine. The server binds to `127.
 
 Privacy: The dashboard may read and display message content from your local OpenCode and Codex sessions for session inspection. This content stays on your machine and is only served to a browser session presenting the instance token over the local 127.0.0.1 dashboard. Nothing is uploaded or sent to external services. Private content is visible to anyone holding the instance link, and tunnels or public exposure are not supported.
 
+## Data handling and limits
+
+- Unknown outcomes stay unknown: a request whose result could not be determined is never silently counted as success or error, and its tokens are never dropped or folded into another bucket.
+- Recency labels (recent, no recent activity, older, unknown) come from session update recency - a session-history signal, not agent execution status.
+- The Codex request list is a bounded **tail** of the newest events with an explicit scanned-vs-total indicator; the synthesized history that feeds the Codex charts keeps the full history (no silent cut-off).
+- "Usage in the 24h before each commit" windows are global and **non-additive**: windows may overlap and may include other projects, so commit rows must not be summed.
+- The Codex synthesis **cache** index lives in `.cache/codex_index.json` (a derived **checkpoint** tied to the published generation): it is **safe to delete** at any time and is never a source of truth; a failed checkpoint write never fails a publish.
+- The server binds to 127.0.0.1 only, requires the per-instance token from the `#token=` fragment, and does not support **tunnels** or public exposure.
+
 ## Quick start (one click)
 
-Requirements: **Python 3** (3.10 or newer works, and it is tested on 3.14) and OpenCode run at least once, so that its database exists.
+Requirements: **Python 3** (3.10 or newer; tested locally on **Windows with Python 3.14.3** - other platforms are not verified yet and CI is pending) and OpenCode run at least once, so that its database exists.
 
 - **Windows:** double-click `start-dashboard.bat`
 - **macOS / Linux:** run `./start-dashboard.sh` (or `bash start-dashboard.sh`)

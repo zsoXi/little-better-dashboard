@@ -139,5 +139,132 @@ class A05BoundedRecordTests(unittest.TestCase):
         self.assertLess(peak, PEAK_LIMIT)
 
 
+    def test_a05_oversize_skip_is_reported_in_source_metadata(self):
+        d = self.d
+        codex_dir = self.root / "codex"
+        codex_dir.mkdir()
+        roll = codex_dir / "rollout-2026-01-01T00-00-00-a05b.jsonl"
+        lines = [
+            json.dumps({"type": "session_meta",
+                        "payload": {"model_provider": "codex"}}),
+            json.dumps({"type": "turn_context",
+                        "payload": {"model": "muse-spark"}}),
+            json.dumps({"type": "token_usage_record", "payload": {"usage": {
+                "input_tokens": 10, "cached_input_tokens": 0,
+                "output_tokens": 0, "total_tokens": 10,
+                "reasoning_output_tokens": 0,
+                "cache_write_input_tokens": 0}}}),
+            json.dumps({"type": "token_usage_record",
+                        "note": "x" * 2000, "payload": {"usage": {
+                            "input_tokens": 900, "cached_input_tokens": 0,
+                            "output_tokens": 0, "total_tokens": 900,
+                            "reasoning_output_tokens": 0,
+                            "cache_write_input_tokens": 0}}}),
+            json.dumps({"type": "token_usage_record", "payload": {"usage": {
+                "input_tokens": 20, "cached_input_tokens": 0,
+                "output_tokens": 0, "total_tokens": 20,
+                "reasoning_output_tokens": 0,
+                "cache_write_input_tokens": 0}}}),
+        ]
+        roll.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+        dir_backup = d.CODEX_DIR
+        synth_backup = d.CODEX_SYNTH
+        index_backup = d.CODEX_INDEX
+        try:
+            d.CODEX_DIR = codex_dir
+            d.CODEX_SYNTH = self.root / "synth.jsonl"
+            d.CODEX_INDEX = self.root / "codex_index.json"
+            d._codex_ev_cache = {}
+            d._codex_ev_sig = None
+            if hasattr(d, "_codex_ev_state"):
+                d._codex_ev_state.clear()
+            if hasattr(d, "_codex_read_failures"):
+                d._codex_read_failures.clear()
+            with _mock.patch.object(d, "MAX_ROUTER_RECORD_BYTES", CAP):
+                path, err = d.ensure_codex_synth(force=True)
+            self.assertIsNone(err)
+            self.assertEqual(getattr(d, "_codex_last_oversize", None), 1)
+            published = []
+            for line in Path(str(path)).read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    published.append(json.loads(line)["totalTokens"])
+            self.assertEqual(published, [10.0, 20.0])
+            index = json.loads(d.CODEX_INDEX.read_text(encoding="utf-8"))
+            self.assertEqual(index.get("oversize"), 1)
+            # A restart adopts the count together with the checkpoints.
+            d._codex_ev_cache = {}
+            d._codex_ev_sig = None
+            d._codex_ev_state.clear()
+            d._codex_last_oversize = 0
+            d._load_codex_index([roll])
+            self.assertEqual(d._codex_last_oversize, 1)
+        finally:
+            d.CODEX_DIR = dir_backup
+            d.CODEX_SYNTH = synth_backup
+            d.CODEX_INDEX = index_backup
+
+
+    def test_a05_oversize_skip_is_reported_in_source_metadata(self):
+        d = self.d
+        codex_dir = self.root / "codex"
+        codex_dir.mkdir()
+        roll = codex_dir / "rollout-2026-01-01T00-00-00-a05b.jsonl"
+        lines = [
+            json.dumps({"type": "session_meta",
+                        "payload": {"model_provider": "codex"}}),
+            json.dumps({"type": "turn_context",
+                        "payload": {"model": "muse-spark"}}),
+            json.dumps({"type": "token_usage_record", "payload": {"usage": {
+                "input_tokens": 10, "cached_input_tokens": 0,
+                "output_tokens": 0, "total_tokens": 10,
+                "reasoning_output_tokens": 0,
+                "cache_write_input_tokens": 0}}}),
+            json.dumps({"type": "token_usage_record",
+                        "note": "x" * 2000, "payload": {"usage": {
+                            "input_tokens": 900, "cached_input_tokens": 0,
+                            "output_tokens": 0, "total_tokens": 900,
+                            "reasoning_output_tokens": 0,
+                            "cache_write_input_tokens": 0}}}),
+            json.dumps({"type": "token_usage_record", "payload": {"usage": {
+                "input_tokens": 20, "cached_input_tokens": 0,
+                "output_tokens": 0, "total_tokens": 20,
+                "reasoning_output_tokens": 0,
+                "cache_write_input_tokens": 0}}}),
+        ]
+        roll.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+        backup = (getattr(d, "CODEX_DIR", None), d.CODEX_SYNTH, d.CODEX_INDEX)
+        try:
+            d.CODEX_DIR = codex_dir
+            d.CODEX_SYNTH = self.root / "synth.jsonl"
+            d.CODEX_INDEX = self.root / "codex_index.json"
+            d._codex_ev_cache = {}
+            d._codex_ev_sig = None
+            if hasattr(d, "_codex_ev_state"):
+                d._codex_ev_state.clear()
+            if hasattr(d, "_codex_read_failures"):
+                d._codex_read_failures.clear()
+            with _mock.patch.object(d, "MAX_ROUTER_RECORD_BYTES", CAP):
+                path, err = d.ensure_codex_synth(force=True)
+            self.assertIsNone(err)
+            # The skipped raw record is reported in the source metadata, not
+            # silently absorbed into a "complete" index.
+            self.assertEqual(getattr(d, "_codex_last_oversize", None), 1)
+            published = [json.loads(l)["totalTokens"]
+                         for l in Path(str(path)).read_text(
+                             encoding="utf-8").splitlines() if l.strip()]
+            self.assertEqual(published, [10.0, 20.0])
+            index = json.loads(d.CODEX_INDEX.read_text(encoding="utf-8"))
+            self.assertEqual(index.get("oversize"), 1)
+            # A restart adopts the count together with the checkpoints.
+            d._codex_ev_cache = {}
+            d._codex_ev_sig = None
+            d._codex_ev_state.clear()
+            d._codex_last_oversize = 0
+            d._load_codex_index([roll])
+            self.assertEqual(d._codex_last_oversize, 1)
+        finally:
+            d.CODEX_DIR, d.CODEX_SYNTH, d.CODEX_INDEX = backup
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -88,6 +88,18 @@ class A06GenerationBindingTests(unittest.TestCase):
         self.assertEqual(problems["window_mode"], "full")
         self.assertEqual([e["total"] for e in events], [120.0])
 
+    def test_a06_full_scan_swap_between_metadata_and_scan_stays_consistent(self):
+        d = self.d
+        self.live.write_bytes(_text([_record(120, 1)]).encode("utf-8"))
+        self.next_gen.write_bytes(
+            _text([_record(120, 1), _record(30, 2)]).encode("utf-8"))
+        patch, state = self._swap_after_count()
+        with patch:
+            events, problems = d.parse_router_events(str(self.live), None)
+        self.assertEqual(problems["lines_total"], len(events))
+        self.assertEqual(problems["window_mode"], "full")
+        self.assertEqual([e["total"] for e in events], [120.0])
+
     def test_a06_plain_read_keeps_full_window_semantics(self):
         d = self.d
         self.live.write_bytes(
@@ -97,6 +109,20 @@ class A06GenerationBindingTests(unittest.TestCase):
         self.assertEqual(problems["candidate_lines"], 2)
         self.assertEqual(problems["window_mode"], "full")
         self.assertEqual([e["total"] for e in events], [120.0, 30.0])
+
+
+    def test_a06_full_scan_swap_between_metadata_and_scan_stays_consistent(self):
+        d = self.d
+        self.live.write_bytes(_text([_record(120, 1)]).encode("utf-8"))
+        self.next_gen.write_bytes(
+            _text([_record(120, 1), _record(30, 2)]).encode("utf-8"))
+        patch, state = self._swap_after_count()
+        with patch:
+            events, problems = d.parse_router_events(str(self.live), None)
+        # Metadata and scanned content must never mix generations: the full
+        # scan used to count A's lines and stream B's records.
+        self.assertEqual(problems["lines_total"], len(events))
+        self.assertEqual([e["total"] for e in events], [120.0])
 
 
 if __name__ == "__main__":

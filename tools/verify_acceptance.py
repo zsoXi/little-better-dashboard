@@ -441,6 +441,69 @@ def main(argv=None):
     else:
         print("(9) OK: F8-T04 not mandatory for this gate.")
 
+    # (10) Execution binding (audit A03): the report must carry real execution
+    # records whose identity matches the current files, and every mandatory
+    # PASS row must reference a successful recorded run. Fresh hashes are
+    # never accepted on top of stale executions.
+    exec10_ok = True
+    execution = report.get("execution")
+    if not isinstance(execution, dict):
+        failures.append(
+            "(10) report has no execution records; PASS rows cannot be bound "
+            "to a real run (run tools/run_acceptance_records.py)."
+        )
+        exec10_ok = False
+    else:
+        ident = execution.get("identity") or {}
+        if str(ident.get("runtime_sha256", "")) != current_hash.replace(
+                "sha256:", ""):
+            failures.append(
+                "(10) execution runtime hash does not match the current code.")
+            exec10_ok = False
+        for group in ("tests", "tools"):
+            recorded = ident.get(group) or {}
+            if not isinstance(recorded, dict) or not recorded:
+                failures.append(
+                    f"(10) execution identity has no {group} hashes.")
+                exec10_ok = False
+                continue
+            for rel, digest in recorded.items():
+                cur = REPO_ROOT / rel
+                if not cur.is_file() or sha256_of(cur) != "sha256:" + str(digest):
+                    failures.append(
+                        f"(10) {group} file changed since the recorded "
+                        f"execution: {rel}")
+                    exec10_ok = False
+        commands = execution.get("commands") or []
+        names = {str(c.get("name")) for c in commands if isinstance(c, dict)}
+        for required in ("import_check", "py_compile", "unittest_discover"):
+            if required not in names:
+                failures.append(
+                    f"(10) execution records lack the required command "
+                    f"'{required}'.")
+                exec10_ok = False
+        for c in commands:
+            if not isinstance(c, dict):
+                continue
+            ec = c.get("exit_code")
+            if ec is None or int(ec) != 0:
+                failures.append(
+                    f"(10) recorded command '{c.get('name')}' exited "
+                    f"{c.get('exit_code')}.")
+                exec10_ok = False
+        for aid in mandatory_ids:
+            for e in by_id.get(aid, []):
+                if str(e.get("result", "")).strip().upper() != "PASS":
+                    continue
+                ec = e.get("execution_exit_code")
+                if not e.get("executed") or ec is None or int(ec) != 0:
+                    failures.append(
+                        f"(10) {aid}: PASS row is not bound to a successful "
+                        "execution record.")
+                    exec10_ok = False
+        if exec10_ok:
+            print("(10) OK: PASS rows are bound to matching execution records.")
+
     if failures:
         print(f"\nGATE {args.gate.upper()} FAILED ({len(failures)} problem(s)):")
         for f in failures:

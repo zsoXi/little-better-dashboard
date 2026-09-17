@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   test:
+    name: python ${{ matrix.python-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -28,6 +29,7 @@ jobs:
         run: python -m unittest discover -s tests -p "test_*.py" -v
 
   browser:
+    name: browser tests on ubuntu-latest
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

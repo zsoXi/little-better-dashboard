@@ -53,6 +53,15 @@ class A02GateCiTests(unittest.TestCase):
         self.code.write_text("VALUE = 1\n", encoding="utf-8")
         self.code_hash = "sha256:" + hashlib.sha256(
             self.code.read_bytes()).hexdigest()
+        # A03 rule (10) fixtures: identity entries must point at real
+        # repository files with their real hashes (the verifier resolves
+        # them against its own REPO_ROOT).
+        self.tests_rel = "tests/test_a02_gate_ci.py"
+        self.tests_digest = hashlib.sha256(
+            (REPO_ROOT / self.tests_rel).read_bytes()).hexdigest()
+        self.tools_rel = "tools/verify_acceptance.py"
+        self.tools_digest = hashlib.sha256(
+            (REPO_ROOT / self.tools_rel).read_bytes()).hexdigest()
         # One existing evidence file is enough: every PASS row points at it,
         # and it carries the PUB-T02 executed-launcher marker.
         self.evidence = root / "evidence.txt"
@@ -77,6 +86,22 @@ class A02GateCiTests(unittest.TestCase):
 
     def _run(self, gate="release", mutate=None):
         report = json.loads(json.dumps(self.report))
+        # A03 rule (10): every synthetic report carries an explicit, synthetic
+        # execution block (honest fixture: real files, real hashes, marked
+        # commands) and marks its PASS rows as executed.
+        report["execution"] = {
+            "records_file": "artifacts/execution-records.json",
+            "identity": {
+                "runtime_sha256": self.code_hash.split(":", 1)[1],
+                "tests": {self.tests_rel: self.tests_digest},
+                "tools": {self.tools_rel: self.tools_digest},
+            },
+            "commands": [{"name": "import_check", "exit_code": 0}, {"name": "py_compile", "exit_code": 0},
+                         {"name": "unittest_discover", "exit_code": 0}],
+        }
+        for entry in report.get("results", []):
+            entry["executed"] = True
+            entry["execution_exit_code"] = 0
         if mutate is not None:
             mutate(report)
         report_path = self.root / ("report-%s.json" % gate)

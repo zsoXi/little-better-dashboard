@@ -1102,17 +1102,25 @@ def _codex_update_row(p, st, state):
     try:
         lines, off, fp, rebuild, tail = _codex_read_since(p, state)
     except OSError:
+        # Audit A01 (session list): a transient read error must neither wipe
+        # the last good contribution nor be blessed as the current
+        # fingerprint - the next plain call retries the read.
+        if state is not None:
+            row = dict(state.get("row") or {})
+            row["_err"] = True
+            return {"fp": state.get("fp"),
+                    "offset": int(state.get("offset") or 0),
+                    "row": row, "tail": state.get("tail") or b""}
         row = _codex_new_row(p, st)
         row["_err"] = True
-        return {"fp": cur_fp,
-                "offset": int((state or {}).get("offset") or 0),
-                "row": row, "tail": (state or {}).get("tail") or b""}
+        return {"fp": None, "offset": 0, "row": row, "tail": b""}
     if state is not None and not rebuild:
         row = state["row"]
     else:
         row = _codex_new_row(p, st)
     for line in lines:
         _codex_consume(row, line)
+    row.pop("_err", None)  # a successful read clears the transient error
     row["_sz"] = st.st_size
     row["_mt"] = int(st.st_mtime)
     return {"fp": fp, "offset": off, "row": row, "tail": tail}
@@ -1155,7 +1163,8 @@ def _write_codex_index(rows):
                 "events": state.get("events", []),
             }
         doc = {"version": CODEX_PARSER_VERSION, "schema": SYNTH_SCHEMA,
-               "generation": generation, "files": files_doc}
+               "generation": generation, "files": files_doc,
+               "oversize": int(_codex_last_oversize)}
         tmp = CODEX_INDEX.with_name(CODEX_INDEX.name + ".tmp.%d.%d" % (
             os.getpid(), threading.get_ident()))
         with open(tmp, "w", encoding="utf-8", newline="") as f:
@@ -1183,6 +1192,7 @@ def _load_codex_index(files):
     # Adopt a checkpoint only when it matches the published generation and the
     # sources still line up; otherwise reject the checkpoint (never the user
     # logs) and let the caller rebuild from scratch.
+    global _codex_last_oversize
     if _codex_ev_state:
         return False
     try:
@@ -1236,6 +1246,10 @@ def _load_codex_index(files):
         if not adopted:
             return False
         _codex_ev_state.update(adopted)
+        try:
+            _codex_last_oversize = int(doc.get("oversize") or 0)
+        except (TypeError, ValueError):
+            _codex_last_oversize = 0
         return True
     except (OSError, ValueError, KeyError, TypeError):
         return False
@@ -1258,7 +1272,11 @@ def query_codex(force=False):
                 p, st, None if force else _codex_file_state.get(key))
         _codex_file_state.clear()
         _codex_file_state.update(new_states)
-        _codex_sig = sig
+        # Audit A01: do not bless a signature that includes failed reads;
+        # the next plain call retries them instead of serving a stale empty.
+        if not any((s.get("row") or {}).get("_err")
+                   for s in new_states.values()):
+            _codex_sig = sig
     sess = []
     invalid = 0
     for key in sorted(_codex_file_state):
@@ -1290,6 +1308,7 @@ _codex_ev_cache = {}
 _codex_ev_sig = None
 _codex_last_error = None  # F5a: last synth publish failure text
 _codex_last_ok = None  # F5a: path of the last successful publish
+_codex_last_oversize = 0  # A05: oversize source lines skipped in the last publish
 # A01: per-file read failures recorded by _parse_codex_events. A build with
 # any recorded failure must not publish a new generation (no fake emptiness).
 _codex_read_failures = {}
@@ -1409,6 +1428,7 @@ def ensure_codex_synth(force=False):
     # Readers are lock-free: os.replace yields a complete A or B snapshot.
     # Lock scope is thread-level within this process (single instance).
     global _codex_ev_cache, _codex_ev_sig, _codex_last_error, _codex_last_ok
+    global _codex_last_oversize, _codex_oversize_records
     global _codex_build_in_progress
     _cleanup_synth_tmps()
     files, _cstate, _cskip = _codex_rollout_files()
@@ -1436,6 +1456,8 @@ def ensure_codex_synth(force=False):
     try:
         rows = {}
         failures = {}
+        # A05: count oversize lines skipped for THIS build only.
+        _codex_oversize_records = 0
         for p in files:
             key = str(p)
             try:
@@ -1490,6 +1512,7 @@ def ensure_codex_synth(force=False):
                 _codex_ev_cache = rows
                 _codex_ev_sig = sig
                 _codex_last_ok = str(CODEX_SYNTH)
+                _codex_last_oversize = _codex_oversize_records
                 _codex_last_error = None
                 _write_codex_index(rows)
                 return str(CODEX_SYNTH), None
@@ -2167,6 +2190,7 @@ def _router_count_lines(path, fh=None):
                 newlines += ent["newlines"]
                 cached = True
             else:
+                f.seek(0)
                 while True:
                     chunk = f.readline(block)
                     if not chunk:
@@ -2289,7 +2313,7 @@ def _router_read_tail(path, limit, cap, fh=None):
     return kept, meta
 
 
-def _router_stream_lines(path, cap):
+def _router_stream_lines(path, cap, fh=None):
     """Lazily yield every physical source line of the usage file as text.
 
     Memory stays bounded: blocks are read at a fixed size and lines are
@@ -2300,10 +2324,13 @@ def _router_stream_lines(path, cap):
     """
     p = Path(path)
     meta = {"last_terminated": True, "partial_head": False}
-    try:
-        f = open(str(p), "rb")
-    except OSError:
-        raise RuntimeError(f"Router usage file not found: {path}")
+    if fh is not None:
+        f = fh
+    else:
+        try:
+            f = open(str(p), "rb")
+        except OSError:
+            raise RuntimeError(f"Router usage file not found: {path}")
 
     def gen():
         buf = b""
@@ -2422,10 +2449,22 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS, synth_context=False):
         problems["window_mode"] = (
             "full" if len(lines) >= lines_total else "physical_tail")
     else:
-        lines_total, count_cached = _router_count_lines(p)
-        problems["lines_total"] = lines_total
-        problems["count_cached"] = count_cached
-        lines, meta = _router_stream_lines(p, MAX_ROUTER_RECORD_BYTES)
+        try:
+            fh = open(str(p), "rb")
+        except OSError:
+            raise RuntimeError(f"Router usage file not found: {path}")
+        try:
+            # A06: count and full scan share one handle, so line metadata and
+            # scanned content always describe the same file generation even
+            # when the name is atomically replaced mid-call.
+            lines_total, count_cached = _router_count_lines(p, fh)
+            problems["lines_total"] = lines_total
+            problems["count_cached"] = count_cached
+            fh.seek(0)
+            lines, meta = _router_stream_lines(p, MAX_ROUTER_RECORD_BYTES, fh)
+        except BaseException:
+            fh.close()
+            raise
     for line in lines:
         if line is _OVERLONG:
             problems["oversize_records"] += 1
@@ -5052,6 +5091,12 @@ class Handler(BaseHTTPRequestHandler):
                 if _rsyn and isinstance(stats, dict):
                     stats["source"] = "codex-synth"
                     stats["source_label"] = "Codex sessions (synthesized)"
+                    if _codex_last_error:
+                        # Audit A01: the refresh failed; the payload is the
+                        # last good snapshot and says so explicitly.
+                        stats["synth_error"] = _codex_last_error
+                        stats["synth_stale"] = True
+                    stats["synth_oversize_records"] = _codex_last_oversize
             except Exception as e:
                 stats = blank_router_stats(error=str(e))
             body = json.dumps(stats).encode("utf-8")

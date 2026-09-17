@@ -546,7 +546,19 @@ class TestF8Evidence(unittest.TestCase):
             lines.append("%s    %s" % ("RED" if ok else "MISSING", name))
             if not ok:
                 missing.append(name)
-        self._write_log("F8-REDGREEN.windows.log", "\n".join(lines) + "\n")
+        if source != self.ARTIFACTS:
+            # A mechanics check against synthetic stand-ins is not product
+            # evidence: it must never masquerade as the historical RED/GREEN
+            # reproduction, so it lands under an explicitly synthetic name.
+            lines.insert(0, "SYNTHETIC FIXTURE - mechanics test only; this "
+                            "is NOT product evidence (historical RED/GREEN "
+                            "logs are absent)")
+            lines.insert(1, "")
+            self._write_log("F8-REDGREEN.synthetic-fixture.log",
+                            "\n".join(lines) + "\n")
+        else:
+            self._write_log("F8-REDGREEN.windows.log",
+                            "\n".join(lines) + "\n")
         self.assertEqual(missing, [],
                          "missing RED/GREEN evidence: %r" % missing)
 

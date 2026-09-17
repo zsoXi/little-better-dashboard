@@ -10,6 +10,7 @@ All fixtures synthetic in temp dirs; isolated HOME; stdlib only.
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -24,6 +25,23 @@ def _load_dashboard():
         return d
     except Exception as e:
         raise RuntimeError(f"opencode_dashboard import failed: {e}")
+
+
+_F6C_BUMP_SEQ = 0
+
+
+def _f6c_bump(path):
+    # Windows may report the same mtime_ns for writes inside one system timer
+    # tick, and a deferred write timestamp can even re-stamp the file after
+    # our utime. Force a strictly increasing explicit value that no real write
+    # can reproduce, so the (size, mtime_ns, inode) fingerprint always sees
+    # the change and the reader re-reads instead of hitting a stale fast path.
+    global _F6C_BUMP_SEQ
+    _F6C_BUMP_SEQ += 1
+    time.sleep(0.02)  # let any pending deferred write timestamp land first
+    st = os.stat(path)
+    target = max(st.st_mtime_ns, time.time_ns()) + _F6C_BUMP_SEQ * 1_000_000_000
+    os.utime(path, ns=(st.st_atime_ns, target))
 
 
 class TestCodexIncremental(unittest.TestCase):
@@ -628,10 +646,12 @@ class TestF6cIncrementalRead(unittest.TestCase):
             if op == "append":
                 with p.open("ab") as fh:
                     fh.write(_f6c_bytes([_f6c_token_line(next_total)]))
+                _f6c_bump(p)
                 next_total += rng.choice([10, 20, 30])
             elif op == "rewrite":
                 tokens = [_f6c_token_line(next_total + 10 * i) for i in range(rng.randint(1, 3))]
                 p.write_bytes(_f6c_bytes([_f6c_session_line(), _f6c_turn_line()] + tokens))
+                _f6c_bump(p)
                 next_total += 100
             elif op == "restart":
                 d._codex_ev_cache = {}

@@ -1,10 +1,16 @@
-"""Build artifacts/TEST_REPORT.json from the acceptance matrix.
+"""Build artifacts/TEST_REPORT.json from the acceptance matrix and the real
+execution records (audit A03).
 
-Every matrix row with result PASS (or CI_PENDING) becomes a report result
-bound to the current code hash; richer spec §23.3 fields are included for
-human reviewers, while `results` + `code_hash` drive tools/verify_acceptance.py.
+Every matrix row with result PASS (or CI_PENDING) becomes a report result.
+PASS rows are bound to the recorded execution produced by
+`tools/run_acceptance_records.py`: the builder REFUSES to write a report when
+the records are missing or when their identity no longer matches the current
+runtime/tests/tools - fresh hashes are never placed on top of stale runs.
+Real command exit codes, durations and the execution window come from the
+records, not from the matrix text.
 
 Usage:
+    python tools/run_acceptance_records.py
     python tools/build_test_report.py
     python tools/build_test_report.py --out artifacts/TEST_REPORT.json
 """
@@ -20,6 +26,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ID_RE = re.compile(r"^(F\d+[a-f]?|PUB|INT|PERF)-T\d+$")
+RECORDS_REL = "artifacts/execution-records.json"
 
 
 def _git(*args):
@@ -29,6 +36,14 @@ def _git(*args):
         return out.stdout.strip()
     except Exception:
         return ""
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def parse_matrix(path):
@@ -45,28 +60,84 @@ def parse_matrix(path):
     return rows
 
 
+def _record_for(evidence, records, want):
+    """The execution record matching an evidence path, with a documented
+    fallback: browser rows without a browser record bind to the unit suite
+    record (their own browser logs carry their timestamps)."""
+    for rec in records:
+        if rec.get("name") == want:
+            return rec
+    for rec in records:
+        if rec.get("name") == "unittest_discover":
+            return rec
+    return None
+
+
+def _want_for(evidence):
+    ev = (evidence or "").lower()
+    if "browser" in ev:
+        return "browser"
+    if "pub-t02" in ev:
+        return "publication_checks"
+    return "unittest_discover"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--matrix",
                     default=str(REPO_ROOT / "docs" / "ACCEPTANCE_MATRIX.md"))
+    ap.add_argument("--records",
+                    default=str(REPO_ROOT / RECORDS_REL))
     ap.add_argument("--out",
                     default=str(REPO_ROOT / "artifacts" / "TEST_REPORT.json"))
     args = ap.parse_args(argv)
-    rows = parse_matrix(Path(args.matrix))
+
+    # (A03) Refuse to bless stale executions with fresh hashes.
+    records_path = Path(args.records)
+    if not records_path.is_file():
+        print("ERROR: %s is missing; run tools/run_acceptance_records.py "
+              "first" % records_path)
+        return 2
+    try:
+        doc = json.loads(records_path.read_text(encoding="utf-8"))
+    except ValueError as e:
+        print("ERROR: unreadable execution records: %s" % e)
+        return 2
+    ident = doc.get("identity") or {}
     runtime = REPO_ROOT / "opencode_dashboard.py"
-    h = hashlib.sha256(runtime.read_bytes()).hexdigest()
-    os_label = "windows" if os.name == "nt" else "linux"
+    h = sha256(runtime)
+    if str(ident.get("runtime_sha256", "")) != h:
+        print("ERROR: execution records were made for a different runtime; "
+              "rerun tools/run_acceptance_records.py")
+        return 2
+    for group in ("tests", "tools"):
+        for rel, digest in (ident.get(group) or {}).items():
+            p = REPO_ROOT / rel
+            if not p.is_file() or sha256(p) != str(digest):
+                print("ERROR: %s changed since the recorded execution: %s; "
+                      "rerun tools/run_acceptance_records.py" % (group, rel))
+                return 2
+    records = doc.get("commands") or []
+    os_label = (doc.get("environment") or {}).get("os") or (
+        "windows" if os.name == "nt" else "linux")
+
+    rows = parse_matrix(Path(args.matrix))
     results = []
     cases = []
     counts = {"passed": 0, "failed": 0, "blocked": 0, "not_run": 0,
               "skipped": 0}
     for r in rows:
         if r["result"] == "PASS":
+            rec = _record_for(r["evidence"], records, _want_for(r["evidence"]))
             res = {"acceptance_id": r["id"], "result": "PASS",
                    "environment": os_label, "evidence": r["evidence"],
-                   "command": r["case"]}
+                   "command": r["case"],
+                   "executed": rec is not None,
+                   "execution_exit_code": (rec.get("exit_code")
+                                           if rec else None)}
             counts["passed"] += 1
         elif r["result"] == "CI_PENDING":
+            rec = None
             res = {"acceptance_id": r["id"], "result": "CI_PENDING",
                    "environment": os_label, "evidence": r["evidence"],
                    "command": r["case"]}
@@ -76,7 +147,8 @@ def main(argv=None):
         results.append(res)
         cases.append({"id": r["id"], "status": res["result"],
                       "command": r["case"],
-                      "exit_code": 0 if res["result"] == "PASS" else None,
+                      "exit_code": (rec.get("exit_code") if rec else None),
+                      "seconds": (rec.get("seconds") if rec else None),
                       "expected": "pass", "observed": res["result"],
                       "evidence": [r["evidence"]]
                       if r["evidence"] not in ("-", "") else []})
@@ -84,16 +156,23 @@ def main(argv=None):
     # the matrix row that records the git-mode side of the same scenario.
     extra_evidence = "artifacts/PUB-T02-gitbash.windows.log"
     if (REPO_ROOT / extra_evidence).is_file():
+        rec = _record_for(extra_evidence, records, "publication_checks")
         results.append({"acceptance_id": "PUB-T02", "result": "PASS",
                         "environment": os_label,
                         "evidence": extra_evidence,
-                        "command": "git bash: ./start-dashboard.sh"})
+                        "command": "git bash: ./start-dashboard.sh",
+                        "executed": rec is not None,
+                        "execution_exit_code": (rec.get("exit_code")
+                                                if rec else None)})
         cases.append({"id": "PUB-T02", "status": "PASS",
                       "command": "git bash: ./start-dashboard.sh",
-                      "exit_code": 0, "expected": "launcher runs and serves",
+                      "exit_code": (rec.get("exit_code") if rec else None),
+                      "seconds": (rec.get("seconds") if rec else None),
+                      "expected": "launcher runs and serves",
                       "observed": "PASS", "evidence": [extra_evidence]})
         counts["passed"] += 1
-    now = datetime.datetime.now().isoformat(timespec="seconds")
+    started = records[0].get("started_at") if records else None
+    finished = records[-1].get("finished_at") if records else None
     report = {
         "schema_version": 1,
         "repo": "zsoXi/little-better-dashboard",
@@ -113,8 +192,15 @@ def main(argv=None):
             "timezone": (datetime.datetime.now().astimezone().tzname()
                          or "local"),
         },
-        "started_at": now,
-        "finished_at": now,
+        "started_at": started,
+        "finished_at": finished,
+        "execution": {
+            "records_file": RECORDS_REL,
+            "generated_at": doc.get("generated_at"),
+            "environment": doc.get("environment"),
+            "identity": ident,
+            "commands": records,
+        },
         "overall_status": "core_candidate",
         "counts": counts,
         "results": results,

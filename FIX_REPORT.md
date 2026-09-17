@@ -1459,3 +1459,121 @@ Verification of the fixed snapshot: full local suite `Ran 181 tests ... OK`
 both gates rerun (core passes; release fails solely on F8-T04 CI_PENDING),
 and the review package rebuilt from the new commit. CI and Linux/macOS
 remain NOT_RUN / CI_PENDING; no push, merge, tag or release was performed.
+
+## 14. Second independent review (bfebdbd package) - fixes after the re-audit
+
+The re-audit confirmed the backend, the A01 publisher, A07, the baseline and
+the packaging, and left four findings plus one evidence-hygiene remark. All
+are now closed with fresh reproductions; one deviation is documented.
+
+- **A03 (report generator)**: PASS rows are no longer blessed from matrix
+  text. `tools/run_acceptance_records.py` runs the real commands
+  (`import_check`, `py_compile`, `unittest discover`, publication checks,
+  integration) and records command, exit code, duration, window and an
+  identity fingerprint (runtime + every test + every tool + matrix). The
+  report builder refuses to write when records are missing or when any
+  recorded file changed (verified: broken runtime -> exit 2 "records were
+  made for a different runtime"; edited test -> exit 2 "tests changed since
+  the recorded execution"). Every PASS row carries `executed` and the real
+  `execution_exit_code`; verifier rule (10) re-checks the whole identity
+  against the current files. The audit's broken-runtime scenario now fails
+  at the acceptance level. Known deviation: `tests/test_synth_publish.py`
+  still converts an import failure into a skip (14 skips, exit 0, when the
+  runtime is broken). The file is locked against modification by an
+  unrelated reader process on this machine (write, rename and replace are
+  all denied by the OS); the `import_check` record closes the acceptance
+  path and this per-module deviation stays explicitly noted.
+- **A01 (API propagation)**: `/api/router` now states a failed refresh -
+  the payload keeps the last good snapshot and adds `synth_stale` and
+  `synth_error`. The session list (`query_codex`) keeps the last good
+  contribution through a transient read error (flagged `partial`) and the
+  failed signature is not blessed, so the next plain request re-reads
+  (120 -> partial 120 -> 150). Covered by `tests/test_a01b_session_list_recovery.py`
+  and the HTTP test `tests/test_a01c_api_synth_state.py`.
+- **A06 (full scan)**: the `limit=None` branch now counts and streams from
+  one shared handle exactly like the tail branch; the swap fixture passes
+  in both modes and the pre-fix code fails it (1 != 2).
+- **A05 (coverage metadata)**: skipped oversize records are surfaced -
+  `_codex_last_oversize` is published with the generation, stored in the
+  restart checkpoint (`oversize` in the index) and exposed as
+  `synth_oversize_records` in `/api/router`. The regression publishes
+  [10, 20] from a 10/900/20 fixture under a 1 KiB cap and asserts the count
+  survives a restart adoption.
+- **Evidence separation (F8-T02)**: synthetic stand-ins are a mechanics
+  check only; in a clean checkout the manifest is written as
+  `F8-REDGREEN.synthetic-fixture.log` with an explicit "NOT product
+  evidence" header, and the historical name is written only when the real
+  logs are present.
+- **Browser evidence refreshed**: the F6d (5/5) and F8 (12/12) suites were
+  rerun on this snapshot (msedge headless, 2026-09-17 17:37); the shipped
+  logs/JSONs are those runs and `screenshot.png` is the fresh F8-B01
+  capture from that run, pinned by its new sha256.
+
+Verification of this round: full local suite `Ran 185 tests ... OK` (one
+environmental skip); execution records 5/5 exit 0; the regenerated report
+shows 138 results / 137 passed; the core gate passes with rule (10)
+satisfied; the release gate fails solely on F8-T04 (CI_PENDING plus the
+derived no-ci_runs line); the review package is rebuilt from the new commit.
+CI and Linux/macOS remain NOT_RUN / CI_PENDING; no push, merge, tag or
+release was performed.
+
+## 14. Second independent review (bfebdbd) - follow-up fixes
+
+The re-audit confirmed the backend, the launcher, A01 index recovery, A02
+rule (9), A07 and A08, and listed the remaining paths. This snapshot closes
+them:
+
+- **A03 (execution binding, the main blocker)**: `tools/run_acceptance_records.py`
+  now executes the acceptance commands (`import_check`, `py_compile`,
+  `unittest_discover`, `publication_checks`, `integration`) and records the
+  real exit codes, durations, environment and the identity hashes of the
+  runtime, tests, tools and matrix. `tools/build_test_report.py` refuses to
+  write a report when the records are missing or when any recorded file
+  changed since the run (verified: broken runtime -> exit 2, changed test ->
+  exit 2, no records -> exit 2), so fresh hashes are never placed on stale
+  executions. `tools/verify_acceptance.py` rule (10) requires the execution
+  block, `import_check`/`py_compile`/`unittest_discover` with exit 0 and
+  every mandatory PASS row bound to a successful record. The CI job display
+  names now match rule (9) (`python X on Y`, `browser tests on
+  ubuntu-latest`).
+- **A01 (session list)**: a transient read error keeps the last good
+  contribution (flagged `partial`), is not blessed as the current
+  fingerprint, and the next plain call retries - regression
+  `test_a01b_transient_read_error_keeps_last_good_and_retries`
+  (120 -> 120 + partial -> 150). The HTTP payload now states a failed synth
+  refresh: `/api/router` carries `synth_stale`/`synth_error` while serving
+  the last good snapshot, and `synth_oversize_records` (regression
+  `test_a01c_router_payload_reports_failed_refresh`).
+- **A05 (coverage metadata)**: the number of skipped oversize source lines
+  is part of the published source metadata (`_codex_last_oversize`),
+  persisted in the restart checkpoint and surfaced in `/api/router`;
+  regression `test_a05_oversize_skip_is_reported_in_source_metadata`
+  (published totals 10+20 with one oversize line, count 1 before and after
+  a restart).
+- **A06 (full scan)**: counting and streaming now share one file handle in
+  both branches; the generation-swap regression passes for the limited tail
+  and the full scan
+  (`test_a06_full_scan_swap_between_metadata_and_scan_stays_consistent`,
+  which fails on the previous snapshot with `1 != 2`).
+- **Evidence separation (F8-T02)**: synthetic stand-ins are validated under
+  an explicitly synthetic name (`F8-REDGREEN.synthetic-fixture.log` with a
+  "NOT product evidence" header); `F8-REDGREEN.windows.log` is only written
+  when the real historical logs are present.
+- **Browser evidence**: the F6d (5/5) and F8 (12/12) suites were re-executed
+  on this runtime (msedge headless, 2026-09-17 17:37) and both logs, the
+  JSON results and the F8-B01 screenshot were regenerated from that run
+  (`screenshot.png` re-pinned by sha256 `7994c830...`).
+
+Known deviation: `tests/test_synth_publish.py` still converts an application
+import failure into `SkipTest` (14 skips instead of hard errors when the
+runtime is broken). The file is locked against any modification by an
+external reader process on this machine (writes, replaces and deletes are
+all denied), so the guard could not be changed here; the acceptance flow
+fails first at `import_check`, and this deviation is recorded explicitly.
+
+Verification of this snapshot: full local suite `Ran 185 tests ... OK` (one
+environmental skip), recorder 5/5 commands exit 0, regenerated report 138
+results / 137 passed, core gate passes with rule (10) OK, release fails
+solely on F8-T04 CI_PENDING (rule 9 also reports the missing `ci_runs`),
+and the review package is rebuilt from the new commit. CI and Linux/macOS
+remain NOT_RUN / CI_PENDING; no push, merge, tag or release was performed.

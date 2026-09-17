@@ -310,3 +310,119 @@
   `TEST_REPORT.json` still carries the F1-only hash. Full log in
   `artifacts/F4-verify-core.windows.log`. This is the honest core-gate state,
   not a regression.
+
+---
+
+# FIX_REPORT — F5a/F6a synth publish durability (RED → GREEN)
+
+## F5a-F6a-1. Repo, base, tested SHA, worktree, environment
+
+- Repo: `V3/little-better-dashboard`, branch `fix/audit-f1-f8`.
+- Start of this run: HEAD `47854a5` ("F4 FIX_REPORT"). Worktree DIRTY at start:
+  `M opencode_dashboard.py`, `M tests/test_router_outcomes.py`,
+  `?? tests/test_synth_publish.py` = the F5a/F6a patch + tests from an
+  interrupted predecessor run. Kept after byte-level diff review (contract
+  matches §9/§12 exactly; no foreign code; local session-stats path untouched).
+- Code hashes tested (current worktree bytes):
+  - `opencode_dashboard.py`: `sha256:7bb1209eb0cb50e1b628f94a664d23cded1f0e7cac444acfb4debb21712373c4`
+  - `tests/test_synth_publish.py`: `sha256:7e5d0b1cf66773f74e9f21ffe2793aa062d4e20b218572285118c98d92d017b0`
+  - `tests/test_router_outcomes.py`: `sha256:33f6b19a0d5b9178b615264715b2f27f43d258daa44eef48b813649bb91e3ad6`
+- Worktree at test time: dirty (intended patch + tests + matrix + this report).
+- Environment: Windows, `python` = Python 3.14.3. No browser/Playwright.
+  Linux/macOS: NOT_RUN. No servers started by these tests (pure unit/thread
+  tests); fixtures synthetic in temp dirs with isolated HOME. Pure-LF files:
+  no `git stash`/`checkout` revert was used (would rewrite EOLs); the RED
+  baseline was executed from a throwaway copy instead.
+
+## F5a-F6a-2. Change (TODO -> REPRODUCED -> PATCHED -> VERIFIED -> DONE)
+
+- Contract (§9 F5a, §12 F6a, binding):
+  - `ensure_codex_synth()` returns `(path, error)`; `error` is `None` on
+    success. A failed publish with a usable previous generation keeps serving
+    the OLD file (bytes + committed signature unchanged) and reports the
+    error text via the return value and `_codex_last_error`; the next call
+    retries on its own (no restart, no data added, no `force=True` needed).
+    With NO usable previous generation the failure is explicit
+    (`RuntimeError`), never a path to a nonexistent "ready" file.
+  - Publish = unique candidate tmp file in the SAME directory/filesystem,
+    written and flushed outside the lock, then `os.replace` under a short
+    `_SYNTH_LOCK` held only for the swap + state commit. Cache, signature and
+    `_codex_last_ok` are committed only AFTER a successful swap. On error only
+    the own tmp is deleted; the previous snapshot stays. Windows
+    replace-refusal counts as failed publish (no in-place fallback).
+  - Readers stay lock-free: complete generation A or complete B, never empty,
+    torn, or mixed. Lock scope is thread-level within this one instance
+    (documented at the state block); atomic replace carries no power-loss
+    promise (documentation says so).
+  - Fast path still stats the output file (deleted rebuildable index
+    regenerates); a schema bump (`SYNTH_SCHEMA`) forces a rebuild; exactly one
+    publish attempt per call (no internal retry loop).
+- Changed symbols in `opencode_dashboard.py`:
+  - NEW state: `_codex_last_error`, `_codex_last_ok`, `_SYNTH_LOCK`,
+    `_synth_tmp_active`, `_synth_tmp_seq` (+ scope/atomicity comment).
+  - NEW helpers: `_synth_sig_of(files)` (schema+count+size/mtime sum),
+    `_cleanup_synth_tmps()` (own pattern only, skips registered in-flight
+    tmps, spare foreign files), `_synth_next_seq()`.
+  - `ensure_codex_synth` rewritten: cleanup -> signature -> fast path ->
+    parse outside lock (per-file cache reuse) -> tmp write + flush -> under
+    lock: supersede check (a newer committed signature wins; older candidate
+    discarded) -> `os.replace` -> commit cache/sig/last_ok. OSError in either
+    stage deletes only own tmp, records `codex synth publish failed: ...` and
+    returns the old path or raises when nothing usable exists. The old
+    `except OSError: pass` around the publish is gone.
+  - `router_events_path`: unpacks the new tuple (`path, _err`); behavior of
+    `/api/router` unchanged (errors surface via `blank_router_stats(error)`
+    through the existing handler catch).
+  - `tests/test_router_outcomes.py`: 3 F4 call sites unpack the tuple and
+    assert `synth_err is None` (lines 214-215, 326-327, 410-411).
+- RED evidence (`artifacts/F5a-F6a-RED.windows.log`, exit 1): the final test
+  bytes executed against the unpatched HEAD dashboard in a throwaway copy:
+  Ran 14, FAILED failures=2 errors=8 — t01 "first failing publish must surface
+  error" got a bare path; t03 no `RuntimeError`; 8 unpack ValueErrors
+  (t02/t04/t05/t06, f6a-t01/t04/t06/t08); 4 guard tests already pass on old
+  code (f6a-t02/t03/t05/t07). Genuine contract-level RED, not fixture noise.
+- GREEN evidence:
+  - `artifacts/F5a-F6a-GREEN.windows.log`: Ran 14 tests, OK (12.6 s).
+  - `artifacts/F5a-F6a-suite.windows.log`: Ran 81 tests, OK (67 prior + 14;
+    zero regressions; one pre-existing 401 ResourceWarning noted).
+- Typesafe/Jev second-opinion gate (run BEFORE committing, on the real
+  `git diff`; jev-1.13.0, DIFF_CHARS=9071, no truncation): `touches_local_path`
+  0.09 (low — router/synth path only), `touches_router_path` 0.96,
+  `silent_failure_removed` 0.84, `atomic_publish_present` 0.96. Consistent
+  with the diff and tests.
+- Matrix: F5a-T01..T06 + F6a-T01..T08 -> PASS (windows,
+  `artifacts/F5a-F6a-GREEN.windows.log`); the placeholder file names were
+  corrected to `tests/test_synth_publish.py`.
+- Retries: 0 PATCHED cycles this run (patch inherited from the interrupted
+  predecessor run, re-reviewed byte-level; RED/GREEN re-established from
+  scratch). No report row faked; every claim above maps to a log.
+
+## F5a-F6a-3. Not changed (verified)
+
+- Local session-stats path untouched: F1-T10 `day_total == 165` green in the
+  same 81-run; grep over the diff shows zero local-path edits.
+- F1 router normalization and F2 auth model intact (their tests green in the
+  same run); F4 outcome-unknown semantics intact (F4-T01..T10 green); `pl`
+  and `rec` guards kept.
+- No new `/api/router` payload keys; publish errors reach callers without
+  changing response shape.
+- Known remaining (honest): `query_router_stats` still counts lines by a
+  separate open before the parsing open, so a reader can stat one generation
+  and parse the next. Deliberately NOT fixed here (no F5a/F6a test forces it;
+  §13/F6b reworks exactly those reads). `_cleanup_synth_tmps` runs without
+  the lock by design (register-before-open ordering makes the scan safe
+  under CPython). Thread-level scope only, as specified — no cross-process
+  claim.
+
+## F5a-F6a-4. Verify gate outcome
+
+- `python tools/verify_acceptance.py --gate core --report artifacts/TEST_REPORT.json`
+  -> FAIL (expected/honest): all 131 canonical IDs present and 131
+  core-mandatory marked; PASS evidence files exist; but `artifacts/TEST_REPORT.json`
+  is still F1-era — F2+ rows missing and the report's code hash mismatches the
+  computed `sha256:7bb1209e...` -> "GATE CORE FAILED (132 problems)". The
+  F8-close step rebuilds `TEST_REPORT.json`; log in
+  `artifacts/F5a-F6a-verify-core.windows.log`.
+- Remote operations: none (no push/merge/fetch). Process hygiene: no servers
+  started by this scope; suite servers bind `127.0.0.1:0` only; only own
+  PIDs/threads handled; no repo files left dirty beyond the intended set.

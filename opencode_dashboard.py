@@ -536,6 +536,12 @@ def query_agents(con):
 GRAPH_LIMIT = 200
 SESS_LIMIT = 100
 INSP_PREVIEW = 1500
+INSP_PAGE_DEFAULT = 50
+INSP_PAGE_MAX = 200
+INSP_PARTS_PER_MSG = 20
+INSP_MSG_JSON_CAP = 16384
+INSP_PART_DATA_CAP = 8192
+INSP_BUDGET_BYTES = 1024 * 1024
 
 def _row_dict(r):
     return {k: r[k] for k in r.keys()}
@@ -588,45 +594,127 @@ def query_sessions(con, q="", agent="", model="", limit=SESS_LIMIT):
         rows.append(d)
     return {"rows": rows, "limit": limit}
 
-def query_inspect(con, sid):
+def query_inspect(con, sid, cursor=None, limit=None):
+    """Bounded inspector page (spec ch.16).
+
+    One page of messages ordered by (time_created, id) with a cursor, a
+    hard limit, parts fetched in ONE batched query (capped per message),
+    raw JSON reads bounded by substr()/LENGTH(), and a whole-response
+    UTF-8 budget. Invalid input returns a controlled dict; read-only.
+    """
+    try:
+        lim = int(limit) if limit is not None else INSP_PAGE_DEFAULT
+    except (TypeError, ValueError):
+        lim = INSP_PAGE_DEFAULT
+    if lim < 1:
+        lim = INSP_PAGE_DEFAULT
+    if lim > INSP_PAGE_MAX:
+        lim = INSP_PAGE_MAX
     s = con.execute("SELECT id, title, agent, model, directory, parent_id, time_created, time_updated FROM session WHERE id = ?", (sid,)).fetchone()
     if not s:
         return {"found": False, "id": sid}
-    msgs = []
-    for m in con.execute("SELECT id, data, time_created FROM message WHERE session_id = ? ORDER BY time_created", (sid,)):
+    after = None
+    if cursor:
+        cparts = str(cursor).split("|", 1)
+        if len(cparts) != 2:
+            return {"found": False, "id": sid, "error": "invalid cursor"}
         try:
-            md = json.loads(m["data"]) if isinstance(m["data"], str) else (m["data"] or {})
+            after = (int(cparts[0]), cparts[1])
+        except (TypeError, ValueError):
+            return {"found": False, "id": sid, "error": "invalid cursor"}
+    page_sql = ("SELECT id, substr(data,1,?) AS djson, LENGTH(data) AS dlen, "
+                "time_created FROM message WHERE session_id = ?")
+    args = [INSP_MSG_JSON_CAP, sid]
+    if after is not None:
+        page_sql += " AND (time_created > ? OR (time_created = ? AND id > ?))"
+        args += [after[0], after[0], after[1]]
+    page_sql += " ORDER BY time_created, id LIMIT ?"
+    args.append(lim + 1)
+    rows = list(con.execute(page_sql, args))
+    has_more = len(rows) > lim
+    rows = rows[:lim]
+    msg_ids = [r["id"] for r in rows]
+    parts_by_msg = {}
+    parts_total = {}
+    if msg_ids:
+        qmarks = ",".join("?" for _ in msg_ids)
+        parts_sql = ("SELECT id, message_id, substr(data,1,?) AS pjson, "
+                     "LENGTH(data) AS size FROM (SELECT id, message_id, data, "
+                     "ROW_NUMBER() OVER (PARTITION BY message_id ORDER BY id) AS rn "
+                     "FROM part WHERE message_id IN (" + qmarks + ")) WHERE rn <= ? "
+                     "ORDER BY message_id, id")
+        pargs = [INSP_PART_DATA_CAP] + msg_ids + [INSP_PARTS_PER_MSG]
+        for p in con.execute(parts_sql, pargs):
+            parts_by_msg.setdefault(p["message_id"], []).append(p)
+        cnt_sql = ("SELECT message_id, COUNT(*) AS c FROM part "
+                   "WHERE message_id IN (" + qmarks + ") GROUP BY message_id")
+        for c in con.execute(cnt_sql, msg_ids):
+            parts_total[c["message_id"]] = c["c"]
+    msgs = []
+    for r in rows:
+        raw = r["djson"]
+        try:
+            md = json.loads(raw) if isinstance(raw, str) else {}
         except Exception:
             md = {}
         if not isinstance(md, dict):
             md = {}
-        mid = m["id"]
-        parts = []
-        try:
-            for p in con.execute("SELECT id, data FROM part WHERE message_id = ? ORDER BY id", (mid,)):
-                raw = p["data"]
-                size = len(raw) if isinstance(raw, str) else 0
-                try:
-                    pd = json.loads(raw) if isinstance(raw, str) else {}
-                except Exception:
-                    pd = {}
-                if not isinstance(pd, dict):
-                    pd = {}
-                ptype = pd.get("type", "?")
-                prev = ""
-                for k in ("text", "content", "reasoning", "summary"):
-                    v = pd.get(k)
-                    if isinstance(v, str) and v:
-                        prev = v[:INSP_PREVIEW]
-                        break
-                if not prev and isinstance(raw, str):
-                    prev = raw[:500]
-                parts.append({"id": p["id"], "type": ptype, "size": size, "preview": prev, "truncated": size > INSP_PREVIEW})
-        except Exception as e:
-            parts = [{"error": str(e)}]
-        msgs.append({"id": mid, "role": md.get("role", "?"), "agent": md.get("agent", ""), "model": md.get("model", ""), "time": m["time_created"], "summary": _sstr(md.get("summary", ""))[:500], "parts": parts})
+        mid = r["id"]
+        plist = []
+        for p in parts_by_msg.get(mid, []):
+            praw = p["pjson"]
+            size = p["size"] if isinstance(p["size"], int) else (len(praw) if isinstance(praw, str) else 0)
+            truncated = size > INSP_PART_DATA_CAP
+            raw_frag = False
+            try:
+                pd = json.loads(praw) if isinstance(praw, str) else {}
+            except Exception:
+                pd = {}
+            if not isinstance(pd, dict):
+                pd = {}
+            ptype = pd.get("type", "?")
+            prev = ""
+            for k in ("text", "content", "reasoning", "summary"):
+                v = pd.get(k)
+                if isinstance(v, str) and v:
+                    prev = v[:INSP_PREVIEW]
+                    break
+            if not prev and isinstance(praw, str):
+                prev = praw[:500]
+                raw_frag = truncated
+            plist.append({"id": p["id"], "type": ptype, "size": size,
+                          "preview": prev, "truncated": truncated,
+                          "raw_fragment": raw_frag})
+        mdict = {"id": mid, "role": md.get("role", "?"),
+                 "agent": md.get("agent", ""), "model": md.get("model", ""),
+                 "time": r["time_created"],
+                 "summary": _sstr(md.get("summary", ""))[:500],
+                 "parts": plist}
+        omitted = max(0, parts_total.get(mid, 0) - INSP_PARTS_PER_MSG)
+        if omitted:
+            mdict["parts_omitted"] = omitted
+        if isinstance(r["dlen"], int) and r["dlen"] > INSP_MSG_JSON_CAP:
+            mdict["data_truncated"] = True
+        msgs.append(mdict)
     out = _row_dict(s)
-    out.update({"found": True, "messages": msgs})
+    out.update({"found": True, "messages": msgs, "has_more": has_more,
+                "cursor": ((str(msgs[-1]["time"]) + "|" + str(msgs[-1]["id"]))
+                           if msgs else None),
+                "count": len(msgs), "limit": lim,
+                "response_truncated": False,
+                "parts_truncated": any(m.get("parts_omitted") for m in msgs)
+                or any(p.get("truncated") for m in msgs for p in m["parts"])})
+    while (len(json.dumps(out).encode("utf-8")) > INSP_BUDGET_BYTES
+           and out["messages"]):
+        out["messages"].pop()
+        out["response_truncated"] = True
+        out["has_more"] = True
+        out["count"] = len(out["messages"])
+        if out["messages"]:
+            last = out["messages"][-1]
+            out["cursor"] = str(last["time"]) + "|" + str(last["id"])
+    if not out["messages"]:
+        out["cursor"] = cursor
     return out
 
 def query_projects(con):
@@ -4493,7 +4581,8 @@ async function fetchSessions(){var p='q='+encodeURIComponent($('ss-q').value)+'&
 function renderProjects(){var tb=document.querySelector('#projtbl tbody');if(!tb)return;if(!PJ||PJ.error){tb.innerHTML='<tr><td colspan="5">ERR</td></tr>';return;}var H='';for(var i=0;i<PJ.rows.length;i++){var r=PJ.rows[i];var nm=r.name||r.directory||r.worktree||r.id;H+='<tr><td>'+ESC(nm)+'</td><td>'+ESC(r.directory||r.worktree||'')+'</td><td>'+ESC(r.vcs||'')+'</td><td class="num">'+(r.sessions||0)+'</td><td>'+fmtT(r.last)+'</td></tr>';}if(!H)H='<tr><td colspan="5">no projects</td></tr>';tb.innerHTML=H;}
 function renderSignals(){var el=document.getElementById('sig-chips');if(!el)return;if(!SG||SG.error){el.textContent='ERR';return;}var H='';for(var i=0;i<SG.signals.length;i++){var s=SG.signals[i];var c=(s.level==='warn')?'#a6761d':((s.level==='err')?'#c00':'#16a34a');H+='<span style="display:inline-block;padding:2px 10px;border:1px solid '+c+';border-radius:12px;margin:2px;color:'+c+'">'+ESC(s.text)+'</span>';}if(!H)H='<span>all clear</span>';el.innerHTML=H;}
 var _inspGen=0;
-async function inspect(sid){var box=document.getElementById('insp');if(!box)return;box.hidden=false;var g=++_inspGen;box.textContent='loading '+sid+' ...';try{var d=await fetchJson('/api/inspect?id='+encodeURIComponent(sid)+'&_='+Date.now());if(g!==_inspGen)return;if(!d||!d.found){box.textContent='not found '+sid+' (click the row to retry)';return;}var H='<b>'+ESC(d.title||sid)+'</b> <span style="opacity:.65">'+ESC(d.agent||'')+' / '+ESC(d.model||'')+' / '+ESC(d.directory||'')+'</span>';for(var i=0;i<d.messages.length;i++){var m=d.messages[i];H+='<div style="margin-top:8px"><b>'+ESC(m.role)+'</b> <span style="opacity:.65">'+ESC(m.agent||'')+' '+ESC(m.model||'')+' · '+m.parts.length+' parts</span>';if(m.summary)H+='<div>'+ESC(m.summary)+'</div>';for(var j=0;j<m.parts.length;j++){var p=m.parts[j];H+='<div style="margin-left:12px;opacity:.85">['+ESC(p.type)+'] '+p.size+' B'+(p.preview?(', '+ESC(String(p.preview).slice(0,300))):'')+'</div>';}H+='</div>';}box.innerHTML=H;box.scrollIntoView();}catch(e){if(e&&e.status===401){noteAuthFailure();box.textContent='Authorization required — reopen via the launcher link';return;}if(g!==_inspGen)return;box.textContent='ERR '+e.message+' (click the row to retry)';}}
+const _inspState={sid:null,cursor:null,hasMore:false,pending:null};
+async function inspect(sid){var box=document.getElementById('insp');if(!box)return;box.hidden=false;var g=++_inspGen;if(_inspState.sid!==sid){_inspState.sid=sid;_inspState.cursor=null;_inspState.hasMore=false;_inspState.pending=null;}box.textContent='loading '+sid+' ...';try{var u='/api/inspect?id='+encodeURIComponent(sid)+'&_='+Date.now();if(_inspState.pending)u+='&cursor='+encodeURIComponent(_inspState.pending);var d=await fetchJson(u);if(g!==_inspGen)return;if(!d||!d.found){box.textContent='not found '+sid+' (click the row to retry)';return;}var H='<b>'+ESC(d.title||sid)+'</b> <span style="opacity:.65">'+ESC(d.agent||'')+' / '+ESC(d.model||'')+' / '+ESC(d.directory||'')+'</span>';for(var i=0;i<d.messages.length;i++){var m=d.messages[i];H+='<div style="margin-top:8px"><b>'+ESC(m.role)+'</b> <span style="opacity:.65">'+ESC(m.agent||'')+' '+ESC(m.model||'')+' · '+m.parts.length+' parts'+(m.parts_omitted?(' (+'+m.parts_omitted+' omitted)'):'')+'</span>';if(m.summary)H+='<div>'+ESC(m.summary)+'</div>';for(var j=0;j<m.parts.length;j++){var p=m.parts[j];H+='<div style="margin-left:12px;opacity:.85">['+ESC(p.type)+'] '+p.size+' B'+(p.preview?(', '+ESC(String(p.preview).slice(0,300))+(p.truncated?' …[truncated]':'')+(p.raw_fragment?' [raw fragment]':'')):'')+'</div>';}H+='</div>';}H+='<div style="margin-top:10px;opacity:.75;font-size:11px">'+d.count+' messages shown'+((d.parts_truncated)?' · some parts truncated':'')+((d.response_truncated)?' · response shortened':'')+'</div>';if(d.has_more){H+='<div style="margin-top:6px"><button id="insp-more" class="tbtn">Load next</button></div>';}box.innerHTML=H;if(d.has_more){_inspState.cursor=d.cursor;_inspState.hasMore=true;var b=document.getElementById('insp-more');if(b)b.onclick=function(){_inspState.pending=_inspState.cursor;inspect(_inspState.sid);};}else{_inspState.hasMore=false;}box.scrollIntoView();}catch(e){if(e&&e.status===401){noteAuthFailure();box.textContent='Authorization required — reopen via the launcher link';return;}if(g!==_inspGen)return;box.textContent='ERR '+e.message+' (click the row to retry)';}}
 if(!window.__p1wire){window.__p1wire=1;document.addEventListener('click',function(e){var t=(e.target&&e.target.closest)?e.target.closest('[data-sid]'):null;if(t)inspect(t.getAttribute('data-sid'));});['ss-q','ss-agent','ss-model'].forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener('input',function(){if(window.__p1t)clearTimeout(window.__p1t);window.__p1t=setTimeout(fetchSessions,350);});});}
 $('refresh').onclick=()=>{if(AUTH_FAILED)return;load();};
 $('search').addEventListener('input',renderSessions);
@@ -4771,10 +4860,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", body)
         elif path.startswith("/api/inspect"):
             try:
-                sid = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
+                pq = parse_qs(urlparse(self.path).query)
+                sid = (pq.get("id") or [""])[0]
+                cursor = (pq.get("cursor") or [None])[0]
+                limit = (pq.get("limit") or [None])[0]
                 con = connect(self.db_path)
                 try:
-                    stats = query_inspect(con, sid)
+                    stats = query_inspect(con, sid, cursor=cursor, limit=limit)
                 finally:
                     con.close()
             except Exception as e:

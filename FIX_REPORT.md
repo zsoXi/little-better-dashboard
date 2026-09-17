@@ -243,3 +243,70 @@
   `TEST_REPORT.json` still carries the F1-only hash. Full log in
   `artifacts/F2-verify-core.windows.log`. This is the honest core-gate state,
   not a regression.
+## F4-1. Repo, base, tested SHA, worktree, environment
+
+- Repo: `V3/little-better-dashboard`, branch `fix/audit-f1-f8`.
+- Start of this run: HEAD `2759dc1` ("F2 access protection + RED-GREEN tests");
+  worktree DIRTY (`M opencode_dashboard.py`, `M tests/test_router_outcomes.py`)
+  = genuine partial F4 work from an interrupted predecessor run (kept after
+  diff review: parse-level `_router_outcome`/`usage_known`/`outcome` field,
+  `SYNTH_SCHEMA` 3, `synth_context`, plus `TestF4UnknownOutcomes` RED tests;
+  no foreign code).
+- F4 code hash tested: `sha256:797120f4bef2f9fd83a9290898cef8dc12aa1a651f937f5ed6350258d7e07df2`.
+- Worktree at test time: dirty (F4 patch + tests + matrix + this report).
+- Environment: Windows, `py -3.14` = Python 3.14.3. No browser/Playwright.
+  Linux/macOS: NOT_RUN. Test servers on `127.0.0.1` with system-allocated ports
+  only (port 0; never 8765/8766/8770). Fixtures synthetic in temp dirs, isolated HOME.
+
+## F4-2. Change (TODO -> REPRODUCED -> PATCHED -> VERIFIED -> DONE)
+
+- RED evidence (`artifacts/F4-RED.windows.log`, predecessor run on the same
+  partial tree): Ran 13 tests, FAILED failures=10. Failure modes: half-patched
+  `query_router_stats` crashed on None status (err500/day paths), writer still
+  stamped status 200, UI untouched; F1-T10 regressed via the same crash.
+- PATCH (my `f4-patch.py`, 26/26 replacements OK, plus `f4-t07-fix.py`, 3/3):
+  synth status null + outcome unknown; normalizer 200-299 success /
+  400-599 error / missing-null-0-bad-1xx-3xx unknown; `usage_known` separate
+  from outcome (explicit-zero True, missing False); totals `unmetered` =
+  not `usage_known` (T07 root cause was the totals counter, not the event
+  classifier); per-aggregation success/error/unknown counters + coverage +
+  `success_rate` over known only (null when 0 known); averages over metered
+  events; real 401/429/500 preserved; `durationMs` null + `latency_na`;
+  `SYNTH_SCHEMA` 3 + cache invalidation; synth records labeled
+  'Usage events'; UI Outcome-unavailable cell + unknown chips + hint + export;
+  JS syntax fix (spurious leading quote on the Outcome cell line, found by
+  `node --check` on TRUE blocks, fixed at L3552).
+- GREEN evidence:
+  - `artifacts/F4-GREEN.windows.log`: **Ran 67 tests in 8.625s, OK**
+    (57 prior + 10 new F4, zero regressions). `py_compile` OK.
+  - `node --check` on both TRUE JS blocks: EXIT 0/0 (extraction by PAGE
+    template, not naive script regex).
+  - Live authed boot on `127.0.0.1:1281` (real user data): unauth
+    `/api/router` 401 (F2 intact); authed requests=61734 total=9583121584
+    ok=0 errors=0 unknown=61734 known_outcomes=0 success_rate=null
+    coverage 0/61734 unmetered=0 invalid_records=0 total_conflicts=0
+    tokens_reasoning=14523651 tokens_cache_write=0 avg_ms=null
+    latency_na=True req_word='Usage events' trunc=False src=codex-synth
+    cache_rate=97. Test server (own PID) killed after evidence.
+- Matrix: `docs/ACCEPTANCE_MATRIX.md` F4-T01..T10 -> PASS (windows,
+  `artifacts/F4-GREEN.windows.log`); all other rows unchanged.
+- Retries: 1 PATCHED cycle + 1 test-only correction (T07 totals formula) +
+  1 JS syntax fix -> GREEN. No BLOCKED.
+
+## F4-3. Not changed (verified)
+
+- F1 router normalization intact (F1-T01..T10 green in the same 67-run);
+  local `day_total`/`dayTotal`/`outMerged` untouched (F1-T10
+  `day_total==165` still passes; diff scan zero hits on the local path).
+- F2 token model intact (live unauth 401 plus all F2 tests green).
+- `pl` isinstance guard kept; new `rec` guard added (F5c partial hardening
+  noted, full F5c stays in its own finding). `git diff --check` clean.
+  No work outside V3 repo; no push/merge/remote; only own PIDs handled.
+
+## F4-4. Verify gate outcome
+
+- `py -3.14 tools/verify_acceptance.py --gate core` -> FAIL (expected):
+  F1+F2+F4 PASS on windows, but F5-F8/PUB/INT remain NOT_RUN by design, and
+  `TEST_REPORT.json` still carries the F1-only hash. Full log in
+  `artifacts/F4-verify-core.windows.log`. This is the honest core-gate state,
+  not a regression.

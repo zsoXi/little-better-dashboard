@@ -14,16 +14,16 @@ one row per single environment (`windows` or `linux`).
 
 | acceptance_id | finding_id | test_file::test_name or runner/case | required environment | mandatory for core/release | result | evidence path |
 | --- | --- | --- | --- | --- | --- | --- |
-| F1-T01 | F1 | tests/test_router_tokens.py::TestRouterTokens::test_router_cache_rate_pure | windows+linux | core+release | NOT_RUN | - |
-| F1-T02 | F1 | tests/test_router_tokens.py::TestRouterTokens::test_router_cache_rate_pure | windows+linux | core+release | NOT_RUN | - |
-| F1-T03 | F1 | tests/test_router_tokens.py::TestRouterTokens::test_router_cache_rate_pure | windows+linux | core+release | NOT_RUN | - |
-| F1-T04 | F1 | tests/test_router_tokens.py::TestRouterTokens::test_router_cache_rate_pure | windows+linux | core+release | NOT_RUN | - |
-| F1-T05 | F1 | tests/test_router_tokens.py::TestRouterTokens::test_router_cache_rate_pure | windows+linux | core+release | NOT_RUN | - |
-| F1-T06 | F1 | tests/test_router_tokens.py::TestRouterTokens::test_router_cache_rate_pure | windows+linux | core+release | NOT_RUN | - |
-| F1-T07 | F1 | tests/test_router_tokens.py::TestRouterTokens::test_router_cache_rate_pure | windows+linux | core+release | NOT_RUN | - |
-| F1-T08 | F1 | tests/test_router_tokens.py::TestRouterTokens::test_router_cache_rate_pure | windows+linux | core+release | NOT_RUN | - |
-| F1-T09 | F1 | tests/test_router_tokens.py::TestRouterTokens::test_router_cache_rate_pure | windows+linux | core+release | NOT_RUN | - |
-| F1-T10 | F1 | tests/test_router_tokens.py::TestRouterTokens::test_router_cache_rate_pure | windows+linux | core+release | NOT_RUN | - |
+| F1-T01 | F1 | tests/test_router_tokens.py::TestRouterTokenContract::test_f1_01_contract_120_all_aggregates | windows+linux | core+release | PASS | artifacts/F1-GREEN.windows.log |
+| F1-T02 | F1 | tests/test_router_tokens.py::TestRouterApiServe::test_f1_02_served_page_shape_120 | windows+linux | core+release | PASS | artifacts/F1-router-api.windows.log |
+| F1-T03 | F1 | tests/test_router_tokens.py::TestRouterFrontendContract::test_f1_03_frontend_js_totals_via_node | windows+linux | core+release | PASS | artifacts/F1-GREEN.windows.log |
+| F1-T04 | F1 | tests/test_router_tokens.py::TestRouterTokenContract::test_f1_04_cache_rate_40 | windows+linux | core+release | PASS | artifacts/F1-GREEN.windows.log |
+| F1-T05 | F1 | tests/test_router_tokens.py::TestRouterTokenContract::test_f1_05_multi_record_consistency_210 | windows+linux | core+release | PASS | artifacts/F1-GREEN.windows.log |
+| F1-T06 | F1 | tests/test_router_tokens.py::TestRouterTokenContract::test_f1_06_missing_total_fallback | windows+linux | core+release | PASS | artifacts/F1-GREEN.windows.log |
+| F1-T07 | F1 | tests/test_router_tokens.py::TestRouterTokenContract::test_f1_07_zeros_partial_conflict | windows+linux | core+release | PASS | artifacts/F1-GREEN.windows.log |
+| F1-T08 | F1 | tests/test_router_tokens.py::TestRouterTokenContract::test_f1_08_invalid_values_sanitized | windows+linux | core+release | PASS | artifacts/F1-GREEN.windows.log |
+| F1-T09 | F1 | tests/test_router_tokens.py::TestRouterTokenContract::test_f1_09_local_path_unchanged | windows+linux | core+release | PASS | artifacts/F1-GREEN.windows.log |
+| F1-T10 | F1 | tests/test_router_tokens.py::TestRouterTokenContract::test_f1_10_odd_status_still_counts_usage | windows+linux | core+release | PASS | artifacts/F1-GREEN.windows.log |
 | F2-T01 | F2 | tests/test_router_outcomes.py::TestRouterOutcomes::test_router_outcome_helpers_pure | windows+linux | core+release | NOT_RUN | - |
 | F2-T02 | F2 | tests/test_router_outcomes.py::TestRouterOutcomes::test_router_outcome_helpers_pure | windows+linux | core+release | NOT_RUN | - |
 | F2-T03 | F2 | tests/test_router_outcomes.py::TestRouterOutcomes::test_router_outcome_helpers_pure | windows+linux | core+release | NOT_RUN | - |

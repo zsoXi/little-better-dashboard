@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import sqlite3
 import subprocess
@@ -139,8 +140,13 @@ def router_cache_rate(input_total, cached_input):
 
 
 def _router_day_tokens(d):
-    """Router day total without double-counting cached input (subset of input)."""
-    return (d.get("ti", 0) or 0) + (d.get("to", 0) or 0) + (d.get("tr", 0) or 0)
+    """Router day total: ti + to only.
+
+    Cached input is a subset of input and reasoning is a subset of output,
+    so neither is ever additive here. (Local OpenCode day_total is a
+    different contract and is intentionally untouched.)
+    """
+    return (d.get("ti", 0) or 0) + (d.get("to", 0) or 0)
 
 
 def compute_streaks(activity, tokens_only=False):
@@ -1355,13 +1361,43 @@ def _router_event_day_hour(at):
         return None, None
 
 
+def _router_token(value, present):
+    """Sanitize one router token counter -> (float_value, valid).
+
+    Only real JSON numbers are measurements. A missing (or explicit null)
+    field is absent, not invalid. Present-but-invalid values -- bools,
+    NaN/Infinity, negatives, strings, objects/lists -- sanitize to 0.0 and
+    are reported via the invalid_records problem counter instead of
+    poisoning the aggregates or the JSON payload. Router-path only; the
+    local OpenCode num() helper is intentionally untouched.
+    """
+    if not present or value is None:
+        return 0.0, True
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0, False
+    if not math.isfinite(value) or value < 0:
+        return 0.0, False
+    return float(value), True
+
+
 def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
-    """Read usage-events.jsonl tail; return list of normalized event dicts.
+    """Read usage-events.jsonl tail; return (events, problems).
 
     Each event: {at, date, hour, model, short, provider, status, ok,
-    ti, cache, to, total, reasoning, cache_write, ms, free, what_if}. Missing token fields on
+    ti, cache, to, total, reasoning, cache_write, ms, free, what_if,
+    total_reported, usage_partial}. Missing token fields on
     error rows (401/429/500) become 0 and are counted as errors, never
     estimated, actuals only.
+
+    Total contract (router path): total = inputTokens + outputTokens.
+    Cached input is a subset of input, reasoning a subset of output --
+    never additive. A declared totalTokens conflicting with complete
+    components is normalized to ti + to and counted in
+    problems["total_conflicts"]; total_reported keeps the source value.
+    A record with only a declared total keeps that sum in every aggregate
+    with usage_partial=True (components are never invented). problems also
+    carries invalid_records (records with a present-but-invalid token
+    field, sanitized to 0 without aborting the read).
     """
     p = Path(path)
     try:
@@ -1371,6 +1407,7 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
         raise RuntimeError(f"Router usage file not found: {path}")
     if limit and len(lines) > limit:
         lines = lines[-limit:]
+    problems = {"invalid_records": 0, "total_conflicts": 0}
     events = []
     for line in lines:
         line = line.strip()
@@ -1389,17 +1426,33 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
         except (TypeError, ValueError):
             status = 0
         ok = status in (0, 200) or 200 <= status < 300
-        ti = num(e.get("inputTokens"))
-        cache = num(e.get("cachedInputTokens"))
-        to = num(e.get("outputTokens"))
-        total = num(e.get("totalTokens"))
-        reasoning = num(e.get("reasoningTokens"))
-        cache_write = num(e.get("cacheWriteInputTokens"))
-        if not total:
+        ti, ti_ok = _router_token(e.get("inputTokens"), "inputTokens" in e)
+        cache, cache_ok = _router_token(e.get("cachedInputTokens"), "cachedInputTokens" in e)
+        to, to_ok = _router_token(e.get("outputTokens"), "outputTokens" in e)
+        total_declared, total_ok = _router_token(e.get("totalTokens"), "totalTokens" in e)
+        reasoning, reasoning_ok = _router_token(e.get("reasoningTokens"), "reasoningTokens" in e)
+        cache_write, cw_ok = _router_token(e.get("cacheWriteInputTokens"), "cacheWriteInputTokens" in e)
+        if not (ti_ok and cache_ok and to_ok and total_ok and reasoning_ok and cw_ok):
+            problems["invalid_records"] += 1
+        has_ti = "inputTokens" in e and e.get("inputTokens") is not None
+        has_to = "outputTokens" in e and e.get("outputTokens") is not None
+        has_total = "totalTokens" in e and e.get("totalTokens") is not None
+        usage_partial = False
+        if ti_ok and to_ok and has_ti and has_to:
             total = ti + to
+            if total_ok and has_total and total_declared != total:
+                problems["total_conflicts"] += 1
+        elif total_ok and has_total:
+            total = total_declared
+            usage_partial = True
+        else:
+            total = 0.0
+            usage_partial = True
         try:
             ms = float(e.get("durationMs") or 0)
         except (TypeError, ValueError):
+            ms = 0.0
+        if not math.isfinite(ms) or ms < 0:
             ms = 0.0
         date, hour = _router_event_day_hour(e.get("at"))
         events.append(
@@ -1421,9 +1474,11 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
                 "ms": ms,
                 "free": router_is_free(model),
                 "what_if": what_if_cost(short, ti, to),
+                "total_reported": total_declared if total_ok and has_total else None,
+                "usage_partial": usage_partial,
             }
         )
-    return events
+    return events, problems
 
 
 def _router_time_key(at):
@@ -1474,10 +1529,10 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         raise RuntimeError(f"Router usage file not found: {events_path}")
     if full_scan:
         truncated = False
-        scanned_events = parse_router_events(events_path, None)
+        scanned_events, problems = parse_router_events(events_path, None)
     else:
         truncated = total_lines > MAX_ROUTER_EVENTS
-        scanned_events = parse_router_events(events_path, MAX_ROUTER_EVENTS)
+        scanned_events, problems = parse_router_events(events_path, MAX_ROUTER_EVENTS)
     # Successful responses that carried no token fields (local/unmetered
     # models, image calls) are excluded from every count and average -
     # never estimated, and reported separately as `unmetered`.
@@ -1491,6 +1546,10 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     ti = sum(e["ti"] for e in ok_events)
     cache = sum(e["cache"] for e in ok_events)
     to = sum(e["to"] for e in ok_events)
+    # Headline usage is the normalized per-event total (ti + to for complete
+    # records, the reported sum for total-only records), so every aggregate
+    # below shares one definition.
+    toks_total = sum(e["total"] for e in ok_events)
     tr = sum(e.get("reasoning", 0) for e in ok_events)
     cw = sum(e.get("cache_write", 0) for e in ok_events)
     what_if = round(sum(e["what_if"] for e in ok_events), 4)
@@ -1550,7 +1609,7 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
             continue
         b = day_buckets.setdefault(
             e["date"], {"reqs": 0, "ok": 0, "err": 0, "err429": 0, "err500": 0, "ti": 0.0, "to": 0.0,
-                        "cache": 0.0, "tr": 0.0, "what_if": 0.0}
+                        "cache": 0.0, "tr": 0.0, "total": 0.0, "what_if": 0.0}
         )
         b["reqs"] += 1
         if e["status"] == 429:
@@ -1563,6 +1622,7 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
             b["to"] += e["to"]
             b["cache"] += e["cache"]
             b["tr"] += e.get("reasoning", 0)
+            b["total"] += e["total"]
             b["what_if"] += e["what_if"]
         else:
             b["err"] += 1
@@ -1570,8 +1630,11 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     day_entries = []
     for d in sorted(day_buckets):
         b = day_buckets[d]
-        # Router inputTokens already includes cachedInputTokens.
-        tot = b["ti"] + b["to"]
+        # Router inputTokens already includes cachedInputTokens, and output
+        # already includes reasoning: the day total is the normalized
+        # per-event total (ti + to, or the reported sum for total-only
+        # records), never ti + to + tr.
+        tot = b["total"]
         day_entries.append(
             {"date": d, "msgs": b["reqs"], "sessions": b["ok"], "reqs": b["reqs"],
              "ok": b["ok"], "err": b["err"], "err429": b["err429"], "err500": b["err500"],
@@ -1581,8 +1644,11 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
              "total": round(tot, 1)}
         )
     activity = pad_activity(day_entries)
+    day_total_by_date = {de["date"]: de["total"] for de in day_entries}
     for slot in activity:
-        slot["total"] = round(slot["ti"] + slot["to"] + slot["tr"], 1)
+        # Heatmap cells reuse the authoritative day total (which includes
+        # reported-only sums); empty window days fall back to ti + to = 0.
+        slot["total"] = round(day_total_by_date.get(slot["date"], slot["ti"] + slot["to"]), 1)
         slot.setdefault("reqs", slot.get("msgs", 0))
 
     recent = sorted(events, key=lambda e: (_router_time_key(e.get("at")), str(e.get("at") or "")),
@@ -1613,7 +1679,7 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     r_commit_rows.sort(key=lambda r: -r[7])
     r_commit_rows = r_commit_rows[:MAX_COMMIT_ROWS]
 
-    avg_per_session = round((ti + to) / len(ok_events), 0) if ok_events else 0
+    avg_per_session = round(toks_total / len(ok_events), 0) if ok_events else 0
     totals = {
         "requests": len(events),
         "ok": len(ok_events),
@@ -1621,12 +1687,14 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         "err429": err429,
         "err500": err500,
         "unmetered": unmetered,
+        "invalid_records": problems["invalid_records"],
+        "total_conflicts": problems["total_conflicts"],
         "tokens_input": ti,
         "tokens_output": to,
         "tokens_reasoning": tr,
         "tokens_cache_read": cache,
         "tokens_cache_write": cw,
-        "tokens_total": ti + to,
+        "tokens_total": toks_total,
         "cache_rate": router_cache_rate(ti, cache),
         "models": len(by_model),
         "providers": len(by_provider),
@@ -1719,6 +1787,7 @@ def blank_router_stats(error=None):
         "source_label": "Codex data",
         "totals": {"requests": 0, "ok": 0, "errors": 0, "err429": 0, "err500": 0,
                    "unmetered": 0,
+                   "invalid_records": 0, "total_conflicts": 0,
                    "tokens_input": 0, "tokens_output": 0, "tokens_reasoning": 0,
                    "tokens_cache_read": 0, "tokens_cache_write": 0, "tokens_total": 0,
                    "cache_rate": 0.0, "models": 0, "providers": 0, "what_if_cost": 0,
@@ -2978,7 +3047,7 @@ function renderFilterBar(){
 }
 /* ---- Codex tab (all models, from usage-events.jsonl) ---- */
 function rModelShort(m){return (m||'-').split('/').pop();}
-function rDayTokenTotal(d){return (d.ti||0)+(d.to||0)+(d.tr||0);}
+function rDayTokenTotal(d){return (d.ti||0)+(d.to||0);}
 function rCutDate(){
   if(RRANGE==='all')return'';
   const d=new Date(Date.now()-RRANGE*86400000);

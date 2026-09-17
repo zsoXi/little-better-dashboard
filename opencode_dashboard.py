@@ -644,16 +644,27 @@ def query_signals(con):
         con.execute("SELECT * FROM router LIMIT 1").fetchone()
     except Exception as e:
         sigs.append({"level": "info", "text": "Router table unreadable: " + str(e)[:120]})
-    import os as _os, time as _time
+    import time as _time
     try:
-        cx = str(CODEX_DIR)
-        files = [f for f in _os.listdir(cx) if f.endswith(".jsonl")]
-        if files:
-            newest = max(_os.path.getmtime(_os.path.join(cx, f)) for f in files)
-            age_h = (_time.time() - newest) / 3600
-            sigs.append({"level": "ok" if age_h < 72 else "warn", "text": "Codex: " + str(len(files)) + " files, newest " + ("%.1f" % age_h) + "h ago"})
+        files, cstate, cskip = _codex_rollout_files()
+        n_ok, newest, sskip = _codex_rollout_stats(files)
+        skipped = cskip + sskip
+        if cstate == "missing":
+            sigs.append({"level": "warn", "text": "Codex sessions dir missing"})
+        elif cstate == "unreadable":
+            sigs.append({"level": "warn", "text": "Codex dir unreadable"})
+        elif not n_ok:
+            if skipped:
+                sigs.append({"level": "warn", "text": "Codex: rollout files unreadable (skipped " + str(skipped) + ")"})
+            else:
+                sigs.append({"level": "warn", "text": "Codex sessions dir empty"})
         else:
-            sigs.append({"level": "warn", "text": "Codex sessions dir empty"})
+            age_h = (_time.time() - newest) / 3600
+            txt = "Codex: " + str(n_ok) + " files, newest " + ("%.1f" % age_h) + "h ago"
+            if skipped:
+                txt += " (partial: " + str(skipped) + " skipped)"
+            sigs.append({"level": "ok" if (age_h < 72 and not skipped) else "warn",
+                         "text": txt})
     except Exception as e:
         sigs.append({"level": "warn", "text": "Codex dir unreadable: " + str(e)[:120]})
     return {"signals": sigs}
@@ -661,6 +672,55 @@ def query_signals(con):
 CODEX_DIR = _HOME / ".codex" / "sessions"
 _codex_cache = {}
 _codex_sig = None
+
+# F5b: one shared rollout enumeration for diagnostics, the session list and
+# the synth reader - same root, same name pattern, same states.
+CODEX_ROLLOUT_GLOB = "rollout-*.jsonl"
+
+def _codex_rollout_files():
+    # Returns (files, state, skipped). state: missing (no dir), unreadable
+    # (listing failed), empty (no matching file), partial (some matching
+    # entries vanished or were unreadable while enumerating), ok.
+    try:
+        if not CODEX_DIR.is_dir():
+            return [], "missing", 0
+    except OSError:
+        return [], "missing", 0
+    try:
+        cand = sorted(CODEX_DIR.rglob(CODEX_ROLLOUT_GLOB))
+    except OSError:
+        return [], "unreadable", 0
+    files = []
+    skipped = 0
+    for p in cand:
+        try:
+            ok = p.is_file()
+        except OSError:
+            ok = False
+        if ok:
+            files.append(p)
+        else:
+            skipped += 1
+    if skipped:
+        return files, ("partial" if files else "empty"), skipped
+    return files, ("ok" if files else "empty"), 0
+
+def _codex_rollout_stats(files):
+    # File count and newest mtime over the same set the parsers read; stat
+    # failures are counted as skipped (partial read), never as success.
+    ok = 0
+    newest = 0
+    skipped = 0
+    for p in files:
+        try:
+            st = p.stat()
+        except OSError:
+            skipped += 1
+            continue
+        ok += 1
+        if st.st_mtime > newest:
+            newest = st.st_mtime
+    return ok, newest, skipped
 
 def _ctext(blocks):
     if not isinstance(blocks, list):
@@ -675,10 +735,12 @@ def _parse_codex_file(p, st):
     row = {"file": str(p), "name": p.stem, "n": 0, "tok": 0, "tools": {},
            "previews": [], "model": "", "provider": "", "cwd": "",
            "sid": "", "first": "", "last": "",
-           "_sz": st.st_size, "_mt": int(st.st_mtime)}
+           "_sz": st.st_size, "_mt": int(st.st_mtime),
+           "_invalid": 0, "_err": False}
     try:
         fh = open(p, encoding="utf-8", errors="replace")
     except OSError:
+        row["_err"] = True
         return row
     with fh:
         for line in fh:
@@ -688,6 +750,9 @@ def _parse_codex_file(p, st):
             try:
                 rec = json.loads(line)
             except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                row["_invalid"] += 1
                 continue
             t = rec.get("type")
             pl = rec.get("payload")
@@ -729,17 +794,15 @@ def _parse_codex_file(p, st):
 
 def query_codex(force=False):
     global _codex_cache, _codex_sig
-    try:
-        files = sorted(CODEX_DIR.rglob("rollout-*.jsonl")) if CODEX_DIR.is_dir() else []
-    except OSError:
-        files = []
+    files, _cstate, cskip = _codex_rollout_files()
+    skipped = cskip
     tot = 0
     for p in files:
         try:
             s = p.stat()
             tot += s.st_size + int(s.st_mtime)
         except OSError:
-            pass
+            skipped += 1
     sig = (len(files), tot)
     if force or _codex_sig != sig:
         rows = {}
@@ -762,6 +825,11 @@ def query_codex(force=False):
     models = {}
     t_tok = 0
     t_msg = 0
+    invalid = 0
+    for r in _codex_cache.values():
+        invalid += int(r.get("_invalid") or 0)
+        if r.get("_err"):
+            skipped += 1
     for r in sess:
         m = r.get("model") or r.get("provider") or "?"
         e = models.setdefault(m, {"n": 0, "tok": 0})
@@ -771,6 +839,7 @@ def query_codex(force=False):
         t_msg += r.get("n", 0)
     return {"ok": True, "total": len(sess), "files": len(files),
             "tokens": t_tok, "msgs": t_msg, "models": models,
+            "invalid_records": invalid, "partial": bool(skipped),
             "sessions": sess[:200]}
 
 CODEX_SYNTH = Path(__file__).with_name("codex_router_events.jsonl")
@@ -873,10 +942,7 @@ def ensure_codex_synth(force=False):
     # Lock scope is thread-level within this process (single instance).
     global _codex_ev_cache, _codex_ev_sig, _codex_last_error, _codex_last_ok
     _cleanup_synth_tmps()
-    try:
-        files = sorted(CODEX_DIR.rglob("rollout-*.jsonl")) if CODEX_DIR.is_dir() else []
-    except OSError:
-        files = []
+    files, _cstate, _cskip = _codex_rollout_files()
     sig = _synth_sig_of(files)
     if not force and _codex_ev_sig == sig and CODEX_SYNTH.is_file():
         _codex_last_error = None
@@ -4187,12 +4253,14 @@ class Handler(BaseHTTPRequestHandler):
             wid = (query.get("wid") or [""])[0]
             if not wid:
                 wid = self.headers.get("X-Window-Id", "")
-            self._send(200, "text/plain", b"bye")
+            # F2-T09: pop before responding so any client that receives the
+            # 200 is guaranteed the window is already gone (no send/pop race).
             with LOCK:
                 if wid:
                     WINDOWS.pop(wid, None)
                 now = time.time()
                 others = any(now - last < 90 for w, last in WINDOWS.items())
+            self._send(200, "text/plain", b"bye")
             if not others:
                 self._arm_close()
         else:

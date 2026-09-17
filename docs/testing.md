@@ -63,7 +63,7 @@ runner headless on Ubuntu (the `browser` job in
 ```powershell
 python tools/benchmark_dashboard.py --scenario ci      # deterministic small (10k) + large (100k)
 python tools/benchmark_dashboard.py --scenario small --repeats 5
-python tools/benchmark_dashboard.py --scenario ci --baseline-file path\to\df23258_opencode_dashboard.py
+python tools/benchmark_dashboard.py --scenario ci --baseline-file path\to\1a345a1_opencode_dashboard.py
 ```
 
 The runner keeps two measurement paths apart: `/api/router` driven by a
@@ -71,7 +71,10 @@ synthetic router ledger and `/api/router` driven by the built-in Codex
 synthesizer (both runtime versions contain a synthesizer; the historical one
 has no checkpoint and no incremental read). Fixtures are deterministic (fixed
 seed 20260917); the baseline runtime comes from
-`git show df23258:opencode_dashboard.py` unless `--baseline-file` points at a
+`git show 1a345a1:opencode_dashboard.py` (the W1-required baseline, 202714
+bytes; it contains the same synthesizer, and its only differences from the
+earlier df23258 snapshot are typographic - df23258 remains valid as a
+historical comparison) unless `--baseline-file` points at a
 copy - the review package ships that unchanged baseline under
 `evidence/performance/baseline/` so the benchmark is reproducible without the
 private repository. Ordinary timing stages run at least five repetitions and

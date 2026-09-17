@@ -1337,9 +1337,11 @@ Evidence:
 
 ## 7. Performance measurements
 
-- Pending: `tools/benchmark_dashboard.py` still reports NOT_IMPLEMENTED/exit 2
-  and the spec section 22 measurements are not recorded yet. Bounded-read
-  guarantees are covered by the F6b/F6c/F6f tests instead.
+- Implemented in the W-round: `tools/benchmark_dashboard.py` records the
+  section 22 measurements (156 samples, two measurement paths, five repeats,
+  median/maximum, scoped byte classes, real-process restart; see
+  `docs/testing.md` and `artifacts/performance/`). The audit-round update of
+  this tool is covered in section 13 (A08).
 
 ## 8. Repo hygiene and screenshot
 
@@ -1368,3 +1370,92 @@ Evidence:
 
 - All test servers, threads and timers were in-process and cleaned up in
   tearDown; no user processes were touched.
+
+## 13. Independent audit of the 83df074 package - fixes A01-A08
+
+The delivered `LBD_REVIEW_83df074.zip` was rejected by an independent audit
+(findings A01-A08). This section records the fixes on top of 83df074. Every
+fix has a reproduction before the change, a minimal diff, the result after
+the change and the dependent regressions; the raw logs, diffs and test
+transcripts are shipped in `evidence/fix-evidence/A01..A08/` of the review
+package.
+
+- **A01 (P0, a transient read error zeroed the synth)**: `_parse_codex_events`
+  turned `OSError` into `[]`, so a failed read published and blessed an empty
+  generation and the next plain call kept it. Fix: read failures are
+  recorded per file (`_codex_read_failures`) and any build with a recorded
+  failure aborts publishing - the previous generation is kept byte-for-byte,
+  the failure is returned and stored in `_codex_last_error`; with no previous
+  generation a `RuntimeError` states unavailability. Repro: 120 -> stale 120
+  with an explicit error -> 150 on a plain retry (before: 120 -> 0 -> 0);
+  regressions: `tests/test_a01_synth_read_errors.py`.
+- **A02 (P0, the release gate accepted a report without any CI)**: the
+  verifier never read `ci_runs`. Fix: rule (9) - F8-T04 passes only when the
+  approved job set (tests on ubuntu/windows x Python 3.10/3.14 plus the
+  browser job on ubuntu) is recorded as completed/success with `head_sha`
+  equal to the report's `tested_commit`; an empty `ci_runs` or a missing
+  `tested_commit` fails the release gate. Repro: no-CI report -> release
+  FAILED with the explicit (9) problem (before: PASSED); the full-set control
+  still passes; regressions: `tests/test_a02_gate_ci.py`.
+- **A03 (P1, a missing app import was only a skip)**: 15 test modules
+  treated an unimportable runtime as `SkipTest`, so a broken import could
+  never fail a run. Fix: those guards raise `RuntimeError` (environmental
+  skips - git, node, Git Bash - stay). Repro on a clean checkout with a
+  broken runtime: before `OK (skipped=2)`, after `FAILED (errors=2)`. One
+  file, `tests/test_synth_publish.py`, is still held open read-only by an
+  external process on the author's machine (the OS denies writes); its guard
+  keeps the old skip and is recorded here as an explicit, known deviation.
+- **A04 (P1, not clean-checkout ready)**: the BAT test ran unconditionally on
+  Linux, and the integration suite required historical `artifacts/*.log`
+  files that are not tracked. Fix: the BAT test is Windows-only with a POSIX
+  `sh` counterpart (stand-in `python3` on PATH, space/`!`/Unicode
+  directory), F8-T02 validates the historical logs when present and
+  otherwise checks synthetic copies in a temp directory, and the platform
+  labels in `build_test_report.py` / `run_browser_tests.py` now describe the
+  real OS. Repro in a clean checkout: before FAIL (17 missing logs), after
+  OK.
+- **A05 (P1, the declared record cap did not bound allocations)**: full reads
+  materialized whole files, the tail reader grew its buffer before checking
+  the cap and the stream reader kept re-accumulating after the first oversize
+  hit. Fix: bounded scans (`_codex_scan_lines`, a backwards
+  `_router_read_tail`, a discard loop in `_router_stream_lines`), one-pass
+  aggregation in `query_router_stats`, and a single-write `_write_codex_index`
+  (also removes the pathological slow-write amplification). Repro (line
+  growing to 16 MiB, cap 1 KiB): before peaks 8.5 MB / 33.6 MB and a missing
+  oversize counter; after bounded peaks and correct counters; regressions:
+  `tests/test_a05_bounded_records.py` plus every router suite.
+- **A06 (P1, metadata and content could mix generations)**: line counting and
+  tail scanning opened the file twice. Fix: one handle feeds both
+  (`_router_count_lines(path, fh)`, `_router_read_tail(..., fh)`), so the
+  count and the scanned content always describe the same generation; on
+  Windows the open handle also blocks the name swap outright. Repro: a
+  deterministic swap between the stages - before `total_lines=1` with 2
+  scanned lines, after fully self-consistent; regressions:
+  `tests/test_a06_generation_binding.py`.
+- **A07 (P1, the per-model average divided by successes)**: `model_rows[8]`
+  divided by `ok` instead of measured events. Fix: a `measured` counter
+  (usage_known events) is the denominator. Repro: one unknown event with 120
+  tokens -> before 0, after 120; success 120 + unknown 30 -> before 150,
+  after 75; regressions: `tests/test_a07_model_average.py`.
+- **A08 (P1/P2, baseline and packaging)**: the main comparison baseline is
+  now `1a345a1` (the required snapshot; it contains the synthesizer and
+  differs from the earlier `df23258` only typographically - verified on the
+  full diff), with `df23258` kept as a historical measurement. The benchmark
+  records `traced` on every sample (only the first cold sample per runtime
+  uses tracemalloc), warm reads compare against the oracle, stats stages
+  record an explicit availability check, and the summary counts correctness
+  coverage (156 true / 0 false / 0 unchecked, with the stats caveat in the
+  notes). Packaging extracts raw git blob bytes (no EOL conversion - the
+  audit saw CRLF copies of LF blobs), the POSIX launcher ships LF with mode
+  100755 in the ZIP, and `screenshot.png` is a fresh capture from the
+  synthetic browser fixture (F8-B01) pinned by sha256 in
+  `test_pub_t05_screenshot_current`. Regenerated measurements: 156/156
+  correct; raw samples and the summary are in
+  `evidence/performance/`, the fix transcripts in
+  `evidence/fix-evidence/A08/`.
+
+Verification of the fixed snapshot: full local suite `Ran 181 tests ... OK`
+(one environmental skip), `py_compile` clean, the regenerated report and
+both gates rerun (core passes; release fails solely on F8-T04 CI_PENDING),
+and the review package rebuilt from the new commit. CI and Linux/macOS
+remain NOT_RUN / CI_PENDING; no push, merge, tag or release was performed.

@@ -37,7 +37,7 @@ def _load_dashboard():
     try:
         import opencode_dashboard as d
     except Exception as exc:  # pragma: no cover - environment guard
-        raise unittest.SkipTest("dashboard not importable: %s" % (exc,))
+        raise RuntimeError("dashboard not importable: %s" % (exc,))
     return d
 
 

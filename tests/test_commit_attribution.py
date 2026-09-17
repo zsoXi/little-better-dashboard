@@ -24,7 +24,7 @@ def _load_dashboard():
 
         return d
     except Exception as exc:  # pragma: no cover
-        raise unittest.SkipTest("dashboard import failed: %s" % exc)
+        raise RuntimeError("dashboard import failed: %s" % exc)
 
 
 GLOBAL_NOTE = "Global time window; may include other projects. Windows overlap. Rows must not be summed."

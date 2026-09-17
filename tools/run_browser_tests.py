@@ -1006,7 +1006,7 @@ def main(argv=None):
     artifacts.mkdir(parents=True, exist_ok=True)
     shots_dir = artifacts / SHOTS_DIRNAME
     shots_dir.mkdir(parents=True, exist_ok=True)
-    stamp = "windows"
+    stamp = "windows" if os.name == "nt" else "linux"
     log_path = artifacts / ("%s.%s.log" % (args.log_prefix, stamp))
     json_path = artifacts / ("%s.%s.json" % (args.log_prefix, stamp))
     log = _Log(log_path)

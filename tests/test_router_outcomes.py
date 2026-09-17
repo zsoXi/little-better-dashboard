@@ -35,7 +35,7 @@ def _load_dashboard():
         import opencode_dashboard as d
         return d
     except Exception as e:
-        raise unittest.SkipTest(f"opencode_dashboard import failed: {e}")
+        raise RuntimeError(f"opencode_dashboard import failed: {e}")
 
 
 F4_TODAY = _dt.date.today().isoformat()

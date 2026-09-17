@@ -5,6 +5,7 @@ launcher bits, secrets/user-data hygiene, screenshot, runtime isolation and
 remote-operation hygiene. They never touch the network, never launch a
 browser window and never modify tracked files.
 """
+import hashlib
 import os
 import re
 import shutil
@@ -61,6 +62,8 @@ class TestPublicationChecks(unittest.TestCase):
         self.assertTrue(content.startswith("#!/bin/sh"))
         self.assertIn('cd "$(dirname "$0")"', content)
 
+    @unittest.skipUnless(os.name == "nt",
+                         "start-dashboard.bat is a Windows scenario")
     def test_pub_t03_bat_special_paths_and_arg_forwarding(self):
         bat = _read(REPO_ROOT / "start-dashboard.bat")
         self.assertIn('cd /d "%~dp0"', bat)
@@ -81,6 +84,42 @@ class TestPublicationChecks(unittest.TestCase):
         out = (cp.stdout or "") + (cp.stderr or "")
         self.assertEqual(cp.returncode, 0, out[-800:])
         self.assertIn("usage:", out.lower())
+
+    @unittest.skipIf(os.name == "nt",
+                     "POSIX counterpart of the BAT launcher scenario")
+    def test_pub_t03b_shell_launcher_special_paths_and_arg_forwarding(self):
+        sh = _read(REPO_ROOT / "start-dashboard.sh")
+        self.assertTrue(sh.startswith("#!/bin/sh"))
+        self.assertIn('cd "$(dirname "$0")"', sh)
+        self.assertIn("exec python3 opencode_dashboard.py", sh)
+        sdir = Path(tempfile.mkdtemp(prefix="pub-t03b-")) / "dir with space !(x) ünïcode"
+        self.addCleanup(shutil.rmtree, str(sdir.parent), True)
+        sdir.mkdir(parents=True)
+        shutil.copyfile(REPO_ROOT / "start-dashboard.sh",
+                        sdir / "start-dashboard.sh")
+        shutil.copyfile(REPO_ROOT / "opencode_dashboard.py",
+                        sdir / "opencode_dashboard.py")
+        # A stand-in python3 on PATH proves argument forwarding and the
+        # working directory without starting a real server.
+        bindir = sdir / "fakebin"
+        bindir.mkdir()
+        fake = bindir / "python3"
+        fake.write_text('#!/bin/sh\nprintf "usage: fake %s\\n" "$*"\n')
+        fake.chmod(0o755)
+        env = dict(os.environ)
+        env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+        env["HOME"] = str(sdir / "home")
+        env["USERPROFILE"] = env["HOME"]
+        env["LOCALAPPDATA"] = env["HOME"]
+        os.makedirs(env["HOME"], exist_ok=True)
+        cp = subprocess.run(
+            ["/bin/sh", str(sdir / "start-dashboard.sh"), "--open", "x y"],
+            cwd=str(sdir), capture_output=True, text=True, timeout=60, env=env)
+        out = (cp.stdout or "") + (cp.stderr or "")
+        self.assertEqual(cp.returncode, 0, out[-800:])
+        self.assertIn("usage:", out.lower())
+        self.assertIn("--open", out)
+        self.assertIn("x y", out)
 
     def test_pub_t04_no_secrets_or_user_data(self):
         r = _git("status", "--porcelain")
@@ -114,6 +153,15 @@ class TestPublicationChecks(unittest.TestCase):
         self.assertTrue(shot.is_file(), "screenshot.png must exist")
         self.assertGreater(shot.stat().st_size, 10_000,
                            "screenshot.png looks empty/stale")
+        digest = hashlib.sha256(shot.read_bytes()).hexdigest()
+        self.assertEqual(
+            digest,
+            "784c28ea329d0295c91c4243b474588ac81736027dc415a303e15078e17e8666",
+            "screenshot.png must be the committed capture of the synthetic "
+            "fixture (regenerate: tools/run_browser_tests.py F8-B01 writes "
+            "artifacts/F6d-browser-shots/F8-B01-01-tabs-120-reasoning.png "
+            "from the synthetic fixture; copy it over screenshot.png and "
+            "update this pin)")
         readme = _read(REPO_ROOT / "README.md")
         self.assertIn("screenshot.png", readme)
 
@@ -150,14 +198,6 @@ class TestPublicationChecks(unittest.TestCase):
         home.mkdir()
         userbase = tmp / "userbase"
         userbase.mkdir()
-        (userbase / "usercustomize.py").write_text(
-            "try:\n"
-            "    import webbrowser\n"
-            "    webbrowser.open = lambda *a, **k: True\n"
-            "    webbrowser.open_new = lambda *a, **k: True\n"
-            "    webbrowser.open_new_tab = lambda *a, **k: True\n"
-            "except Exception:\n"
-            "    pass\n", encoding="utf-8")
         env = dict(os.environ)
         env["HOME"] = str(home)
         env["USERPROFILE"] = str(home)
@@ -172,6 +212,26 @@ class TestPublicationChecks(unittest.TestCase):
         if pre.returncode != 0:
             self.skipTest("Git Bash has no python3: %r"
                           % ((pre.stderr or pre.stdout) or "")[:200])
+        # The browser suppression must sit in the child interpreter's per
+        # version user site directory (userbase/PythonXY/site-packages);
+        # placed directly under PYTHONUSERBASE it is never imported and the
+        # launcher (start-dashboard.sh --open) would pop a real browser tab.
+        mver = re.search(r"Python\s+(\d)\.(\d+)",
+                         (pre.stdout or "") + (pre.stderr or ""))
+        if not mver:
+            self.skipTest("cannot parse the Git Bash python3 version")
+        site_dir = (userbase
+                    / ("Python%s%s" % (mver.group(1), mver.group(2)))
+                    / "site-packages")
+        site_dir.mkdir(parents=True, exist_ok=True)
+        (site_dir / "usercustomize.py").write_text(
+            "try:\n"
+            "    import webbrowser\n"
+            "    webbrowser.open = lambda *a, **k: True\n"
+            "    webbrowser.open_new = lambda *a, **k: True\n"
+            "    webbrowser.open_new_tab = lambda *a, **k: True\n"
+            "except Exception:\n"
+            "    pass\n", encoding="utf-8")
         command = "cd \"%s\" && ./start-dashboard.sh --quiet --port 0" % unix_dir
         proc = subprocess.Popen(
             [str(bash), "-lc", command], stdout=subprocess.PIPE,

@@ -12,6 +12,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -54,6 +55,7 @@ def main(argv=None):
     rows = parse_matrix(Path(args.matrix))
     runtime = REPO_ROOT / "opencode_dashboard.py"
     h = hashlib.sha256(runtime.read_bytes()).hexdigest()
+    os_label = "windows" if os.name == "nt" else "linux"
     results = []
     cases = []
     counts = {"passed": 0, "failed": 0, "blocked": 0, "not_run": 0,
@@ -61,12 +63,12 @@ def main(argv=None):
     for r in rows:
         if r["result"] == "PASS":
             res = {"acceptance_id": r["id"], "result": "PASS",
-                   "environment": "windows", "evidence": r["evidence"],
+                   "environment": os_label, "evidence": r["evidence"],
                    "command": r["case"]}
             counts["passed"] += 1
         elif r["result"] == "CI_PENDING":
             res = {"acceptance_id": r["id"], "result": "CI_PENDING",
-                   "environment": "windows", "evidence": r["evidence"],
+                   "environment": os_label, "evidence": r["evidence"],
                    "command": r["case"]}
             counts["blocked"] += 1
         else:
@@ -83,7 +85,7 @@ def main(argv=None):
     extra_evidence = "artifacts/PUB-T02-gitbash.windows.log"
     if (REPO_ROOT / extra_evidence).is_file():
         results.append({"acceptance_id": "PUB-T02", "result": "PASS",
-                        "environment": "windows",
+                        "environment": os_label,
                         "evidence": extra_evidence,
                         "command": "git bash: ./start-dashboard.sh"})
         cases.append({"id": "PUB-T02", "status": "PASS",
@@ -102,9 +104,12 @@ def main(argv=None):
         "code_hash": "sha256:" + h,
         "changed_file_sha256": {"opencode_dashboard.py": h},
         "test_environment": {
-            "os": "windows",
+            "os": os_label,
             "python": sys.version.split()[0],
-            "browser": "msedge headless (playwright 1.62.0)",
+            "browser": ("msedge headless (playwright 1.62.0)"
+                        if os_label == "windows"
+                        else "chromium headless (playwright; see "
+                             "requirements-dev.txt)"),
             "timezone": (datetime.datetime.now().astimezone().tzname()
                          or "local"),
         },
@@ -117,7 +122,9 @@ def main(argv=None):
         "ci_runs": [],
         "known_limitations": [
             "real CI runs are pending (workflow added, not executed)",
-            "Linux and macOS were not verified on this machine",
+            ("Linux and macOS were not verified on this machine"
+             if os_label == "windows"
+             else "Windows and macOS were not verified on this machine"),
         ],
         "blocked_items": ["F8-T04 real CI jobs"],
         "processes_started": ["in-process test servers on 127.0.0.1:0 only"],

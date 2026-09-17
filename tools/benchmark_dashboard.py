@@ -21,7 +21,7 @@ for BOTH versions in the same cold scenarios.
 
 Usage:
     py -3.14 tools/benchmark_dashboard.py --scenario ci
-    py -3.14 tools/benchmark_dashboard.py --scenario small --baseline-file path/to/df23258_opencode_dashboard.py
+    py -3.14 tools/benchmark_dashboard.py --scenario small --baseline-file path/to/1a345a1_opencode_dashboard.py
 """
 import argparse
 import builtins
@@ -48,7 +48,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = REPO_ROOT / "artifacts"
 PERF_DIR = ARTIFACTS / "performance"
-BASELINE_REF_DEFAULT = "df23258"
+# W1: main comparison baseline is the full 1a345a1 revision (it contains the
+# Codex synthesizer: CODEX_SYNTH / _parse_codex_events / ensure_codex_synth).
+# df23258 remains the historical comparison: its runtime differs only in
+# typographic em-dash strings (202830 vs 202714 bytes, no logic change).
+BASELINE_REF_DEFAULT = "1a345a10c2d8e8f16121e10e2206e57e76684ed0"
 SEED = 20260917
 
 SCENARIOS = {
@@ -671,6 +675,7 @@ class RuntimeRun:
                     "correct": total is not None and abs(total - led) < 1e-6,
                     "k_used": k_used, "lines_total": led_lines,
                     "scope": "window" if k_used < led_lines else "full",
+                    "traced": bool(memory),
                     "http_status": st})
         if peak is not None:
             rec["tracemalloc_peak_bytes"] = peak
@@ -682,9 +687,14 @@ class RuntimeRun:
         st, payload = request(self.port, self.token, "/api/router")
         dt = time.perf_counter() - t0
         rec = INSTR.snapshot()
+        total = payload["totals"]["tokens_total"] if payload else None
+        k = payload.get("candidate_lines") if payload else None
+        led, led_lines, k_used = oracle_ledger_window(
+            self.run_root / "usage-events.jsonl", k)
         rec.update({"stage": "ledger_warm", "seconds": dt,
-                    "payload_total": payload["totals"]["tokens_total"]
-                    if payload else None,
+                    "payload_total": total, "oracle_total": led,
+                    "correct": total is not None and abs(total - led) < 1e-6,
+                    "k_used": k_used, "traced": False,
                     "http_status": st})
         return rec
 
@@ -705,7 +715,7 @@ class RuntimeRun:
         rec2.update({"stage": "ledger_append", "seconds": dt,
                      "payload_total": total, "oracle_total": led,
                      "correct": total is not None and abs(total - led) < 1e-6,
-                     "k_used": k_used, "http_status": st})
+                     "k_used": k_used, "traced": False, "http_status": st})
         return rec2
 
     def obs_ledger_rotate(self):
@@ -723,7 +733,7 @@ class RuntimeRun:
         rec.update({"stage": "ledger_rotate", "seconds": dt,
                     "payload_total": total, "oracle_total": led,
                     "correct": total is not None and abs(total - led) < 1e-6,
-                    "http_status": st})
+                    "traced": False, "http_status": st})
         return rec
 
     def obs_stats_cold(self):
@@ -732,25 +742,41 @@ class RuntimeRun:
         st, payload = request(self.port, self.token, "/api/stats")
         dt = time.perf_counter() - t0
         rec = INSTR.snapshot()
-        rec.update({"stage": "stats_cold", "seconds": dt, "http_status": st})
+        rec.update({"stage": "stats_cold", "seconds": dt,
+                    "correct": st == 200 and isinstance(payload, dict),
+                    "check": "availability (HTTP 200 + payload present); "
+                             "no independent oracle for this stage",
+                    "traced": False,
+                    "http_status": st})
         return rec
 
     def obs_stats_burst(self, n=5):
         INSTR.reset()
+        oks = []
         for _ in range(n):
-            request(self.port, self.token, "/api/stats")
+            st, payload = request(self.port, self.token, "/api/stats")
+            oks.append(st == 200 and isinstance(payload, dict))
         rec = INSTR.snapshot()
-        rec.update({"stage": "stats_%d_refreshes" % n, "seconds": 0.0})
+        rec.update({"stage": "stats_%d_refreshes" % n, "seconds": 0.0,
+                    "correct": all(oks),
+                    "check": "availability across %d refreshes; "
+                             "no independent oracle for this stage" % n,
+                    "traced": False})
         return rec
 
     def obs_stats_after_ttl(self, wait=11.0):
         time.sleep(wait)
         INSTR.reset()
         t0 = time.perf_counter()
-        request(self.port, self.token, "/api/stats")
+        st, payload = request(self.port, self.token, "/api/stats")
         dt = time.perf_counter() - t0
         rec = INSTR.snapshot()
-        rec.update({"stage": "stats_after_ttl", "seconds": dt})
+        rec.update({"stage": "stats_after_ttl", "seconds": dt,
+                    "correct": st == 200 and isinstance(payload, dict),
+                    "check": "availability after the cache TTL; "
+                             "no independent oracle for this stage",
+                    "traced": False,
+                    "http_status": st})
         return rec
 
     def obs_synth_cold(self, memory=False):
@@ -777,6 +803,7 @@ class RuntimeRun:
                                       if isinstance(payload, dict) else None),
                     "is_synth": (payload.get("is_synth")
                                  if isinstance(payload, dict) else None),
+                    "traced": bool(memory),
                     "synth_present": (self.run_root / "synth.jsonl").is_file(),
                     "checkpoint_present":
                         (self.run_root / "cache" / "codex_index.json").is_file()})
@@ -795,6 +822,7 @@ class RuntimeRun:
         rec.update({"stage": "synth_warm", "seconds": dt,
                     "payload_total": total, "oracle_total": oracle,
                     "correct": total is not None and abs(total - oracle) < 1e-6,
+                    "traced": False,
                     "http_status": st,
                     "payload_error": (payload.get("error")
                                       if isinstance(payload, dict) else None)})
@@ -818,6 +846,7 @@ class RuntimeRun:
                     "http_status": st,
                     "payload_error": (payload.get("error")
                                       if isinstance(payload, dict) else None),
+                    "traced": False,
                     "synth_present": (self.run_root / "synth.jsonl").is_file(),
                     "checkpoint_present":
                         (self.run_root / "cache" / "codex_index.json").is_file()})
@@ -842,6 +871,7 @@ class RuntimeRun:
                     "seconds": None,
                     "detail": "unparsable child output: %s" % out[-300:]}
         rec["stage"] = "synth_restart"
+        rec.setdefault("traced", False)
         if not rec.get("correct"):
             rec["detail"] = ("child: http=%s payload=%s oracle=%s synth=%s "
                              "checkpoint=%s" % (
@@ -1045,8 +1075,22 @@ def main(argv=None):
                         continue
                     fh.write(json.dumps(s) + "\n")
     env["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    correct_true = sum(1 for s in samples if s.get("correct") is True)
+    correct_false = sum(1 for s in samples if s.get("correct") is False)
+    correct_none = sum(1 for s in samples if "correct" not in s)
+    notes = list(notes) + [
+        "correct coverage: %d true, %d false, %d without a correctness "
+        "check (stats stages check availability only; they have no "
+        "independent oracle)" % (correct_true, correct_false, correct_none),
+        "only the first cold sample of each runtime is measured with "
+        "tracemalloc (traced=true); every other sample carries traced=false "
+        "and no peak, so peak comparisons are per-runtime, not per-time",
+    ]
     (PERF_DIR / "PERF-summary.windows.json").write_text(
-        json.dumps({"environment": env, "summary": summary, "notes": notes},
+        json.dumps({"environment": env, "summary": summary, "notes": notes,
+                    "correct_counts": {"true": correct_true,
+                                       "false": correct_false,
+                                       "none": correct_none}},
                    indent=1), encoding="utf-8")
     _write_perf_logs(summary, env, notes, ARTIFACTS)
     bad = [s for s in samples if s.get("correct") is False]

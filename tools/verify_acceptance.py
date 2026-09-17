@@ -28,6 +28,10 @@ Expected TEST_REPORT.json schema (JSON object):
     Pointing at .github/workflows/tests.yml alone is insufficient (see 6).
   - code_hash: top-level (preferred) or per-result; must equal the
     current sha256 of opencode_dashboard.py.
+  - ci_runs: optional list of recorded CI executions, each an object with
+    name/status/conclusion/head_sha. F8-T04 (release gate) passes only when
+    the approved job set has completed successfully for the tested commit;
+    a lone PASS row or empty ci_runs never satisfies it.
 
 Gate semantics (skeleton):
   - core gate mandatory = matrix rows whose mandatory column contains
@@ -218,6 +222,7 @@ def main(argv=None):
             by_id.setdefault(aid, []).append(entry)
 
     top_hash = normalize_hash(report.get("code_hash", ""))
+    tested_commit = str(report.get("tested_commit", "")).strip()
 
     # (4) Current code hash (computed once).
     try:
@@ -385,6 +390,56 @@ def main(argv=None):
         print("(8) OK: report environments match the matrix requirements.")
     else:
         print("(8) FAIL: environment mismatch between matrix and report.")
+
+    # (9) F8-T04: release acceptance is derived from the approved CI job set
+    # bound to the tested snapshot. A PASS row in the report (or a workflow
+    # file) is never enough on its own.
+    REQUIRED_CI = [
+        ("python 3.10 on ubuntu-latest", ("ubuntu-latest", "3.10")),
+        ("python 3.14 on ubuntu-latest", ("ubuntu-latest", "3.14")),
+        ("python 3.10 on windows-latest", ("windows-latest", "3.10")),
+        ("python 3.14 on windows-latest", ("windows-latest", "3.14")),
+        ("browser tests on ubuntu-latest", ("browser", "ubuntu-latest")),
+    ]
+    ci9_ok = True
+    if "F8-T04" in mandatory_ids:
+        runs = report.get("ci_runs")
+        if not isinstance(runs, list) or not runs:
+            failures.append(
+                "(9) F8-T04: no ci_runs recorded; CI presence (a workflow file or a "
+                "plain PASS row) is not CI execution."
+            )
+            ci9_ok = False
+        elif not tested_commit:
+            failures.append(
+                "(9) F8-T04: report has no tested_commit; CI results cannot be "
+                "bound to the tested snapshot."
+            )
+            ci9_ok = False
+        else:
+            for label, tokens in REQUIRED_CI:
+                satisfied = False
+                for run in runs:
+                    if not isinstance(run, dict):
+                        continue
+                    name = str(run.get("name", "")).lower()
+                    if not all(token.lower() in name for token in tokens):
+                        continue
+                    if (str(run.get("status", "")).lower() == "completed"
+                            and str(run.get("conclusion", "")).lower() == "success"
+                            and str(run.get("head_sha", "")).strip() == tested_commit):
+                        satisfied = True
+                        break
+                if not satisfied:
+                    failures.append(
+                        f"(9) F8-T04: required CI job '{label}' is missing or not a "
+                        "completed successful run of the tested commit."
+                    )
+                    ci9_ok = False
+        if ci9_ok:
+            print("(9) OK: approved CI job set completed successfully for the tested commit.")
+    else:
+        print("(9) OK: F8-T04 not mandatory for this gate.")
 
     if failures:
         print(f"\nGATE {args.gate.upper()} FAILED ({len(failures)} problem(s)):")

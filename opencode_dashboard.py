@@ -836,6 +836,11 @@ _codex_file_state = {}
 _codex_ev_state = {}
 _codex_index_note = None
 _CODEX_ANCHOR_LEN = 64
+# A05: bounded record scans. Lines above the cap are skipped whole while
+# reading (their remainder is discarded in block-sized pieces) and counted;
+# the scan buffer never exceeds cap + one read block.
+_CODEX_READ_BLOCK = 65536
+_codex_oversize_records = 0
 
 # F5b: one shared rollout enumeration for diagnostics, the session list and
 # the synth reader - same root, same name pattern, same states.
@@ -987,23 +992,67 @@ def _codex_files_sig(files, schema=None):
     return (schema, CODEX_PARSER_VERSION, tuple(sorted(parts)))
 
 
-def _codex_split(data):
+def _codex_scan_lines(fh, cap, initial_tail=b""):
+    """Scan physical source lines with bounded memory (A05).
+
+    Only newline-terminated lines are kept. A complete line above ``cap``
+    bytes is skipped whole - its remainder is discarded while scanning for
+    the newline - and counted in ``_codex_oversize_records``. An
+    unterminated trailing fragment is ignored (the previous ``_codex_split``
+    semantics). Returns ``(lines, used, tail)``: ``used`` is the absolute
+    offset just past the last newline, ``tail`` the last bytes ending there.
+    """
+    global _codex_oversize_records
+    block = _CODEX_READ_BLOCK
     lines = []
-    start = 0
+    tail = initial_tail
+    buf = b""
+    base = fh.tell()
+    used = base
+    overlong = False
     while True:
-        nl = data.find(b"\n", start)
-        if nl < 0:
+        chunk = fh.read(block)
+        if not chunk:
             break
-        lines.append(data[start:nl].decode("utf-8", "replace"))
-        start = nl + 1
-    return lines, start
+        buf += chunk
+        base = fh.tell() - len(buf)
+        pos = 0
+        while True:
+            nl = buf.find(b"\n", pos)
+            if nl < 0:
+                if overlong:
+                    buf = b""
+                    base = fh.tell()
+                else:
+                    buf = buf[pos:]
+                    base = base + pos
+                    if len(buf) > cap:
+                        _codex_oversize_records += 1
+                        overlong = True
+                        buf = b""
+                        base = fh.tell()
+                break
+            if overlong:
+                overlong = False
+                tail = (buf[max(pos, nl - (_CODEX_ANCHOR_LEN - 1)):nl]
+                        + b"\n")[-_CODEX_ANCHOR_LEN:]
+            else:
+                line = buf[pos:nl]
+                if len(line) > cap:
+                    _codex_oversize_records += 1
+                    tail = (line[-(_CODEX_ANCHOR_LEN - 1):]
+                            + b"\n")[-_CODEX_ANCHOR_LEN:]
+                else:
+                    lines.append(line.decode("utf-8", "replace"))
+                    tail = (tail + line + b"\n")[-_CODEX_ANCHOR_LEN:]
+            used = base + nl + 1
+            pos = nl + 1
+    return lines, used, tail
 
 
 def _codex_full_read(p, fp):
     with open(p, "rb") as fh:
-        data = fh.read()
-    lines, used = _codex_split(data)
-    tail = data[max(0, used - _CODEX_ANCHOR_LEN):used]
+        lines, used, tail = _codex_scan_lines(fh, MAX_ROUTER_RECORD_BYTES)
     return lines, used, fp, True, tail
 
 
@@ -1039,10 +1088,11 @@ def _codex_read_since(p, state):
         return [], old_off, fp, False, old_tail
     with open(p, "rb") as fh:
         fh.seek(old_off)
-        data = fh.read()
-    lines, used = _codex_split(data)
-    tail = (old_tail + data[:used])[-_CODEX_ANCHOR_LEN:] if used else old_tail
-    return lines, old_off + used, fp, False, tail
+        lines, used_abs, tail = _codex_scan_lines(
+            fh, MAX_ROUTER_RECORD_BYTES, old_tail)
+    if used_abs <= old_off:
+        return [], old_off, fp, False, old_tail
+    return lines, used_abs, fp, False, tail
 
 
 def _codex_update_row(p, st, state):
@@ -1109,7 +1159,11 @@ def _write_codex_index(rows):
         tmp = CODEX_INDEX.with_name(CODEX_INDEX.name + ".tmp.%d.%d" % (
             os.getpid(), threading.get_ident()))
         with open(tmp, "w", encoding="utf-8", newline="") as f:
-            json.dump(doc, f)
+            # Single serialization call: json.dump streams hundreds of small
+            # write() calls for a large index; one write keeps the checkpoint
+            # cheap even on slow/filtered filesystems (and for tests whose
+            # writer proxies count writes).
+            f.write(json.dumps(doc))
             f.flush()
         os.replace(str(tmp), str(CODEX_INDEX))
         _codex_index_note = None
@@ -1236,6 +1290,9 @@ _codex_ev_cache = {}
 _codex_ev_sig = None
 _codex_last_error = None  # F5a: last synth publish failure text
 _codex_last_ok = None  # F5a: path of the last successful publish
+# A01: per-file read failures recorded by _parse_codex_events. A build with
+# any recorded failure must not publish a new generation (no fake emptiness).
+_codex_read_failures = {}
 # F6a: publish-stage lock only; thread scope within this process. It is not
 # held while parsing rollouts or writing the candidate tmp file.
 _SYNTH_LOCK = threading.Lock()
@@ -1258,15 +1315,19 @@ def _parse_codex_events(p):
     state = _codex_ev_state.get(key)
     try:
         st = p.stat()
-    except OSError:
+    except OSError as e:
+        _codex_read_failures[key] = "%s: %s" % (type(e).__name__, e)
         return []
     fp = (st.st_size, st.st_mtime_ns, getattr(st, "st_ino", 0))
     if state is not None and state.get("fp") == fp:
+        _codex_read_failures.pop(key, None)
         return list(state["events"])
     try:
         lines, off, fp, rebuild, tail = _codex_read_since(p, state)
-    except OSError:
+    except OSError as e:
+        _codex_read_failures[key] = "%s: %s" % (type(e).__name__, e)
         return []
+    _codex_read_failures.pop(key, None)
     if state is not None and not rebuild:
         model = state.get("model", "")
         provider = state.get("provider", "?")
@@ -1374,13 +1435,27 @@ def ensure_codex_synth(force=False):
                     timeout=min(5.0, max(0.05, deadline - time.time())))
     try:
         rows = {}
+        failures = {}
         for p in files:
+            key = str(p)
             try:
                 st = p.stat()
-            except OSError:
+            except OSError as e:
+                _codex_read_failures[key] = "%s: %s" % (type(e).__name__, e)
+                failures[key] = _codex_read_failures[key]
                 continue
-            key = str(p)
             rows[key] = (st.st_size, int(st.st_mtime), _parse_codex_events(p))
+            if key in _codex_read_failures:
+                failures[key] = _codex_read_failures[key]
+        if failures:
+            # A01: an unread source must not masquerade as an empty source.
+            msg = "codex read failed for %d file(s): %s" % (
+                len(failures),
+                "; ".join(failures[k] for k in sorted(failures)[:3]))
+            _codex_last_error = msg
+            if CODEX_SYNTH.is_file():
+                return str(CODEX_SYNTH), msg
+            raise RuntimeError(msg)
         tmp = CODEX_SYNTH.with_name(CODEX_SYNTH.name + ".tmp.%d.%d.%d" % (
             os.getpid(), threading.get_ident(), _synth_next_seq()))
         _synth_tmp_active.add(tmp.name)
@@ -2051,7 +2126,7 @@ class _OverlongLine(object):
 _OVERLONG = _OverlongLine()
 
 
-def _router_count_lines(path):
+def _router_count_lines(path, fh=None):
     """Exact physical line count for the usage file, cached and incremental.
 
     Returns (lines, cached). Cold reads stream the file in bounded chunks
@@ -2062,7 +2137,8 @@ def _router_count_lines(path):
     p = Path(path)
     key = str(p)
     try:
-        st = p.stat()
+        # A06: identity always comes from the bound handle when one is given.
+        st = os.fstat(fh.fileno()) if fh is not None else p.stat()
     except OSError:
         raise RuntimeError(f"Router usage file not found: {path}")
     size, mtime = st.st_size, st.st_mtime_ns
@@ -2073,8 +2149,11 @@ def _router_count_lines(path):
     cached = False
     newlines = 0
     last = b""
+    f = fh
     try:
-        with open(str(p), "rb") as f:
+        if f is None:
+            f = open(str(p), "rb")
+        try:
             if ent and getattr(st, "st_ino", 0) == ent.get("ino") and size > ent["size"]:
                 added = size - ent["size"]
                 f.seek(ent["size"])
@@ -2094,6 +2173,9 @@ def _router_count_lines(path):
                         break
                     newlines += chunk.count(b"\n")
                     last = chunk[-1:]
+        finally:
+            if fh is None and f is not None:
+                f.close()
     except OSError:
         raise RuntimeError(f"Router usage file not found: {path}")
     lines = newlines + (1 if size > 0 and last != b"\n" else 0)
@@ -2104,56 +2186,107 @@ def _router_count_lines(path):
     return lines, cached
 
 
-def _router_read_tail(path, limit, cap):
+def _router_read_tail(path, limit, cap, fh=None):
     """Last ``limit`` physical source lines of the usage file, as text.
 
-    Reads backwards in bounded byte blocks (never ``readlines``), assembles
-    complete lines before decoding (CRLF and multibyte safe across chunk
-    boundaries), and marks an unterminated final line so callers can treat
-    it as pending. Lines above ``cap`` bytes yield the _OVERLONG marker
-    instead of their content. meta records partial_head (the byte window
-    started mid-line, so the leading fragment is not a candidate) and
-    ends_with_newline.
+    Reads backwards in bounded byte blocks (never ``readlines``): only the
+    requested window is ever held - at most ``limit`` complete lines of at
+    most ``cap`` bytes each - and the read cost is the tail region, not the
+    file. A line above ``cap`` bytes yields the _OVERLONG marker; while
+    backtracking such a line its head is discarded in block-sized pieces
+    without accumulating. The final line without a newline is marked via
+    _Unterminated (unless oversize). meta records partial_head (always
+    False: the window starts on a line boundary) and ends_with_newline.
     """
     p = Path(path)
     meta = {"partial_head": False, "ends_with_newline": True}
     try:
-        size = p.stat().st_size
+        # A06: the bound handle defines the generation being read.
+        size = (os.fstat(fh.fileno()) if fh is not None else p.stat()).st_size
     except OSError:
         raise RuntimeError(f"Router usage file not found: {path}")
     if not size:
         return [], meta
     block = _ROUTER_READ_BLOCK
-    buf = b""
-    pos = size
+    kept = []           # newest first while scanning, reversed before return
+    cur = b""           # bytes of the item currently being assembled
+    overlong = False    # discarding the head of an oversize line
+    first = True        # the file's own last line is still to be completed
+    skip_phantom = False  # set once the trailing newline is known
+
+    def _complete(line):
+        if len(line) > cap:
+            kept.append(_OVERLONG)
+        else:
+            kept.append(line.decode("utf-8", "replace"))
+
+    f = fh
     try:
-        with open(str(p), "rb") as f:
-            while pos > 0 and buf.count(b"\n") <= limit:
+        if f is None:
+            f = open(str(p), "rb")
+        try:
+            f.seek(size - 1)
+            ends = f.read(1) == b"\n"
+            meta["ends_with_newline"] = ends
+            skip_phantom = ends
+            pos = size
+            while pos > 0 and len(kept) < limit:
                 step = block if pos >= block else pos
                 pos -= step
                 f.seek(pos)
-                buf = f.read(step) + buf
-            f.seek(size - 1)
-            meta["ends_with_newline"] = f.read(1) == b"\n"
-            if pos > 0:
-                f.seek(pos - 1)
-                meta["partial_head"] = f.read(1) != b"\n"
+                chunk = f.read(step)
+                end = len(chunk)
+                while end > 0 and len(kept) < limit:
+                    nl = chunk.rfind(b"\n", 0, end)
+                    if nl < 0:
+                        if not overlong:
+                            cur = chunk[:end] + cur
+                            if len(cur) > cap:
+                                overlong = True
+                                cur = b""
+                        break
+                    seg = chunk[nl + 1:end]
+                    if overlong:
+                        overlong = False
+                        if not (skip_phantom and not seg and not cur):
+                            kept.append(_OVERLONG)
+                    elif skip_phantom and not seg and not cur:
+                        pass  # empty span after the trailing newline
+                    else:
+                        if first:
+                            first = False
+                            if not ends:
+                                if len(seg + cur) > cap:
+                                    kept.append(_OVERLONG)
+                                else:
+                                    kept.append(_Unterminated(
+                                        (seg + cur).decode("utf-8", "replace")))
+                            else:
+                                _complete(seg + cur)
+                        else:
+                            _complete(seg + cur)
+                    skip_phantom = False
+                    cur = b""
+                    end = nl
+            if pos == 0 and len(kept) < limit:
+                if overlong:
+                    kept.append(_OVERLONG)
+                elif cur:
+                    if first and not ends:
+                        if len(cur) > cap:
+                            kept.append(_OVERLONG)
+                        else:
+                            kept.append(_Unterminated(
+                                cur.decode("utf-8", "replace")))
+                    else:
+                        _complete(cur)
+        finally:
+            if fh is None and f is not None:
+                f.close()
     except OSError:
         raise RuntimeError(f"Router usage file not found: {path}")
-    parts = buf.split(b"\n")
-    if buf.endswith(b"\n"):
-        parts = parts[:-1]
-    parts = parts[-limit:]
-    out = []
-    for i, raw in enumerate(parts):
-        if len(raw) > cap:
-            out.append(_OVERLONG)
-            continue
-        text = raw.decode("utf-8", errors="replace")
-        if i == len(parts) - 1 and not meta["ends_with_newline"]:
-            text = _Unterminated(text)
-        out.append(text)
-    return out, meta
+    kept.reverse()
+    return kept, meta
 
 
 def _router_stream_lines(path, cap):
@@ -2185,16 +2318,20 @@ def _router_stream_lines(path, cap):
                 while True:
                     nl = buf.find(b"\n")
                     if nl < 0:
-                        if len(buf) > cap and not overlong:
+                        if overlong:
+                            buf = b""
+                            break
+                        if len(buf) > cap:
                             overlong = True
                             yield _OVERLONG
                             buf = b""
                         break
-                    line = buf[:nl]
-                    buf = buf[nl + 1:]
                     if overlong:
                         overlong = False
+                        buf = buf[nl + 1:]
                         continue
+                    line = buf[:nl]
+                    buf = buf[nl + 1:]
                     if len(line) > cap:
                         yield _OVERLONG
                     else:
@@ -2264,16 +2401,30 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS, synth_context=False):
         "lines_total": 0,
         "count_cached": False,
     }
-    lines_total, count_cached = _router_count_lines(p)
-    problems["lines_total"] = lines_total
-    problems["count_cached"] = count_cached
     events = []
     if limit:
-        lines, meta = _router_read_tail(p, limit, MAX_ROUTER_RECORD_BYTES)
+        try:
+            fh = open(str(p), "rb")
+        except OSError:
+            raise RuntimeError(f"Router usage file not found: {path}")
+        try:
+            # A06: count and tail read share one handle, so line metadata and
+            # scanned content always describe the same file generation even
+            # when the name is atomically replaced mid-call.
+            lines_total, count_cached = _router_count_lines(p, fh)
+            problems["lines_total"] = lines_total
+            problems["count_cached"] = count_cached
+            lines, meta = _router_read_tail(
+                p, limit, MAX_ROUTER_RECORD_BYTES, fh)
+        finally:
+            fh.close()
         problems["partial_head"] = meta["partial_head"]
         problems["window_mode"] = (
             "full" if len(lines) >= lines_total else "physical_tail")
     else:
+        lines_total, count_cached = _router_count_lines(p)
+        problems["lines_total"] = lines_total
+        problems["count_cached"] = count_cached
         lines, meta = _router_stream_lines(p, MAX_ROUTER_RECORD_BYTES)
     for line in lines:
         if line is _OVERLONG:
@@ -2418,36 +2569,64 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     # never estimated, and reported separately as `unmetered`.
     # F4: three outcomes. usage_known (a real token read) is independent
     # of outcome, so unknown/error events with tokens still count.
-    events = list(scanned_events)
-    ok_events = [e for e in events if e["outcome"] == "success"]
-    err_events = [e for e in events if e["outcome"] == "error"]
-    measured = [e for e in events if e.get("usage_known")]
-    unmetered = sum(1 for e in events if not e.get("usage_known"))
-    err429 = sum(1 for e in events if e["status"] == 429)
-    err500 = sum(1 for e in events if type(e["status"]) is int and e["status"] >= 500)
-
-    ti = sum(e["ti"] for e in measured)
-    cache = sum(e["cache"] for e in measured)
-    to = sum(e["to"] for e in measured)
-    # Headline usage is the normalized per-event total (ti + to for complete
-    # records, the reported sum for total-only records), so every aggregate
-    # below shares one definition.
-    toks_total = sum(e["total"] for e in measured)
-    tr = sum(e.get("reasoning", 0) for e in measured)
-    cw = sum(e.get("cache_write", 0) for e in measured)
-    what_if = round(sum(e["what_if"] for e in measured), 4)
-    free_unpriced = sum(1 for e in measured if e["free"] and not e["what_if"])
-    # Latency over successful requests only: fast 429/401 rejects would
-    # otherwise drag the average down and misrepresent model speed.
-    ms_vals = [e["ms"] for e in measured if e["ms"] > 0]
-    avg_ms = round(sum(ms_vals) / len(ms_vals), 1) if ms_vals else None
+    # A05: one pass over the scanned events; no per-subset copies beyond the
+    # scanned list itself (counters and running sums instead of full lists).
+    events = scanned_events
+    ok_count = err_count = measured_count = unmetered = 0
+    err429 = err500 = 0
+    ti = cache = to = toks_total = 0.0
+    tr = cw = 0.0
+    what_if = 0.0
+    free_unpriced = 0
+    ms_sum = ms_count = 0
+    ok_times = []
+    biggest_req = None
+    for e in events:
+        outcome = e["outcome"]
+        if outcome == "success":
+            ok_count += 1
+            at_ms = _router_time_key(e.get("at"))
+            if at_ms > 0:
+                ok_times.append((at_ms * 1000, e["total"]))
+            if biggest_req is None or e["total"] > biggest_req["total"]:
+                biggest_req = e
+        elif outcome == "error":
+            err_count += 1
+        if e["status"] == 429:
+            err429 += 1
+        if type(e["status"]) is int and e["status"] >= 500:
+            err500 += 1
+        if e.get("usage_known"):
+            measured_count += 1
+            ti += e["ti"]
+            cache += e["cache"]
+            to += e["to"]
+            # Headline usage is the normalized per-event total (ti + to for
+            # complete records, the reported sum for total-only records), so
+            # every aggregate shares one definition.
+            toks_total += e["total"]
+            tr += e.get("reasoning", 0)
+            cw += e.get("cache_write", 0)
+            what_if += e["what_if"]
+            if e["free"] and not e["what_if"]:
+                free_unpriced += 1
+            # Latency over measured requests only: fast 429/401 rejects would
+            # otherwise drag the average down and misrepresent model speed.
+            if e["ms"] > 0:
+                ms_sum += e["ms"]
+                ms_count += 1
+        else:
+            unmetered += 1
+    what_if = round(what_if, 4)
+    avg_ms = round(ms_sum / ms_count, 1) if ms_count else None
+    ok_times.sort()
 
     by_model = {}
     for e in events:
         m = by_model.setdefault(
             e["model"],
             {"provider": e["provider"], "reqs": 0, "ok": 0, "err": 0,
-             "unknown": 0,
+             "unknown": 0, "measured": 0,
              "ti": 0.0, "to": 0.0, "cache": 0.0, "total": 0.0,
              "reasoning": 0.0,
              "what_if": 0.0, "ms": 0.0, "free": e["free"]},
@@ -2460,6 +2639,7 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         else:
             m["unknown"] += 1
         if e.get("usage_known"):
+            m["measured"] += 1
             m["ti"] += e["ti"]
             m["to"] += e["to"]
             m["cache"] += e["cache"]
@@ -2473,7 +2653,7 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         tot = m["total"]
         model_rows.append(
             [name, m["reqs"], tot, m["ti"], m["to"], m["cache"], m["ok"], m["err"],
-             round(tot / m["ok"], 0) if m["ok"] else 0,
+             round(tot / m["measured"], 0) if m["measured"] else 0,
              router_cache_rate(m["ti"], m["cache"]), m["provider"],
              m["free"], round(m["what_if"], 4), round(m["reasoning"], 1),
              m["unknown"]]
@@ -2549,10 +2729,6 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     # Tokens per commit from router request tokens (timestamp-only join: the
     # usage-events stream has no project/file info). Same commit list and
     # 24h window as the local tab so both sides stay comparable.
-    ok_times = sorted(
-        (_router_time_key(e.get("at")) * 1000, e["total"])
-        for e in ok_events if _router_time_key(e.get("at")) > 0
-    )
     window_ms = COMMIT_WINDOW_HOURS * 3600 * 1000
     r_commit_rows = []
     for c in collect_repo_commits(worktrees or []):
@@ -2571,15 +2747,16 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     r_commit_rows.sort(key=lambda r: -r[7])
     r_commit_rows = r_commit_rows[:MAX_COMMIT_ROWS]
 
-    avg_per_session = round(toks_total / len(measured), 0) if measured else 0
-    known = len(ok_events) + len(err_events)
+    avg_per_session = (round(toks_total / measured_count, 0)
+                       if measured_count else 0)
+    known = ok_count + err_count
     totals = {
         "requests": len(events),
-        "ok": len(ok_events),
-        "errors": len(err_events),
+        "ok": ok_count,
+        "errors": err_count,
         "unknown": len(events) - known,
         "known_outcomes": known,
-        "success_rate": round(len(ok_events) / known, 4) if known else None,
+        "success_rate": round(ok_count / known, 4) if known else None,
         "coverage": {"known": known, "total": len(events)},
         "err429": err429,
         "err500": err500,
@@ -2597,7 +2774,7 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         "providers": len(by_provider),
         "what_if_cost": what_if,
         "avg_ms": avg_ms,
-        "sessions": len(ok_events),
+        "sessions": ok_count,
         "messages": len(events),
         "cost": 0,
         "avg_duration_min": 0,
@@ -2607,11 +2784,10 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
 
     biggest_day = max(day_entries, key=lambda d: d["total"]) if day_entries else None
     top_model = model_rows[0] if model_rows else None
-    biggest_req = max(ok_events, key=lambda e: e["total"]) if ok_events else None
     peak_hour = max(range(24), key=lambda h: hour_tokens.get(h, 0)) if any(hour_tokens.values()) else None
     req_word = "Usage events" if full_scan else "requests"
     insights = [
-        f"Codex made {len(events):,} {req_word} across {len(by_model)} models, {len(ok_events):,} ok, {len(err_events):,} errors.",
+        f"Codex made {len(events):,} {req_word} across {len(by_model)} models, {ok_count:,} ok, {err_count:,} errors.",
         (f"Top model: {router_short(top_model[0])}, {top_model[2]:,.0f} tokens over {top_model[1]:,} requests."
          if top_model else ""),
         (f"Busiest day: {biggest_day['date']}, {biggest_day['total']:,.0f} tokens, {biggest_day['reqs']} requests."

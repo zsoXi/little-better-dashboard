@@ -1070,3 +1070,90 @@ Contract: spec §7 (`F3: aktywnosc historyczna nie jest stanem wykonania agenta`
 - Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
   only own PIDs/threads handled; no repo files left dirty beyond the intended
   set.
+
+# FIX_REPORT — F6e bounded inspector, cursor paging + batched parts (RED -> GREEN)
+
+## F6e-1. Repo, base, tested SHA, worktree, environment
+
+- Repo: `D:\TESTY!\V3\little-better-dashboard`, branch `fix/audit-f1-f8`;
+  start HEAD `75b9503` (F6d reports; F6d code `717aee8`).
+- Worktree: 2 files — `opencode_dashboard.py` (modified),
+  `tests/test_inspector.py` (modified). A cosmetic stat-dirty flag on
+  `tests/test_synth_publish.py` (external deletion incident, content proven
+  equal) is never staged; `HANDOFF.md` stays untracked.
+- Tested hashes: `opencode_dashboard.py`
+  `sha256:d2d4a0e3c923301662cb8db2600dbe28f33c9595c78fa34e358447232d87a0f3`;
+  `tests/test_inspector.py`
+  `sha256:f777d20a2de726f8ca1af619310ed09ee126c16a4b53ce99b7e28df27cd8e7d4`.
+- Environment: Windows, `python` 3.14.3. Test servers `127.0.0.1:0` only
+  (never 8765/8766/8770); fixtures in temp dirs with isolated
+  HOME/USERPROFILE/LOCALAPPDATA.
+
+## F6e-2. Change (TODO -> REPRODUCED -> PATCHED -> VERIFIED -> DONE)
+
+- Contract: spec §16 — bounded inspector: message pagination with a hard
+  server limit, cursor on a stable order, parts fetched collectively (no
+  per-message query), response size budget with explicit truncation markers,
+  controlled bad-input handling, read-only DB access.
+- REPRODUCED (RED): `artifacts/F6e-RED.windows.log` —
+  `python -m unittest tests.test_inspector -v` -> Ran 9, FAILED
+  (failures=3, errors=3).
+- PATCHED: constants `INSP_PAGE_DEFAULT = 50`, `INSP_PAGE_MAX = 200`,
+  `INSP_PARTS_PER_MSG = 20`, `INSP_MSG_JSON_CAP = 16384`,
+  `INSP_PART_DATA_CAP = 8192`, `INSP_BUDGET_BYTES = 1 MiB`.
+  `query_inspect(con, sid, cursor=None, limit=None)` now clamps the limit
+  (default 50, 1..200), parses the `ts|id` cursor with a controlled
+  `{"found": False, "id": sid, "error": "invalid cursor"}` on malformed
+  input, reads ONE page of messages ordered by `(time_created, id)` with
+  `LIMIT lim + 1` for `has_more`, bounds raw reads with
+  `substr(data,1,cap)` + `LENGTH(data)` so multi-megabyte values are never
+  fully loaded, fetches page parts in ONE batched query
+  (`ROW_NUMBER() OVER (PARTITION BY message_id ORDER BY id) <= 20`) plus a
+  single `COUNT(*) GROUP BY message_id` for omission counts, and marks every
+  shortening: `parts_omitted`, `truncated`, `raw_fragment`, `data_truncated`,
+  `response_truncated`, `parts_truncated`. The whole response is held under
+  ~1 MiB UTF-8 by dropping tail messages (never cutting JSON mid-byte), with
+  `has_more`/`cursor` kept consistent. The `/api/inspect` handler passes
+  `id`/`cursor`/`limit` through and keeps the controlled fallback. The
+  frontend `inspect()` keeps its exact signature (F6d-T09 substring test),
+  gains `_inspState` (sid/cursor/hasMore/pending), appends `&cursor=` for the
+  next page, labels omitted/truncated parts and raw fragments, and offers a
+  `Load next` button; read-only queries only, no DDL.
+- VERIFIED: `python -m unittest tests.test_inspector -v` -> Ran 9, OK;
+  `python -m unittest discover -s tests` -> Ran 137, OK (115.9 s);
+  `py_compile` OK; `node --check` OK (92520-char extracted PAGE JS).
+  Logs: `artifacts/F6e-GREEN.windows.log`. Jev gate (jev-1.13.0,
+  diff 26 253 chars): `touches_local_path` 0.09 LOW /
+  `bounded_paging_cursor` 0.97 /
+  `batched_parts_not_per_message` 0.94 /
+  `response_budget_explicit` 0.88 / `controlled_bad_inputs` 0.92.
+- Matrix: F6e-T01..T06 rows -> real test IDs, env `windows`, PASS, evidence
+  `artifacts/F6e-GREEN.windows.log`.
+- Retries: none of note — RED captured, single patch pass, GREEN on the
+  first run.
+
+## F6e-3. Not changed (verified)
+
+- Local session-stats path untouched: `day_total`/`dayTotal`/`outMerged`,
+  token SUM SQL, cache-rate math unchanged (Jev `touches_local_path` 0.09
+  changed-lines-only; F1/F3/F4 suites unchanged).
+- No DDL, no migrations and no indexes are created in the user database; the
+  inspector stays read-only (message counts unchanged after bad inputs,
+  F6e-T05).
+- No runtime dependencies added; prompt content still stays local and is
+  never sent to reports or CI.
+- The other endpoints keep their behavior; the inspector no longer delays
+  `/api/stats` (F6e-T06) and paging never pretends the first page is the
+  whole session (`has_more`/`cursor` always present).
+
+## F6e-4. Verify gate outcome
+
+- `python tools/verify_acceptance.py --gate core --report artifacts/TEST_REPORT.json`
+  -> FAIL (expected/honest, exit 1): `artifacts/TEST_REPORT.json` is still
+  F1-era (F2..INT rows missing; report hash `sha256:ce11d08f...` != current
+  dashboard hash) -> same honest "GATE CORE FAILED (132 problem(s))" count as
+  the prior steps; the report is rebuilt at the F8-close step.
+  Log: `artifacts/F6e-verify-core.windows.log`.
+- Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
+  only own PIDs/threads handled; no repo files left dirty beyond the intended
+  set.

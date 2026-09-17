@@ -120,28 +120,28 @@ one row per single environment (`windows` or `linux`).
 | F7-T04 | F7 | tests/test_commit_attribution.py::TestF7CommitWindows::test_f7_t04_timezone_equivalence | windows | core+release | PASS | artifacts/F7-GREEN.windows.log |
 | F7-T05 | F7 | tests/test_commit_attribution.py::TestF7CommitWindows::test_f7_t05_warnings_in_ui_and_export | windows | core+release | PASS | artifacts/F7-GREEN.windows.log |
 | F7-T06 | F7 | tests/test_commit_attribution.py::TestF7CommitWindows::test_f7_t06_no_inferred_attribution | windows | core+release | PASS | artifacts/F7-GREEN.windows.log |
-| F8-T01 | F8 | tools/verify_acceptance.py::skeleton-case F8-T01 | windows+linux | core+release | NOT_RUN | - |
-| F8-T02 | F8 | tools/verify_acceptance.py::skeleton-case F8-T02 | windows+linux | core+release | NOT_RUN | - |
-| F8-T03 | F8 | tools/verify_acceptance.py::skeleton-case F8-T03 | windows+linux | core+release | NOT_RUN | - |
-| F8-T04 | F8 | tools/verify_acceptance.py::skeleton-case F8-T04 | windows+linux | core+release | NOT_RUN | - |
-| F8-T05 | F8 | tools/verify_acceptance.py::skeleton-case F8-T05 | windows+linux | core+release | NOT_RUN | - |
-| F8-T06 | F8 | tools/verify_acceptance.py::skeleton-case F8-T06 | windows+linux | core+release | NOT_RUN | - |
-| PUB-T01 | PUB | tests/test_codex_publication.py::TestCodexPublication::test_blank_stats_shape_and_safe_embed | windows+linux | core+release | NOT_RUN | - |
-| PUB-T02 | PUB | tests/test_codex_publication.py::TestCodexPublication::test_blank_stats_shape_and_safe_embed | windows+linux | core+release | NOT_RUN | - |
-| PUB-T03 | PUB | tests/test_codex_publication.py::TestCodexPublication::test_blank_stats_shape_and_safe_embed | windows+linux | core+release | NOT_RUN | - |
-| PUB-T04 | PUB | tests/test_codex_publication.py::TestCodexPublication::test_blank_stats_shape_and_safe_embed | windows+linux | core+release | NOT_RUN | - |
-| PUB-T05 | PUB | tests/test_codex_publication.py::TestCodexPublication::test_blank_stats_shape_and_safe_embed | windows+linux | core+release | NOT_RUN | - |
-| PUB-T06 | PUB | tests/test_codex_publication.py::TestCodexPublication::test_blank_stats_shape_and_safe_embed | windows+linux | core+release | NOT_RUN | - |
-| PUB-T07 | PUB | tests/test_codex_publication.py::TestCodexPublication::test_blank_stats_shape_and_safe_embed | windows+linux | core+release | NOT_RUN | - |
-| INT-T01 | INT | tests/test_codex_incremental.py::TestCodexIncremental::test_window_and_fingerprint_pure | windows+linux | core+release | NOT_RUN | - |
-| INT-T02 | INT | tests/test_codex_incremental.py::TestCodexIncremental::test_window_and_fingerprint_pure | windows+linux | core+release | NOT_RUN | - |
-| INT-T03 | INT | tests/test_codex_incremental.py::TestCodexIncremental::test_window_and_fingerprint_pure | windows+linux | core+release | NOT_RUN | - |
-| INT-T04 | INT | tests/test_codex_incremental.py::TestCodexIncremental::test_window_and_fingerprint_pure | windows+linux | core+release | NOT_RUN | - |
-| INT-T05 | INT | tests/test_codex_incremental.py::TestCodexIncremental::test_window_and_fingerprint_pure | windows+linux | core+release | NOT_RUN | - |
-| INT-T06 | INT | tests/test_codex_incremental.py::TestCodexIncremental::test_window_and_fingerprint_pure | windows+linux | core+release | NOT_RUN | - |
-| INT-T07 | INT | tests/test_codex_incremental.py::TestCodexIncremental::test_window_and_fingerprint_pure | windows+linux | core+release | NOT_RUN | - |
-| INT-T08 | INT | tests/test_codex_incremental.py::TestCodexIncremental::test_window_and_fingerprint_pure | windows+linux | core+release | NOT_RUN | - |
-| INT-T09 | INT | tests/test_codex_incremental.py::TestCodexIncremental::test_window_and_fingerprint_pure | windows+linux | core+release | NOT_RUN | - |
-| INT-T10 | INT | tests/test_codex_incremental.py::TestCodexIncremental::test_window_and_fingerprint_pure | windows+linux | core+release | NOT_RUN | - |
-| INT-T11 | INT | tests/test_codex_incremental.py::TestCodexIncremental::test_window_and_fingerprint_pure | windows+linux | core+release | NOT_RUN | - |
-| INT-T12 | INT | tests/test_codex_incremental.py::TestCodexIncremental::test_window_and_fingerprint_pure | windows+linux | core+release | NOT_RUN | - |
+| F8-T01 | F8 | tests/test_integration.py::TestIntIntegration::test_int_t12_clean_checkout_quick_start | windows | core+release | PASS | artifacts/F8-GREEN.windows.log |
+| F8-T02 | F8 | tests/test_integration.py::TestF8Evidence::test_f8_t02_redgreen_logs_present | windows | core+release | PASS | artifacts/F8-REDGREEN.windows.log |
+| F8-T03 | F8 | tools/run_browser_tests.py --cases F8-B01..F8-B07 | windows | core+release | PASS | artifacts/F8-browser.windows.log |
+| F8-T04 | F8 | .github/workflows/tests.yml (real CI runs) | windows+linux | release | CI_PENDING | - |
+| F8-T05 | F8 | tests/test_integration.py::TestF8Evidence::test_f8_t05_stale_report_detected | windows | core+release | PASS | artifacts/F8-T05-stale.windows.log |
+| F8-T06 | F8 | tests/test_integration.py::TestF8Evidence::test_f8_t06_missing_mandatory_detected | windows | core+release | PASS | artifacts/F8-T06-missing.windows.log |
+| PUB-T01 | PUB | tests/test_publication_checks.py::TestPublicationChecks::test_pub_t01_readme_matches_tested_behavior | windows | core+release | PASS | artifacts/PUB-GREEN.windows.log |
+| PUB-T02 | PUB | tests/test_publication_checks.py::TestPublicationChecks::test_pub_t02_shell_launcher_is_executable | windows | core+release | PASS | artifacts/PUB-GREEN.windows.log |
+| PUB-T03 | PUB | tests/test_publication_checks.py::TestPublicationChecks::test_pub_t03_bat_special_paths_and_arg_forwarding | windows | core+release | PASS | artifacts/PUB-GREEN.windows.log |
+| PUB-T04 | PUB | tests/test_publication_checks.py::TestPublicationChecks::test_pub_t04_no_secrets_or_user_data | windows | core+release | PASS | artifacts/PUB-GREEN.windows.log |
+| PUB-T05 | PUB | tests/test_publication_checks.py::TestPublicationChecks::test_pub_t05_screenshot_current | windows | core+release | PASS | artifacts/PUB-GREEN.windows.log |
+| PUB-T06 | PUB | tests/test_publication_checks.py::TestPublicationChecks::test_pub_t06_runtime_stays_dependency_free | windows | core+release | PASS | artifacts/PUB-GREEN.windows.log |
+| PUB-T07 | PUB | tests/test_publication_checks.py::TestPublicationChecks::test_pub_t07_no_unauthorized_remote_operations | windows | core+release | PASS | artifacts/PUB-GREEN.windows.log |
+| INT-T01 | INT | tests/test_integration.py::TestIntIntegration::test_int_t01_cold_start_sqlite_and_codex | windows | core+release | PASS | artifacts/INT-GREEN.windows.log |
+| INT-T02 | INT | tests/test_integration.py::TestIntIntegration::test_int_t02_no_sqlite_codex_ok | windows | core+release | PASS | artifacts/INT-GREEN.windows.log |
+| INT-T03 | INT | tests/test_integration.py::TestIntIntegration::test_int_t03_no_codex_sqlite_ok | windows | core+release | PASS | artifacts/INT-GREEN.windows.log |
+| INT-T04 | INT | tests/test_integration.py::TestIntIntegration::test_int_t04_synthesis_120_unknown_cache40 | windows | core+release | PASS | artifacts/INT-GREEN.windows.log |
+| INT-T05 | INT | tests/test_integration.py::TestIntIntegration::test_int_t05_append_during_refresh_no_partial_loss | windows | core+release | PASS | artifacts/INT-GREEN.windows.log |
+| INT-T06 | INT | tests/test_integration.py::TestIntIntegration::test_int_t06_publish_failure_stale_then_recovery | windows | core+release | PASS | artifacts/INT-GREEN.windows.log |
+| INT-T07 | INT | tools/run_browser_tests.py::F6d-T01 | windows | core+release | PASS | artifacts/F6d-browser.windows.log |
+| INT-T08 | INT | tests/test_http_security.py::TestF2T10RestartInvalidatesOldToken::test_f2_t10_old_token_is_401_and_new_link_recovers | windows | core+release | PASS | artifacts/F2-GREEN.windows.log |
+| INT-T09 | INT | tests/test_integration.py::TestIntIntegration::test_int_t09_two_tabs_close_one_keeps_other | windows | core+release | PASS | artifacts/INT-GREEN.windows.log |
+| INT-T10 | INT | tests/test_integration.py::TestIntIntegration::test_int_t10_real_router_replaces_synthesis | windows | core+release | PASS | artifacts/INT-GREEN.windows.log |
+| INT-T11 | INT | tests/test_codex_incremental.py::TestF6cIncrementalRead::test_f6c_t08_restart_uses_valid_checkpoint | windows | core+release | PASS | artifacts/F6c-GREEN.windows.log |
+| INT-T12 | INT | tests/test_integration.py::TestIntIntegration::test_int_t12_clean_checkout_quick_start | windows | core+release | PASS | artifacts/INT-GREEN.windows.log |

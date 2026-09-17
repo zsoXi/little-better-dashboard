@@ -1240,166 +1240,131 @@ Contract: spec §7 (`F3: aktywnosc historyczna nie jest stanem wykonania agenta`
   only own PIDs/threads handled; no repo files left dirty beyond the intended
   set.
 
-# FIX_REPORT — F6f per-worktree git TTL cache, bounded refresh calls (RED -> GREEN)
 
-## F6f-1. Repo, base, tested SHA, worktree, environment
+# FIX_REPORT — F8-close, PUB and INT (final acceptance)
 
-- Repo: `D:\TESTY!\V3\little-better-dashboard`, branch `fix/audit-f1-f8`;
-  start HEAD `d477410` (F6e reports; F6e code `bb0e629`).
-- Worktree: 2 files — `opencode_dashboard.py` (modified),
-  `tests/test_cache_and_git.py` (modified). A cosmetic stat-dirty flag on
-  `tests/test_synth_publish.py` (external deletion incident, content proven
-  equal) is never staged; `HANDOFF.md` stays untracked.
-- Tested hashes: `opencode_dashboard.py`
-  `sha256:ae3991d6dab251bab27293dae6ac35ee7923ba2b7ee04b721fa717aa4b815068`;
-  `tests/test_cache_and_git.py`
-  `sha256:0806586ae638c38df6c72d2ac5ce17f4e2feb3203da5ab0ae06d17349cfc0737`.
-- Environment: Windows, `python` 3.14.3. Test servers `127.0.0.1:0` only
-  (never 8765/8766/8770); fixtures in temp dirs with isolated
-  HOME/USERPROFILE/LOCALAPPDATA.
-
-## F6f-2. Change (TODO -> REPRODUCED -> PATCHED -> VERIFIED -> DONE)
-
-- Contract: spec §17 — control expensive git calls on refresh: separate
-  SQLite freshness from git reads, per-worktree TTL cache shared between
-  parallel requests, timeout + stale fallback per subprocess, argv lists
-  (no shell), known worktree set only, HEAD visible after the TTL, no
-  remote fetch.
-- REPRODUCED (RED): `artifacts/F6f-RED.windows.log` —
-  `python -m unittest tests.test_cache_and_git -v` -> Ran 17, FAILED
-  (failures=2, errors=1).
-- PATCHED: `GIT_TTL_SECONDS = 10.0`, `_GIT_LOCK = threading.Lock()`,
-  `_HEADS_CACHE = {}`, `_COMMITS_CACHE = {}`; `_head_for(wt, now, force)`
-  and `_commits_for(name, wt, per_repo, now, force)` refresh under the lock
-  with double-checked freshness and keep `{"head"/"commits", "at", "state"}`
-  entries (`ok` / `stale` / `unavailable`). `repo_heads(worktrees)` and
-  `collect_repo_commits(worktrees)` are served from those caches, so
-  `cached_local_stats` and `cached_router_stats` fingerprints stop spawning
-  one git subprocess per worktree per request while a HEAD change still
-  flows into the fingerprint after the TTL. Every git call stays an argv
-  list with a timeout (5 s rev-parse, 15 s log), failures keep the last
-  value with the stale state and never raise; no disk scanning, no remote
-  fetch.
-- VERIFIED: `python -m unittest tests.test_cache_and_git -v` -> Ran 17, OK;
-  `python -m unittest discover -s tests` -> Ran 141, OK (118.1 s);
-  `py_compile` OK. Logs: `artifacts/F6f-GREEN.windows.log`. Jev gate
-  (jev-1.13.0, diff 15 407 chars): round 1 `touches_local_path` 0.13 LOW /
-  `per_worktree_ttl_cache_shared` 0.96 / `bounded_subprocess_per_refresh`
-  0.49 / `timeout_safe_stale_fallback` 0.92 / `argv_list_no_shell` 0.97 /
-  `no_disk_scan_no_remote_fetch` 0.94; round 2 with the wording sharpened
-  (the fingerprint still calls `repo_heads`, but the cache is what bounds
-  subprocesses) `touches_local_path` 0.14 LOW and
-  `bounded_subprocess_per_refresh` 0.87.
-- Matrix: F6f-T01..T04 rows -> real test IDs, env `windows`, PASS, evidence
-  `artifacts/F6f-GREEN.windows.log`.
-- Retries: one Jev wording round; otherwise RED captured, single patch
-  pass, GREEN on the first run.
-
-## F6f-3. Not changed (verified)
-
-- Local session-stats token formula, SQL and cache-rate math unchanged
-  (Jev `touches_local_path` 0.14 LOW, changed-lines-only; F1/F3/F4 suites
-  unchanged).
-- Git history and user repositories untouched; no write operations at all:
-  `rev-parse`/`log` only, argv lists, no `shell=True`, no quoting issues
-  (F6f-T04 covers spaces and Unicode).
-- No disk-wide repository scanning and no `git fetch`/`pull` anywhere in
-  the display path; only the known worktree set from the project table is
-  consulted.
-- TTL stays a bounded 10 s (not inflated); the commit panel updates after
-  the TTL without a SQLite change (F6f-T03); git being slow or absent
-  degrades to the previous data with a stale/unavailable state (F6f-T02).
-
-## F6f-4. Verify gate outcome
-
-- `python tools/verify_acceptance.py --gate core --report artifacts/TEST_REPORT.json`
-  -> FAIL (expected/honest, exit 1): `artifacts/TEST_REPORT.json` is still
-  F1-era (F2..INT rows missing; report hash `sha256:ce11d08f...` != current
-  dashboard hash) -> same honest "GATE CORE FAILED (132 problem(s))" count as
-  the prior steps; the report is rebuilt at the F8-close step.
-  Log: `artifacts/F6f-verify-core.windows.log`.
-- Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
-  only own PIDs/threads handled; no repo files left dirty beyond the intended
-  set.
-
-# FIX_REPORT — F6f per-worktree git TTL cache, bounded refresh calls (RED -> GREEN)
-
-## F6f-1. Repo, base, tested SHA, worktree, environment
+## 1. Repo, base, tested SHA, worktree, environment
 
 - Repo: `D:\TESTY!\V3\little-better-dashboard`, branch `fix/audit-f1-f8`;
-  start HEAD `d477410` (F6e reports; F6e code `bb0e629`).
-- Worktree: 2 files — `opencode_dashboard.py` (modified),
-  `tests/test_cache_and_git.py` (modified). A cosmetic stat-dirty flag on
-  `tests/test_synth_publish.py` (external deletion incident, content proven
-  equal) is never staged; `HANDOFF.md` stays untracked.
-- Tested hashes: `opencode_dashboard.py`
-  `sha256:ae3991d6dab251bab27293dae6ac35ee7923ba2b7ee04b721fa717aa4b815068`;
-  `tests/test_cache_and_git.py`
-  `sha256:0806586ae638c38df6c72d2ac5ce17f4e2feb3203da5ab0ae06d17349cfc0737`.
-- Environment: Windows, `python` 3.14.3. Test servers `127.0.0.1:0` only
-  (never 8765/8766/8770); synthetic git repos in temp dirs with isolated
-  HOME/USERPROFILE/LOCALAPPDATA.
+  report written on top of HEAD `f855918` (F6f reports; F6f code `9f012ff`),
+  with the F8-close changes committed directly below this report commit.
+- Tested runtime hash: `opencode_dashboard.py`
+  `sha256:ae3991d6dab251bab27293dae6ac35ee7923ba2b7ee04b721fa717aa4b815068`
+  (unchanged since F6f - F8-close touched tests, tools, docs and CI only).
+- Worktree: `README.md`, `requirements-dev.txt`, `start-dashboard.bat`,
+  `start-dashboard.sh` (mode 100755 via `git update-index --chmod=+x`),
+  `tools/run_browser_tests.py`, `tools/verify_acceptance.py`,
+  `docs/testing.md`, `CHANGELOG.md`, plus new `tests/test_integration.py`,
+  `tests/test_publication_checks.py`, `tools/build_test_report.py` and
+  `.github/workflows/tests.yml`; report-only: `FIX_REPORT.md`,
+  `docs/ACCEPTANCE_MATRIX.md`. `tests/test_synth_publish.py` stays untouched
+  and unstaged (cosmetic stat-dirty); `HANDOFF.md` stays untracked.
+- Environment: Windows, `python` 3.14.3; browser: msedge 153 headless via
+  playwright 1.62.0 (dev-only); servers `127.0.0.1:0` only; local timezone.
 
-## F6f-2. Change (TODO -> REPRODUCED -> PATCHED -> VERIFIED -> DONE)
+## 2. Change (F8-close, PUB, INT)
 
-- Contract: spec §17 — separate SQLite freshness from expensive git reads;
-  per-worktree TTL cache shared by parallel requests; every git subprocess
-  timed with a stale/unavailable fallback; argv lists only; no disk scan,
-  no remote fetch; HEAD changes visible after the TTL.
-- REPRODUCED (RED): `artifacts/F6f-RED.windows.log` —
-  `python -m unittest tests.test_cache_and_git -v` -> Ran 17, FAILED
-  (failures=2, errors=1).
-- PATCHED: `GIT_TTL_SECONDS = 10.0`, `_GIT_LOCK = threading.Lock()`,
-  `_HEADS_CACHE = {}`, `_COMMITS_CACHE = {}`. `_head_for(wt, now,
-  force=False)` and `_commits_for(name, wt, per_repo, now, force=False)`
-  double-check freshness under the lock: inside the TTL the cached value is
-  returned without touching git; outside it one subprocess refreshes
-  `git -C <wt> rev-parse HEAD` (timeout 5) or `git log -nN ... --numstat`
-  (timeout 15). Failures/timeouts keep the previous value with state
-  `stale` (or `unavailable` without a previous value) and never raise;
-  `repo_heads(worktrees, force=False)` and `collect_repo_commits(...)` now
-  serve from these caches, so the `cached_local_stats` and
-  `cached_router_stats` fingerprints stay cheap while a HEAD change still
-  invalidates them after the TTL. Argv lists only, no shell, no disk scan,
-  no remote fetch.
-- VERIFIED: `python -m unittest tests.test_cache_and_git -v` -> Ran 17, OK;
-  `python -m unittest discover -s tests` -> Ran 141, OK (118.1 s);
-  `py_compile` OK. Logs: `artifacts/F6f-GREEN.windows.log`. Jev gate
-  (jev-1.13.0, diff 15 407 chars): round 1 `touches_local_path` 0.13 LOW /
-  `per_worktree_ttl_cache_shared` 0.96 /
-  `bounded_subprocess_per_refresh` 0.49 (ambiguous wording) /
-  `timeout_safe_stale_fallback` 0.92 / `argv_list_no_shell` 0.97 /
-  `no_disk_scan_no_remote_fetch` 0.94; round 2 (sharpened:
-  "count spawned subprocesses, not function calls") `touches_local_path`
-  0.14 LOW, `bounded_subprocess_per_refresh` 0.87, others unchanged
-  (0.96/0.92/0.97/0.93).
-- Matrix: F6f-T01..T04 rows -> real test IDs, env `windows`, PASS, evidence
-  `artifacts/F6f-GREEN.windows.log`.
-- Retries: none of note — RED captured, single patch pass, GREEN on the
-  first run; one Jev re-round with sharper question wording.
+- Browser coverage grew to the spec section 19-C minimum: new cases `F8-B01`
+  (OpenCode/Codex tabs + the shared 120 sum + reasoning toggle), `F8-B02`
+  (search, chip filter, range preset, restored tab), `F8-B03` (unknown
+  outcome counted, no fake success), `F8-B04` (recency labels + child-list
+  cap), `F8-B05` (inspector paging footer + content), `F8-B06` (legal auth,
+  two tabs, 401 after a token restart), `F8-B07` (synthetic HTML/JS never
+  executes, no console errors, no external requests) - all on synthetic
+  sources in real headless msedge.
+- New `tests/test_integration.py`: INT-T01..T06, T09, T10, T12 against a real
+  in-process server, plus `TestF8Evidence` with the RED/GREEN manifest check
+  and the stale-report / missing-mandatory verifier demonstrations.
+- New `tests/test_publication_checks.py`: PUB-T01..T07 (README claims, SH
+  executable bit, BAT special paths on Windows, secrets/user-data scan,
+  screenshot, dependency-free runtime, no remote operations).
+- New `tools/build_test_report.py`: builds the section 23.3 report from the
+  matrix bound to the current runtime sha256.
+- `tools/verify_acceptance.py` keeps `--gate` and accepts the spec alias
+  `--require`. `.github/workflows/tests.yml` gained the headless Chromium
+  browser job next to the unit matrix. `README.md` gained the "Data handling
+  and limits" section and an honest platform statement;
+  `requirements-dev.txt` pins `playwright==1.62.0` (dev-only);
+  `start-dashboard.bat` now prefers `python` with a `py -3` fallback;
+  `docs/testing.md` and `CHANGELOG.md` were rewritten for the real tooling.
 
-## F6f-3. Not changed (verified)
+Evidence:
 
-- Local session-stats path untouched: `day_total`/`dayTotal`/`outMerged`,
-  token SUM SQL, cache-rate math unchanged (Jev `touches_local_path` 0.13
-  changed-lines-only; F1/F3/F4 suites unchanged).
-- No git history or user repos are modified; the dashboard only reads
-  HEAD/commits via argv lists with timeouts; no shell interpretation even
-  for paths with spaces/Unicode (`repo späce & $HOME ! (x)`, F6f-T04).
-- No disk-wide repository scanning (only the project table's worktree set),
-  no remote `git fetch`/`pull`, and the TTL stays a constant 10 s — not
-  inflated to hide cost.
-- Degraded git behaves readably: stale heads/commits are served with their
-  state while tokens and other sources keep working (F6f-T02).
+- Backend: `python -m unittest discover -s tests -p "test_*.py" -v` ->
+  Ran 160, OK (121.6 s); `tests.test_integration` -> Ran 12, OK;
+  `tests.test_publication_checks` -> Ran 7, OK.
+- Browser: F6d suite 5/5 PASS and F8 suite 7/7 PASS (exit 0) -
+  `artifacts/F6d-browser.windows.log`, `artifacts/F8-browser.windows.log`,
+  JSON plus screenshots in `artifacts/F6d-browser-shots/`.
+- Report and gates: `tools/build_test_report.py` -> 131 results, 130 PASS;
+  `--gate core` -> `GATE CORE PASSED.` (exit 0,
+  `artifacts/F8-verify-core.windows.log`); `--gate release` -> exit 1 with
+  exactly one problem, `F8-T04: mandatory result CI_PENDING is not PASS`
+  (`artifacts/F8-verify-release.windows.log`).
+- RED/GREEN manifest `artifacts/F8-REDGREEN.windows.log`; stale-report demo
+  `artifacts/F8-T05-stale.windows.log` (verifier rejects a wrong code hash);
+  missing-mandatory demo `artifacts/F8-T06-missing.windows.log` (verifier
+  rejects a missing ID and missing evidence).
 
-## F6f-4. Verify gate outcome
+## 3. Not changed (verified)
 
-- `python tools/verify_acceptance.py --gate core --report artifacts/TEST_REPORT.json`
-  -> FAIL (expected/honest, exit 1): `artifacts/TEST_REPORT.json` is still
-  F1-era (F2..INT rows missing; report hash `sha256:ce11d08f...` != current
-  dashboard hash) -> same honest "GATE CORE FAILED (132 problem(s))" count as
-  the prior steps; the report is rebuilt at the F8-close step.
-  Log: `artifacts/F6f-verify-core.windows.log`.
-- Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
-  only own PIDs/threads handled; no repo files left dirty beyond the intended
-  set.
+- Local accounting (`day_total`/`dayTotal`/`outMerged`, SUM SQL, cache-rate),
+  the loopback bind and the source logs are untouched.
+- No runtime dependencies; playwright is dev-only. No DDL in the user DB, no
+  git history rewrite, no remote fetch. UI, tabs, filters and theme survive.
+
+## 4. Integration and browser results
+
+- INT: T01..T06, T09, T10, T12 executed locally in `tests/test_integration.py`;
+  T07 via the browser runner (F6d-T01/T02), T08 via the F2 restart test, T11
+  via the F6c checkpoint test - all PASS with logs above.
+- Browser: 12/12 cases PASS across both suites in a real browser.
+
+## 5. Platform results
+
+- Windows + Python 3.14.3: full local suite and both browser suites executed
+  (evidence above).
+- Linux: NOT_RUN (no environment on this machine; the CI job exists but has
+  not executed).
+- macOS: NOT_RUN.
+
+## 6. CI
+
+- `.github/workflows/tests.yml`: unit matrix (ubuntu + windows, Python
+  3.10 + 3.14) and a browser job (ubuntu, Python 3.14, pinned playwright,
+  Chromium, evidence upload). Status: `CI_PENDING` - nothing was pushed and
+  no CI job has run; a workflow file alone never counts as CI evidence.
+
+## 7. Performance measurements
+
+- Pending: `tools/benchmark_dashboard.py` still reports NOT_IMPLEMENTED/exit 2
+  and the spec section 22 measurements are not recorded yet. Bounded-read
+  guarantees are covered by the F6b/F6c/F6f tests instead.
+
+## 8. Repo hygiene and screenshot
+
+- `artifacts/` stays gitignored; PUB-T04 found no secrets or user data in
+  tracked changes; `screenshot.png` exists and is referenced from the README;
+  README matches the tested behavior; the SH launcher is executable in the
+  index; the BAT handles spaces/`!`/Unicode; the runtime imports no dev
+  dependency; no remote operations were performed.
+
+## 9. Blocked
+
+- Real CI execution (F8-T04) - needs a push and a runner; the release gate
+  stays failed solely on this item.
+- Linux/macOS verification and the section 22 measurements.
+
+## 10. Out of scope
+
+- Profile/UglyDashboard proposals and optional commit `cwd` filtering (the
+  spec keeps them separate from this repo's repair scope).
+
+## 11. Remote operations
+
+- None (no push/merge/fetch/publish).
+
+## 12. Processes terminated
+
+- All test servers, threads and timers were in-process and cleaned up in
+  tearDown; no user processes were touched.

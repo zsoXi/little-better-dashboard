@@ -372,7 +372,9 @@ class TestRouterApiServe(unittest.TestCase):
 
     def test_f1_02_served_page_shape_120(self):
         import json as _json
+        import secrets as _secrets
         import threading
+        import urllib.request
         from http.server import ThreadingHTTPServer
         d = _load_dashboard()
         p = str(Path(self._tmp.name) / "usage-events.jsonl")
@@ -387,12 +389,24 @@ class TestRouterApiServe(unittest.TestCase):
         except Exception:
             pass
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), d.Handler)
+        # F2 auth model: private /api/* needs a per-instance bearer token.
+        try:
+            self._server.auth_token = _secrets.token_urlsafe(32)
+        except Exception:
+            pass
+        try:
+            d.Handler.auth_token = self._server.auth_token
+        except Exception:
+            pass
+        token = self._server.auth_token
         host, port = self._server.server_address
         self.assertEqual(host, "127.0.0.1")
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
-        import urllib.request
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/router", timeout=10) as r:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/router",
+            headers={"Authorization": "Bearer " + token})
+        with urllib.request.urlopen(req, timeout=10) as r:
             body = r.read().decode("utf-8")
         strict = _json.loads(body, parse_constant=lambda x: (_ for _ in ()).throw(ValueError(x)))
         self.assertEqual(strict["totals"]["tokens_total"], 120)
@@ -401,10 +415,13 @@ class TestRouterApiServe(unittest.TestCase):
         cell = _f1_activity_cell(strict, F1_TODAY)
         self.assertIsNotNone(cell)
         self.assertEqual(cell["total"], 120)
+        # F2: public shell carries null payloads, never private totals.
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=10) as r:
             page = r.read().decode("utf-8")
         self.assertEqual(r.status, 200)
-        self.assertIn('"tokens_total": 120', page)
+        self.assertNotIn('"tokens_total": 120', page)
+        self.assertIn("const S0 = null", page)
+        self.assertIn("const R0 = null", page)
 
 
 if __name__ == "__main__":

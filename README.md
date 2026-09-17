@@ -12,9 +12,9 @@ A single-file, zero-dependency usage dashboard for [OpenCode](https://github.com
 
 **Codex tab** gives the same treatment to your local Codex sessions, with request, token and model stats synthesized from your rollout files alongside a browsable session table.
 
-Everything is read from files already on your machine. Nothing is uploaded anywhere, since the server binds to `127.0.0.1` only.
+Everything is read from files already on your machine. The server binds to `127.0.0.1` only and additionally requires a per-instance bearer token plus strict Host/Origin checks; the bind alone is not claimed to prevent all exfiltration.
 
-Privacy: The dashboard may read and display message content from your local OpenCode and Codex sessions for session inspection. This content stays on your machine and is only served through the local 127.0.0.1 dashboard. Nothing is uploaded or sent to external services.
+Privacy: The dashboard may read and display message content from your local OpenCode and Codex sessions for session inspection. This content stays on your machine and is only served to a browser session presenting the instance token over the local 127.0.0.1 dashboard. Nothing is uploaded or sent to external services. Private content is visible to anyone holding the instance link, and tunnels or public exposure are not supported.
 
 ## Quick start (one click)
 
@@ -23,7 +23,7 @@ Requirements: **Python 3** (3.10 or newer works, and it is tested on 3.14) and O
 - **Windows:** double-click `start-dashboard.bat`
 - **macOS / Linux:** run `./start-dashboard.sh` (or `bash start-dashboard.sh`)
 
-The dashboard opens in your browser at `http://127.0.0.1:8765`.
+The dashboard opens in your browser at `http://127.0.0.1:8765/#token=…` (per-instance token in the URL fragment; the fragment is never sent over HTTP and no `?token=` query string is used).
 
 Prefer the terminal?
 

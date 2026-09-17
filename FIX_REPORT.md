@@ -148,3 +148,98 @@
   process exited (PID-file host check confirms no stray process).
 - No process killed by name; only own PIDs/threads handled. Temp HOME dirs removed
   via `TemporaryDirectory` cleanup; repo `artifacts/` holds only logs + report JSON.
+
+---
+
+# FIX_REPORT — F2 access protection (RED → GREEN)
+
+## F2-1. Repo, base, tested SHA, worktree, environment
+
+- Repo: `V3/little-better-dashboard`, branch `fix/audit-f1-f8`.
+- Start of this run: HEAD `7243ea8` ("F1 FIX_REPORT"), `git status --short` clean,
+  suite 45 tests OK (F1 DONE).
+- F2 code hash tested: `sha256:41c71cf68e2838d5b647db9956592bde85a777d06fc9ad15450953d36adb8e7c`.
+- Worktree at test time: dirty (intended F2 patch + tests + matrix + this report).
+- Environment: Windows, `py -3.14` = Python 3.14.3. No browser/Playwright.
+  Linux/macOS: NOT_RUN. Test servers on `127.0.0.1` with system-allocated ports
+  only (port 0; never 8765/8766/8770). Fixtures synthetic in temp dirs, isolated HOME.
+
+## F2-2. Change (TODO → REPRODUCED → PATCHED → VERIFIED → DONE)
+
+- Contract (binding, §6): loopback + per-instance `secrets.token_urlsafe(32)`,
+  canonical `127.0.0.1:<real_port>` Host allowlist from `server.server_address`,
+  exact `http://127.0.0.1:<port>` Origin, `Authorization: Bearer` on all
+  private `/api/*` (incl. GET + POST `/api/close`). Public shell has null
+  payloads and no token; `--open` uses `#token=` fragment, never query.
+- Changed symbols in `opencode_dashboard.py`:
+  - imports: `+re`, `+secrets`; NEW `_TOKEN_RE`, `_new_token`,
+    `_expected_host`, `_expected_origin`, `_header_all`, `_is_private_path`.
+  - `Handler._check_origin` → strict delegate; NEW `_check_origin_strict`,
+    `_check_host` (single Host; missing/multiple 400, mismatch 403),
+    `_check_auth` (`compare_digest` after format check; missing/wrong/empty/multi 401),
+    `_deny` (generic 400/401/403/405, no private data), `_guard`
+    (Host→Origin→auth before any read/synth/`_touch`/close), `_unsupported_method`
+    + `__getattr__` guard for HEAD/OPTIONS/unknown methods (405, no effects).
+  - `Handler.do_GET`: guard first; shell `/`,`/index.html` returns
+    `PAGE` with `null`/`null`, zero DB/synth reads; private routes unchanged
+    shape (F1 fields kept, only gated).
+  - `Handler.do_POST`: same guard; `/api/close` accepts `?wid=` or
+    `X-Window-Id` after auth, else 401/403/400 with no window change.
+  - `Handler._send`: `+X-Content-Type-Options: nosniff`,
+    `+Referrer-Policy: no-referrer`, `+X-Frame-Options: DENY`; keeps
+    `Cache-Control: no-store`; HEAD sends headers only; never
+    `Access-Control-Allow-Origin`.
+  - `main`: `server.auth_token=_new_token()` (+ class fallback),
+    real-port URL + `/#token=` print/open, never `?token=`.
+  - Frontend `PAGE`: NEW `#auth-lock` card; token from `#token=` →
+    `history.replaceState` + memory + `sessionStorage ocd-token` (never
+    `localStorage`); NEW `authHeaders`/`authFetch` (token only to `/api/`),
+    `showAuthLock`/`noteAuthFailure` (401 stops auto-refresh, no loop);
+    `stopServer` is authed `fetch keepalive` (no `sendBeacon`);
+    `load`/`fetchSessions`/`inspect`/`openSession` via `authFetch` with 401
+    handling; boot loads only with token.
+  - `README.md`: bind-alone claim removed; token/Host/Origin, fragment,
+    no-tunnel, authorized-viewer-visible documented.
+  - `tests/test_router_tokens.py::TestRouterApiServe`: updated for F2 model
+    (authed `/api/router` still 120; shell now `const S0 = null`/`R0 = null`,
+    no `tokens_total` embed). F1 contract preserved via API.
+- RED evidence (`artifacts/F2-RED.windows.log`, 16 tests: 11 FAIL):
+  - `/api/stats` no-token `200 != 401`; foreign Host+Origin `200 != 403`;
+    foreign `Origin: http://evil.test/` `200 != 403`; missing Host not 400;
+    shell contains canary; HEAD/OPTIONS/unknown bypass; query-token `200 != 401`;
+    unauth close `200 != 401`; old-token `200 != 401`; second origin `200 != 403`;
+    missing `nosniff`. T02 positive already passed, as expected.
+- GREEN evidence:
+  - `artifacts/F2-GREEN.windows.log`: **57 tests, OK** (45 prior + 12 new,
+    zero regressions; two consecutive runs implied by live + suite).
+    `py_compile` OK.
+  - `artifacts/F2-http-api.windows.log`: live boot on `127.0.0.1:6439`
+    (port 0) with synthetic one-record fixture (100/20/40/5/120, canary model);
+    **33/33 PASS** accepted-rejected matrix per route, token REDACTED;
+    headline `120.0`, canary only via auth, `GET /` 200 with `auth-lock`,
+    `ocd-token`+`replaceState`, `S0/R0 null`; required headers on every case.
+- Matrix: `docs/ACCEPTANCE_MATRIX.md` F2-T01..T12 → PASS (windows,
+  `artifacts/F2-GREEN.windows.log`); F1-T01..T10 stay PASS (F1-T02 via
+  updated authed test); all other rows stay NOT_RUN.
+- Limitations: DOM pixel rendering + two-origin browser navigation need the
+  F8 browser suite (no Playwright here); T08/T10/T11 browser remainders
+  verified via real-HTTP Origin/Host/token + shipped-JS string asserts, not
+  mislabeled as full DOM. `sendBeacon` removal documented: unload delivery
+  not promised; idle-timeout/monitor is the fallback. Linux pending.
+- Retries: 1 PATCHED cycle + 1 test-only correction (T08 `?token=` comment
+  literal, T12 generic-UI-word strictness) → GREEN. No BLOCKED.
+
+## F2-3. Not changed (verified)
+
+- F1 router shape/fields kept (additive only); local `day_total`/`dayTotal`
+  untouched; `pl` guard, loopback bind, `json_html` guard, parameterized SQL,
+  source logs/DBs untouched. `git diff --check` clean. No work outside V3 repo;
+  no push/merge/remote; only own PIDs handled.
+
+## F2-4. Verify gate outcome
+
+- `py -3.14 tools/verify_acceptance.py --gate core` → FAIL (expected):
+  F1+F2 PASS on windows, but F3–F8/PUB/INT remain NOT_RUN by design, and
+  `TEST_REPORT.json` still carries the F1-only hash. Full log in
+  `artifacts/F2-verify-core.windows.log`. This is the honest core-gate state,
+  not a regression.

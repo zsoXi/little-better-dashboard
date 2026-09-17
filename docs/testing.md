@@ -62,15 +62,24 @@ runner headless on Ubuntu (the `browser` job in
 
 ```powershell
 python tools/benchmark_dashboard.py --scenario ci      # deterministic small (10k) + large (100k)
-python tools/benchmark_dashboard.py --scenario small
+python tools/benchmark_dashboard.py --scenario small --repeats 5
+python tools/benchmark_dashboard.py --scenario ci --baseline-file path\to\df23258_opencode_dashboard.py
 ```
 
-The runner generates deterministic synthetic fixtures (fixed seed 20260917),
-extracts the baseline runtime with `git show df23258:opencode_dashboard.py`
-and measures both runtimes on identical data: cold/warm refresh time, bytes
-actually read (raw vs derived), parser calls, git subprocess calls around the
-TTL window, restart/checkpoint behaviour, rotation correctness against an
-independent oracle and `tracemalloc` tracked memory. Raw samples and the
+The runner keeps two measurement paths apart: `/api/router` driven by a
+synthetic router ledger and `/api/router` driven by the built-in Codex
+synthesizer (both runtime versions contain a synthesizer; the historical one
+has no checkpoint and no incremental read). Fixtures are deterministic (fixed
+seed 20260917); the baseline runtime comes from
+`git show df23258:opencode_dashboard.py` unless `--baseline-file` points at a
+copy - the review package ships that unchanged baseline under
+`evidence/performance/baseline/` so the benchmark is reproducible without the
+private repository. Ordinary timing stages run at least five repetitions and
+report observations, median and maximum (no p95 from five samples). Read
+bytes are classified into raw source, derived index and checkpoint scopes, so
+every "0 bytes" figure has an explicit meaning; restart is a real new
+process, memory is `tracemalloc` tracked allocations (not RSS), rotation and
+append totals are checked against an independent oracle. Raw samples and the
 summary land in `artifacts/performance/`; the per-ID evidence logs are
 `artifacts/PERF-T01..T06.windows.log`. No speed promises are made - the
-acceptance is bounded reads and explicit correctness checks.
+acceptance is bounded reads, explicit scopes and correctness.

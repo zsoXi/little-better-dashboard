@@ -1,22 +1,27 @@
-"""Deterministic performance measurements for the dashboard (spec §22).
+"""Deterministic performance measurements for the dashboard (spec §22 / W2).
 
-Runs the baseline runtime (pre-repair commit, extracted with ``git show``)
-and the final runtime from the working tree on IDENTICAL synthetic data and
-records: cold start / first refresh time, warm refresh, bytes actually read
-(raw source vs derived index), parser calls, git subprocess calls around the
-TTL window, restart/checkpoint behaviour, rotation/truncate correctness and
-tracked memory (``tracemalloc`` - tracked memory, not process RSS). A simple
-independent oracle re-parses the same files and the payload totals are
-compared with it, so every sample has an explicit correctness check.
+Two measurement paths, kept apart on purpose:
 
-Samples and per-PERF-ID logs land in ``artifacts/``; numbers are never
-fabricated. Metrics that the baseline does not implement (incremental codex
-reading, restart checkpoint, bounded tail) are reported as
-``not_available_in_baseline`` with a note.
+  * router ledger path  - /api/router with --router-events pointing at a
+    synthetic usage-events.jsonl (both the historical and the final runtime
+    read this file);
+  * codex synth path    - /api/router with no router ledger, so the built-in
+    Codex synthesizer reads the rollout files (BOTH runtime versions contain
+    a synthesizer; the historical one has no checkpoint and no incremental
+    read, which the measurements expose).
+
+Byte instrumentation classifies reads into raw source bytes (rollouts,
+ledger), derived index bytes (codex_router_events.jsonl / synth files) and
+checkpoint bytes (.cache/codex_index.json), so a "0 bytes" figure always has
+an explicit scope. Restart is a REAL new process (child driver), not a dict
+reset. Ordinary timing comparisons keep at least --repeats repetitions and
+the summary reports observations, median and max (no p95 from 5 samples).
+Memory is measured with tracemalloc (tracked Python allocations, not RSS)
+for BOTH versions in the same cold scenarios.
 
 Usage:
     py -3.14 tools/benchmark_dashboard.py --scenario ci
-    py -3.14 tools/benchmark_dashboard.py --scenario small --baseline-ref df23258
+    py -3.14 tools/benchmark_dashboard.py --scenario small --baseline-file path/to/df23258_opencode_dashboard.py
 """
 import argparse
 import builtins
@@ -25,10 +30,10 @@ import importlib.util
 import json
 import os
 import platform
-import random
 import secrets
 import shutil
 import sqlite3
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -91,11 +96,9 @@ def _ledger_event(i):
 
 
 def generate_fixture(root, spec, seed=SEED):
-    rng = random.Random(seed)
     codex = root / "codex" / "sessions"
     codex.mkdir(parents=True)
     per_file = max(1, spec["events"] // spec["files"])
-    codex_bytes = 0
     for f in range(spec["files"]):
         sub = codex / ("nested%d" % f)
         sub.mkdir()
@@ -112,12 +115,10 @@ def generate_fixture(root, spec, seed=SEED):
             for i in range(per_file):
                 rec = _rollout_event(f * per_file + i, spec["long_every"])
                 fh.write(json.dumps(rec) + "\n")
-        codex_bytes += path.stat().st_size
     ledger = root / "usage-events.jsonl"
     with open(ledger, "w", encoding="utf-8", newline="") as fh:
         for i in range(spec["events"]):
             fh.write(json.dumps(_ledger_event(i)) + "\n")
-    ledger_bytes = ledger.stat().st_size
     db = root / "bench.db"
     con = sqlite3.connect(str(db))
     con.executescript(FIXTURE_SCHEMA)
@@ -152,8 +153,46 @@ def generate_fixture(root, spec, seed=SEED):
     con.commit()
     con.close()
     return {"root": root, "codex": codex, "ledger": ledger, "db": db,
-            "repo": repo, "codex_bytes": codex_bytes,
-            "ledger_bytes": ledger_bytes}
+            "repo": repo}
+
+
+def fixture_counts(fixture, spec):
+    rollout_files = sorted(fixture["codex"].rglob("rollout-*.jsonl"))
+    lines = 0
+    usage = 0
+    meta = 0
+    for p in rollout_files:
+        with open(p, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                lines += 1
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("type") == "token_usage_record":
+                    usage += 1
+                else:
+                    meta += 1
+    ledger_lines = 0
+    with open(fixture["ledger"], "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.strip():
+                ledger_lines += 1
+    return {
+        "events": spec["events"],
+        "rollout_files": len(rollout_files),
+        "rollout_lines": lines,
+        "rollout_usage_records": usage,
+        "rollout_metadata_records": meta,
+        "rollout_bytes": sum(p.stat().st_size for p in rollout_files),
+        "ledger_lines": ledger_lines,
+        "ledger_bytes": fixture["ledger"].stat().st_size,
+        "days": 1,
+        "ledger_models": 3,
+    }
 
 
 def oracle_totals(path):
@@ -178,11 +217,7 @@ def oracle_totals(path):
 
 
 def oracle_ledger_window(path, k, cap=30000):
-    """(sum of the last k ledger events, total_lines, k_used).
-
-    When the payload does not expose candidate_lines (baseline runtime),
-    fall back to the documented bounded window cap.
-    """
+    """(sum of the last k ledger events, total_lines, k_used)."""
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         lines = fh.readlines()
     total_lines = len(lines)
@@ -201,75 +236,100 @@ def oracle_ledger_window(path, k, cap=30000):
 
 
 # --------------------------------------------------------------------------
-# Instrumentation
+# Instrumentation (read bytes classified by scope)
 # --------------------------------------------------------------------------
 class Instruments:
     def __init__(self):
         self.lock = threading.Lock()
-        self.bytes_read = 0
+        self.kinds = {"raw": 0, "derived": 0, "checkpoint": 0, "other": 0}
         self.json_calls = 0
         self.git_calls = 0
         self.root = ""
+        self.ledger = ""
+        self.synth = ""
+        self.cache = ""
         self._real_open = builtins.open
         self._real_loads = json.loads
         self._real_run = subprocess.run
-        self.open_patched = None
-        self.loads_patched = None
-        self.run_patched = None
+        self._real_read_bytes = Path.read_bytes
+        self._real_read_text = Path.read_text
+        self._real_read_bytes = Path.read_bytes
+        self._real_read_text = Path.read_text
+        self.installed = False
 
     def reset(self):
         with self.lock:
-            self.bytes_read = 0
+            self.kinds = {"raw": 0, "derived": 0, "checkpoint": 0, "other": 0}
             self.json_calls = 0
             self.git_calls = 0
 
     def snapshot(self):
         with self.lock:
-            return {"bytes_read": self.bytes_read,
+            kinds = dict(self.kinds)
+            return {"bytes_raw": kinds["raw"],
+                    "bytes_derived": kinds["derived"],
+                    "bytes_checkpoint": kinds["checkpoint"],
+                    "bytes_other": kinds["other"],
+                    "bytes_total": sum(kinds.values()),
                     "json_calls": self.json_calls,
                     "git_calls": self.git_calls}
 
-    def install(self, root):
+    def _kind(self, path):
+        p = str(path)
+        if p == self.ledger:
+            return "raw"
+        if p.startswith(self.cache):
+            return "checkpoint"
+        if p == self.synth or "synth" in Path(p).name:
+            return "derived"
+        if p.startswith(self.root):
+            return "raw" if (Path(self.root) / "codex") in Path(p).parents \
+                else "other"
+        return None
+
+    def install(self, root, ledger, synth, cache):
+        if self.installed:
+            self.uninstall()
         self.root = str(root)
+        self.ledger = str(ledger)
+        self.synth = str(synth)
+        self.cache = str(cache)
         real_open = self._real_open
+        counter = self
 
         def counting_open(file, mode="r", *a, **k):
             fh = real_open(file, mode, *a, **k)
             try:
-                path = str(file)
-                if "r" in str(mode) and path.startswith(self.root):
-                    counter = self
-
-                    class _Counted:
-                        def read(self, *aa, **kk):
-                            data = fh.read(*aa, **kk)
-                            with counter.lock:
-                                counter.bytes_read += len(data)
-                            return data
-
-                        def __iter__(self):
-                            return self
-
-                        def __next__(self):
-                            line = next(fh)
-                            try:
+                if "r" in str(mode):
+                    kind = counter._kind(file)
+                    if kind is not None:
+                        class _Counted:
+                            def read(self, *aa, **kk):
+                                data = fh.read(*aa, **kk)
                                 with counter.lock:
-                                    counter.bytes_read += len(line)
-                            except TypeError:
-                                pass
-                            return line
+                                    counter.kinds[kind] += len(data)
+                                return data
 
-                        def __getattr__(self, name):
-                            return getattr(fh, name)
+                            def __iter__(self):
+                                return self
 
-                        def __enter__(self):
-                            fh.__enter__()
-                            return self
+                            def __next__(self):
+                                line = next(fh)
+                                with counter.lock:
+                                    counter.kinds[kind] += len(line)
+                                return line
 
-                        def __exit__(self, *exc):
-                            return fh.__exit__(*exc)
+                            def __getattr__(self, name):
+                                return getattr(fh, name)
 
-                    return _Counted()
+                            def __enter__(self):
+                                fh.__enter__()
+                                return self
+
+                            def __exit__(self, *exc):
+                                return fh.__exit__(*exc)
+
+                        return _Counted()
             except Exception:
                 pass
             return fh
@@ -290,25 +350,186 @@ class Instruments:
                     self.git_calls += 1
             return self._real_run(*a, **k)
 
+        def counting_read_bytes(p):
+            data = counter._real_read_bytes(p)
+            kind = counter._kind(p)
+            if kind is not None:
+                with counter.lock:
+                    counter.kinds[kind] += len(data)
+            return data
+
+        def counting_read_text(p, *a, **k):
+            txt = counter._real_read_text(p, *a, **k)
+            kind = counter._kind(p)
+            if kind is not None:
+                with counter.lock:
+                    counter.kinds[kind] += len(txt)
+            return txt
+
+        Path.read_bytes = counting_read_bytes
+        Path.read_text = counting_read_text
         builtins.open = counting_open
         json.loads = counting_loads
         subprocess.run = counting_run
-        self.open_patched, self.loads_patched, self.run_patched = (
-            counting_open, counting_loads, counting_run)
+        self.installed = True
 
     def uninstall(self):
-        if self.open_patched is not None:
+        if self.installed:
             builtins.open = self._real_open
             json.loads = self._real_loads
             subprocess.run = self._real_run
+            Path.read_bytes = self._real_read_bytes
+            Path.read_text = self._real_read_text
+            self.installed = False
 
 
 INSTR = Instruments()
 
+_RESTART_DRIVER = r'''
+import builtins, hashlib, importlib.util, json, os, secrets, statistics, sys, threading, time
+import tracemalloc
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
+from pathlib import Path
 
-# --------------------------------------------------------------------------
-# Runtime loading and server driving
-# --------------------------------------------------------------------------
+runtime_file, run_root, home = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
+os.environ["HOME"] = home
+os.environ["USERPROFILE"] = home
+os.environ["LOCALAPPDATA"] = home
+
+counts = {"raw": 0, "derived": 0, "checkpoint": 0, "other": 0}
+codex_dir = run_root / "codex" / "sessions"
+synth = run_root / "synth.jsonl"
+cache = run_root / "cache"
+real_open = builtins.open
+
+def kind_of(p):
+    p = str(p)
+    if p.startswith(str(cache)):
+        return "checkpoint"
+    if p == str(synth) or "synth" in Path(p).name:
+        return "derived"
+    if p.startswith(str(run_root)):
+        return "raw" if (run_root / "codex") in Path(p).parents else "other"
+    return None
+
+def counting_open(file, mode="r", *a, **k):
+    fh = real_open(file, mode, *a, **k)
+    try:
+        if "r" in str(mode):
+            kind = kind_of(file)
+            if kind is not None:
+                class C:
+                    def read(self, *aa, **kk):
+                        d = fh.read(*aa, **kk); counts[kind] += len(d); return d
+                    def __iter__(self):
+                        return self
+                    def __next__(self):
+                        line = next(fh); counts[kind] += len(line); return line
+                    def __getattr__(self, n):
+                        return getattr(fh, n)
+                    def __enter__(self):
+                        fh.__enter__(); return self
+                    def __exit__(self, *e):
+                        return fh.__exit__(*e)
+                return C()
+    except Exception:
+        pass
+    return fh
+
+builtins.open = counting_open
+
+real_read_bytes = Path.read_bytes
+real_read_text = Path.read_text
+
+def counting_read_bytes(p):
+    data = real_read_bytes(p)
+    k = kind_of(p)
+    if k is not None:
+        counts[k] += len(data)
+    return data
+
+def counting_read_text(p, *a, **kk):
+    txt = real_read_text(p, *a, **kk)
+    k = kind_of(p)
+    if k is not None:
+        counts[k] += len(txt)
+    return txt
+
+Path.read_bytes = counting_read_bytes
+Path.read_text = counting_read_text
+
+spec = importlib.util.spec_from_file_location("restart_bench", runtime_file)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod.Handler.db_path = str(run_root / "bench.db")
+mod.Handler.router_events = None
+mod.Handler.router_limits = None
+mod.Handler.quiet = True
+for attr, value in (("CODEX_DIR", codex_dir), ("CODEX_SYNTH", synth),
+                    ("CODEX_CACHE_DIR", cache),
+                    ("CODEX_INDEX", cache / "codex_index.json")):
+    try:
+        setattr(mod, attr, value)
+    except Exception:
+        pass
+
+srv = ThreadingHTTPServer(("127.0.0.1", 0), mod.Handler)
+srv.auth_token = secrets.token_urlsafe(32)
+try:
+    mod.Handler.auth_token = srv.auth_token
+except Exception:
+    pass
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+host, port = srv.server_address
+
+total = 0.0
+for f in sorted(codex_dir.rglob("rollout-*.jsonl")):
+    with real_open(f, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("type") == "token_usage_record":
+                u = (rec.get("payload") or {}).get("usage") or {}
+                total += float(u.get("total_tokens") or 0)
+
+tracemalloc.start()
+t0 = time.perf_counter()
+conn = HTTPConnection("127.0.0.1", port, timeout=300)
+conn.request("GET", "/api/router", headers={"Authorization": "Bearer " + srv.auth_token, "X-Window-Id": "bench"})
+resp = conn.getresponse()
+body = resp.read()
+conn.close()
+dt = time.perf_counter() - t0
+cur, peak = tracemalloc.get_traced_memory()
+tracemalloc.stop()
+srv.shutdown()
+srv.server_close()
+
+try:
+    payload = json.loads(body.decode("utf-8"))
+    got = float(payload["totals"]["tokens_total"])
+except Exception:
+    got = None
+print(json.dumps({
+    "seconds": dt,
+    "bytes_raw": counts["raw"],
+    "bytes_derived": counts["derived"],
+    "bytes_checkpoint": counts["checkpoint"],
+    "bytes_other": counts["other"],
+    "tracemalloc_peak_bytes": peak,
+    "payload_total": got,
+    "oracle_total": total,
+    "correct": got is not None and abs(got - total) < 1e-6 and got > 0,
+    "http_status": resp.status,
+    "synth_present": synth.is_file(),
+    "checkpoint_present": (cache / "codex_index.json").is_file(),
+}))
+'''
+
+
 def load_runtime(path, name):
     spec = importlib.util.spec_from_file_location(name, str(path))
     mod = importlib.util.module_from_spec(spec)
@@ -335,7 +556,7 @@ def start_server(mod):
 
 
 def request(port, token, path):
-    conn = HTTPConnection("127.0.0.1", port, timeout=120)
+    conn = HTTPConnection("127.0.0.1", port, timeout=300)
     headers = {"Authorization": "Bearer " + token, "X-Window-Id": "bench"}
     conn.request("GET", path, headers=headers)
     resp = conn.getresponse()
@@ -348,177 +569,327 @@ def request(port, token, path):
     return resp.status, obj
 
 
-def run_runtime(mod, fixture, tag, samples, notes):
-    mod.Handler.db_path = str(fixture["db"])
-    mod.Handler.router_events = str(fixture["ledger"])
-    mod.Handler.router_limits = None
-    mod.Handler.quiet = True
-    for attr, value in (("CODEX_DIR", fixture["codex"]),
-                        ("CODEX_SYNTH", fixture["root"] / "synth.jsonl"),
-                        ("CODEX_CACHE_DIR", fixture["root"] / "cache"),
-                        ("CODEX_INDEX",
-                         fixture["root"] / "cache" / "codex_index.json")):
-        if hasattr(mod, attr):
-            setattr(mod, attr, value)
-    for clear in ("ROUTER_CACHE", "LOCAL_CACHE", "WINDOWS"):
-        try:
-            getattr(mod, clear).clear()
-        except Exception:
-            pass
-    server, thread, token, port = start_server(mod)
-    section = {"runtime": tag}
+def _median(rows, key):
+    vals = [r[key] for r in rows if r.get(key) is not None]
+    return statistics.median(vals) if vals else None
 
-    def sample(stage, seconds, payload_total, oracle_total=None, extra=None):
-        inst = INSTR.snapshot()
-        rec = {"stage": stage, "seconds": round(seconds, 6),
-               "bytes_read": inst["bytes_read"],
-               "json_calls": inst["json_calls"],
-               "git_calls": inst["git_calls"]}
-        if payload_total is not None:
-            rec["payload_total"] = payload_total
-        if oracle_total is not None:
-            rec["oracle_total"] = oracle_total
-            rec["correct"] = abs(payload_total - oracle_total) < 1e-6
-        if extra:
-            rec.update(extra)
+
+def _max(rows, key):
+    vals = [r[key] for r in rows if r.get(key) is not None]
+    return max(vals) if vals else None
+
+
+class RuntimeRun:
+    """One runtime version against one isolated fixture copy."""
+
+    def __init__(self, runtime_file, tag, scenario, run_root, cache_tag):
+        self.runtime_file = runtime_file
+        self.tag = tag
+        self.scenario = scenario
+        self.run_root = run_root
+        self.cache_tag = cache_tag
+        self.module_seq = 0
+        self.server = None
+        self.thread = None
+        self.token = None
+        self.port = None
+
+    # -- lifecycle -----------------------------------------------------
+    def stop(self):
+        if self.server is not None:
+            try:
+                self.server.shutdown()
+            except Exception:
+                pass
+            try:
+                self.server.server_close()
+            except Exception:
+                pass
+            self.server = None
+        if self.thread is not None:
+            self.thread.join(timeout=5)
+            self.thread = None
+
+    def clean_derived(self):
+        for p in self.run_root.glob("synth*.jsonl"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        shutil.rmtree(self.run_root / "cache", ignore_errors=True)
+
+    def fresh(self, router_events):
+        self.stop()
+        self.module_seq += 1
+        name = "bench_%s_%s_%s_%d" % (self.scenario, self.tag,
+                                     self.cache_tag, self.module_seq)
+        mod = load_runtime(self.runtime_file, name)
+        mod.Handler.db_path = str(self.run_root / "bench.db")
+        mod.Handler.router_events = (str(self.run_root / "usage-events.jsonl")
+                                     if router_events else None)
+        mod.Handler.router_limits = None
+        mod.Handler.quiet = True
+        for attr, value in (("CODEX_DIR",
+                             self.run_root / "codex" / "sessions"),
+                            ("CODEX_SYNTH", self.run_root / "synth.jsonl"),
+                            ("CODEX_CACHE_DIR", self.run_root / "cache"),
+                            ("CODEX_INDEX",
+                             self.run_root / "cache" / "codex_index.json")):
+            try:
+                setattr(mod, attr, value)
+            except Exception:
+                pass
+        for clear in ("ROUTER_CACHE", "LOCAL_CACHE", "WINDOWS"):
+            try:
+                getattr(mod, clear).clear()
+            except Exception:
+                pass
+        self.server, self.thread, self.token, self.port = start_server(mod)
+        return mod
+
+    # -- observations --------------------------------------------------
+    def obs_ledger_cold(self, memory=False):
+        self.clean_derived()
+        self.fresh(router_events=True)
+        INSTR.reset()
+        if memory:
+            tracemalloc.start()
+        t0 = time.perf_counter()
+        st, payload = request(self.port, self.token, "/api/router")
+        dt = time.perf_counter() - t0
+        peak = None
+        if memory:
+            cur, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+        rec = INSTR.snapshot()
+        total = payload["totals"]["tokens_total"] if payload else None
+        k = payload.get("candidate_lines") if payload else None
+        led, led_lines, k_used = oracle_ledger_window(
+            self.run_root / "usage-events.jsonl", k)
+        rec.update({"stage": "ledger_cold", "seconds": dt,
+                    "payload_total": total, "oracle_total": led,
+                    "correct": total is not None and abs(total - led) < 1e-6,
+                    "k_used": k_used, "lines_total": led_lines,
+                    "scope": "window" if k_used < led_lines else "full",
+                    "http_status": st})
+        if peak is not None:
+            rec["tracemalloc_peak_bytes"] = peak
+        return rec
+
+    def obs_ledger_warm(self):
+        INSTR.reset()
+        t0 = time.perf_counter()
+        st, payload = request(self.port, self.token, "/api/router")
+        dt = time.perf_counter() - t0
+        rec = INSTR.snapshot()
+        rec.update({"stage": "ledger_warm", "seconds": dt,
+                    "payload_total": payload["totals"]["tokens_total"]
+                    if payload else None,
+                    "http_status": st})
+        return rec
+
+    def obs_ledger_append(self):
+        with open(self.run_root / "usage-events.jsonl", "a",
+                  encoding="utf-8", newline="") as fh:
+            fh.write(json.dumps(_ledger_event(999999)) + "\n")
+        rec = INSTR.snapshot()
+        INSTR.reset()
+        t0 = time.perf_counter()
+        st, payload = request(self.port, self.token, "/api/router")
+        dt = time.perf_counter() - t0
+        rec2 = INSTR.snapshot()
+        total = payload["totals"]["tokens_total"] if payload else None
+        k = payload.get("candidate_lines") if payload else None
+        led, led_lines, k_used = oracle_ledger_window(
+            self.run_root / "usage-events.jsonl", k)
+        rec2.update({"stage": "ledger_append", "seconds": dt,
+                     "payload_total": total, "oracle_total": led,
+                     "correct": total is not None and abs(total - led) < 1e-6,
+                     "k_used": k_used, "http_status": st})
+        return rec2
+
+    def obs_ledger_rotate(self):
+        (self.run_root / "usage-events.jsonl").write_text(
+            json.dumps(_ledger_event(1)) + "\n", encoding="utf-8")
+        INSTR.reset()
+        t0 = time.perf_counter()
+        st, payload = request(self.port, self.token, "/api/router")
+        dt = time.perf_counter() - t0
+        rec = INSTR.snapshot()
+        total = payload["totals"]["tokens_total"] if payload else None
+        k = payload.get("candidate_lines") if payload else None
+        led, led_lines, k_used = oracle_ledger_window(
+            self.run_root / "usage-events.jsonl", k)
+        rec.update({"stage": "ledger_rotate", "seconds": dt,
+                    "payload_total": total, "oracle_total": led,
+                    "correct": total is not None and abs(total - led) < 1e-6,
+                    "http_status": st})
+        return rec
+
+    def obs_stats_cold(self):
+        INSTR.reset()
+        t0 = time.perf_counter()
+        st, payload = request(self.port, self.token, "/api/stats")
+        dt = time.perf_counter() - t0
+        rec = INSTR.snapshot()
+        rec.update({"stage": "stats_cold", "seconds": dt, "http_status": st})
+        return rec
+
+    def obs_stats_burst(self, n=5):
+        INSTR.reset()
+        for _ in range(n):
+            request(self.port, self.token, "/api/stats")
+        rec = INSTR.snapshot()
+        rec.update({"stage": "stats_%d_refreshes" % n, "seconds": 0.0})
+        return rec
+
+    def obs_stats_after_ttl(self, wait=11.0):
+        time.sleep(wait)
+        INSTR.reset()
+        t0 = time.perf_counter()
+        request(self.port, self.token, "/api/stats")
+        dt = time.perf_counter() - t0
+        rec = INSTR.snapshot()
+        rec.update({"stage": "stats_after_ttl", "seconds": dt})
+        return rec
+
+    def obs_synth_cold(self, memory=False):
+        self.clean_derived()
+        self.fresh(router_events=False)
+        INSTR.reset()
+        if memory:
+            tracemalloc.start()
+        t0 = time.perf_counter()
+        st, payload = request(self.port, self.token, "/api/router")
+        dt = time.perf_counter() - t0
+        peak = None
+        if memory:
+            cur, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+        rec = INSTR.snapshot()
+        total = payload["totals"]["tokens_total"] if payload else None
+        oracle = oracle_totals(self.run_root / "codex" / "sessions")
+        rec.update({"stage": "synth_cold", "seconds": dt,
+                    "payload_total": total, "oracle_total": oracle,
+                    "correct": total is not None and abs(total - oracle) < 1e-6,
+                    "http_status": st,
+                    "payload_error": (payload.get("error")
+                                      if isinstance(payload, dict) else None),
+                    "is_synth": (payload.get("is_synth")
+                                 if isinstance(payload, dict) else None),
+                    "synth_present": (self.run_root / "synth.jsonl").is_file(),
+                    "checkpoint_present":
+                        (self.run_root / "cache" / "codex_index.json").is_file()})
+        if peak is not None:
+            rec["tracemalloc_peak_bytes"] = peak
+        return rec
+
+    def obs_synth_warm(self):
+        INSTR.reset()
+        t0 = time.perf_counter()
+        st, payload = request(self.port, self.token, "/api/router")
+        dt = time.perf_counter() - t0
+        rec = INSTR.snapshot()
+        total = payload["totals"]["tokens_total"] if payload else None
+        oracle = oracle_totals(self.run_root / "codex" / "sessions")
+        rec.update({"stage": "synth_warm", "seconds": dt,
+                    "payload_total": total, "oracle_total": oracle,
+                    "correct": total is not None and abs(total - oracle) < 1e-6,
+                    "http_status": st,
+                    "payload_error": (payload.get("error")
+                                      if isinstance(payload, dict) else None)})
+        return rec
+
+    def obs_synth_append(self):
+        target = sorted((self.run_root / "codex" / "sessions")
+                        .rglob("rollout-*.jsonl"))[0]
+        with open(target, "a", encoding="utf-8", newline="") as fh:
+            fh.write(json.dumps(_rollout_event(1, 0)) + "\n")
+        INSTR.reset()
+        t0 = time.perf_counter()
+        st, payload = request(self.port, self.token, "/api/router")
+        dt = time.perf_counter() - t0
+        rec = INSTR.snapshot()
+        total = payload["totals"]["tokens_total"] if payload else None
+        oracle = oracle_totals(self.run_root / "codex" / "sessions")
+        rec.update({"stage": "synth_append", "seconds": dt,
+                    "payload_total": total, "oracle_total": oracle,
+                    "correct": total is not None and abs(total - oracle) < 1e-6,
+                    "http_status": st,
+                    "payload_error": (payload.get("error")
+                                      if isinstance(payload, dict) else None),
+                    "synth_present": (self.run_root / "synth.jsonl").is_file(),
+                    "checkpoint_present":
+                        (self.run_root / "cache" / "codex_index.json").is_file()})
+        return rec
+
+    def obs_synth_restart(self, driver, home):
+        cp = subprocess.run([sys.executable, driver, self.runtime_file,
+                             str(self.run_root), str(home)],
+                            capture_output=True, text=True, timeout=600,
+                            encoding="utf-8", errors="replace")
+        out = (cp.stdout or "").strip()
+        err = (cp.stderr or "").strip()
+        if cp.returncode != 0 or not out:
+            return {"stage": "synth_restart", "correct": False,
+                    "seconds": None,
+                    "detail": "rc=%s stderr=%s stdout=%s"
+                              % (cp.returncode, err[-300:], out[-300:])}
+        try:
+            rec = json.loads(out.splitlines()[-1])
+        except ValueError:
+            return {"stage": "synth_restart", "correct": False,
+                    "seconds": None,
+                    "detail": "unparsable child output: %s" % out[-300:]}
+        rec["stage"] = "synth_restart"
+        if not rec.get("correct"):
+            rec["detail"] = ("child: http=%s payload=%s oracle=%s synth=%s "
+                             "checkpoint=%s" % (
+                                 rec.get("http_status"),
+                                 rec.get("payload_total"),
+                                 rec.get("oracle_total"),
+                                 rec.get("synth_present"),
+                                 rec.get("checkpoint_present")))
+        return rec
+
+
+def run_version(runtime_file, tag, scenario, spec, run_root, driver, home,
+                repeats, samples, notes):
+    run = RuntimeRun(runtime_file, tag, scenario, run_root, tag)
+
+    def push(rec, repeat=None):
+        rec["scenario"] = scenario
+        rec["runtime"] = tag
+        if repeat is not None:
+            rec["repeat"] = repeat
         samples.append(rec)
         return rec
 
     try:
-        # S1 cold start / first refresh
+        for i in range(repeats):
+            push(run.obs_ledger_cold(memory=(i == 0)), i + 1)
         INSTR.reset()
-        tracemalloc.start()
-        t0 = time.perf_counter()
-        st, payload = request(port, token, "/api/router")
-        dt = time.perf_counter() - t0
-        cur, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-        total = payload["totals"]["tokens_total"] if payload else None
-        k = payload.get("candidate_lines") if payload else None
-        led, led_lines, k_used = oracle_ledger_window(fixture["ledger"], k)
-        sample("cold_first_refresh", dt, total, led,
-               {"http_status": st, "tracemalloc_peak_bytes": peak,
-                "tracemalloc_current_bytes": cur,
-                "window_mode": payload.get("window_mode") if payload else None,
-                "candidate_lines": k, "lines_total": led_lines,
-                "k_used": k_used,
-                "scope": "window" if k_used < led_lines else "full"})
-        # S2 warm refresh
-        INSTR.reset()
-        t0 = time.perf_counter()
-        st, payload = request(port, token, "/api/router")
-        dt = time.perf_counter() - t0
-        sample("warm_refresh", dt,
-               payload["totals"]["tokens_total"] if payload else None, None,
-               {"http_status": st})
-        # S3 append: ledger (both runtimes) and codex (final only)
-        with open(fixture["ledger"], "a", encoding="utf-8", newline="") as fh:
-            fh.write(json.dumps(_ledger_event(999999)) + "\n")
-        extra_bytes = len(json.dumps(_ledger_event(999999))) + 1
-        INSTR.reset()
-        t0 = time.perf_counter()
-        st, payload = request(port, token, "/api/router")
-        dt = time.perf_counter() - t0
-        total2 = payload["totals"]["tokens_total"] if payload else None
-        rec = sample("append_refresh", dt, total2,
-                     extra={"appended_bytes": extra_bytes,
-                            "http_status": st})
-        k2 = payload.get("candidate_lines") if payload else None
-        led2, led2_lines, k2_used = oracle_ledger_window(fixture["ledger"], k2)
-        rec["oracle_total"] = led2
-        rec["lines_total"] = led2_lines
-        rec["k_used"] = k2_used
-        rec["scope"] = "window" if k2_used < led2_lines else "full"
-        rec["correct"] = (total2 is not None
-                          and abs(total2 - led2) < 1e-6)
-        codex_file = sorted(fixture["codex"].rglob("rollout-*.jsonl"))[0]
-        if tag == "final":
-            with open(codex_file, "a", encoding="utf-8", newline="") as fh:
-                rec = _rollout_event(1, 0)
-                fh.write(json.dumps(rec) + "\n")
-            try:
-                mod.Handler.router_events = None
-                INSTR.reset()
-                t0 = time.perf_counter()
-                st, payload = request(port, token, "/api/router")
-                dt = time.perf_counter() - t0
-                total3 = payload["totals"]["tokens_total"] if payload else None
-                rec3 = sample("codex_append_incremental", dt, total3,
-                              extra={"appended_bytes":
-                                     len(json.dumps(rec)) + 1,
-                                     "http_status": st})
-                codex2 = oracle_totals(fixture["codex"])
-                rec3["oracle_total"] = codex2
-                rec3["correct"] = (total3 is not None
-                                   and abs(total3 - codex2) < 1e-6)
-            finally:
-                mod.Handler.router_events = str(fixture["ledger"])
-        else:
-            notes.append(
-                "codex_append_incremental: not_available_in_baseline "
-                "(synth feature added by F6a/F6b/F6c)")
-        # S4 rotation/truncate (ledger)
-        fixture["ledger"].write_text(
-            json.dumps(_ledger_event(1)) + "\n", encoding="utf-8")
-        INSTR.reset()
-        t0 = time.perf_counter()
-        st, payload = request(port, token, "/api/router")
-        dt = time.perf_counter() - t0
-        total4 = payload["totals"]["tokens_total"] if payload else None
-        rec4 = sample("rotation_truncate", dt, total4,
-                      extra={"http_status": st})
-        k4 = payload.get("candidate_lines") if payload else None
-        led3, led3_lines, k4_used = oracle_ledger_window(fixture["ledger"], k4)
-        rec4["oracle_total"] = led3
-        rec4["lines_total"] = led3_lines
-        rec4["k_used"] = k4_used
-        rec4["correct"] = (total4 is not None
-                           and abs(total4 - led3) < 1e-6)
-        # S5 stats + git subprocess counts (TTL window)
-        INSTR.reset()
-        t0 = time.perf_counter()
-        st, payload = request(port, token, "/api/stats")
-        dt = time.perf_counter() - t0
-        sample("stats_cold", dt, None, None, {"http_status": st})
-        INSTR.reset()
-        for _ in range(5):
-            request(port, token, "/api/stats")
-        sample("stats_5_refreshes", 0.0, None, None)
-        time.sleep(11.0)
-        INSTR.reset()
-        t0 = time.perf_counter()
-        request(port, token, "/api/stats")
-        dt = time.perf_counter() - t0
-        sample("stats_after_ttl", dt, None, None)
-        # S6 restart/checkpoint (final only)
-        if tag == "final":
-            INSTR.reset()
-            server2, thread2, tok2, port2 = start_server(mod)
-            try:
-                t0 = time.perf_counter()
-                st, payload = request(port2, tok2, "/api/router")
-                dt = time.perf_counter() - t0
-                total5 = payload["totals"]["tokens_total"] if payload else None
-                rec5 = sample("restart_with_checkpoint", dt, total5,
-                              extra={"http_status": st})
-                oc5 = led3
-                rec5["oracle_total"] = oc5
-                rec5["correct"] = (total5 is not None
-                                   and abs(total5 - oc5) < 1e-6)
-            finally:
-                server2.shutdown()
-                server2.server_close()
-                thread2.join(timeout=5)
-        else:
-            notes.append(
-                "restart_with_checkpoint: not_available_in_baseline "
-                "(checkpoint added by F6c)")
-        section["samples"] = samples
-        return section
+        request(run.port, run.token, "/api/stats")  # settle caches
+        for i in range(repeats):
+            push(run.obs_ledger_warm(), i + 1)
+        for i in range(repeats):
+            push(run.obs_ledger_append(), i + 1)
+        push(run.obs_ledger_rotate())
+        push(run.obs_stats_cold())
+        push(run.obs_stats_burst())
+        push(run.obs_stats_after_ttl())
+        for i in range(repeats):
+            push(run.obs_synth_cold(memory=(i == 0)), i + 1)
+        for i in range(repeats):
+            push(run.obs_synth_warm(), i + 1)
+        for i in range(repeats):
+            push(run.obs_synth_append(), i + 1)
+        run.stop()
+        for i in range(repeats):
+            push(run.obs_synth_restart(driver, home), i + 1)
+        return run
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
+        run.stop()
 
 
 def _git_show(ref, relpath, out_path):
@@ -531,47 +902,49 @@ def _git_show(ref, relpath, out_path):
     return out_path
 
 
-def _write_perf_logs(samples_by_scenario, env, notes):
-    per_id = {i: [] for i in range(1, 7)}
+def _write_perf_logs(summary, env, notes, out_dir):
+    def block(stage):
+        lines = []
+        for scenario, per in summary.items():
+            for tag in ("baseline", "final"):
+                rows = per.get(tag, {}).get(stage)
+                if not rows:
+                    continue
+                med = _median(rows, "seconds")
+                mx = _max(rows, "seconds")
+                r0 = rows[0]
+                line = ("%s %s n=%d seconds_median=%s seconds_max=%s "
+                        "bytes_raw=%s bytes_derived=%s bytes_checkpoint=%s "
+                        "json=%s git=%s" % (
+                            scenario, tag, len(rows), med, mx,
+                            r0.get("bytes_raw"), r0.get("bytes_derived"),
+                            r0.get("bytes_checkpoint"), r0.get("json_calls"),
+                            r0.get("git_calls")))
+                if r0.get("payload_total") is not None:
+                    line += " payload=%s oracle=%s correct=%s" % (
+                        r0.get("payload_total"), r0.get("oracle_total"),
+                        r0.get("correct"))
+                if r0.get("tracemalloc_peak_bytes") is not None:
+                    line += " tracemalloc_peak_bytes=%s" % (
+                        r0["tracemalloc_peak_bytes"])
+                if r0.get("scope"):
+                    line += " scope=%s" % r0["scope"]
+                lines.append(line)
+        return lines
 
-    def add(idx, line):
-        per_id[idx].append(line)
-
-    add(1, "environment=%s" % json.dumps(env, sort_keys=True))
-    for scenario, section in samples_by_scenario.items():
-        for tag, data in section.items():
-            for s in data["samples"]:
-                line = "%s runtime=%s stage=%s seconds=%s bytes=%s " \
-                       "json=%s git=%s" % (scenario, tag, s["stage"],
-                                           s["seconds"], s["bytes_read"],
-                                           s["json_calls"], s["git_calls"])
-                if "payload_total" in s:
-                    line += " payload_total=%s" % s["payload_total"]
-                if "oracle_total" in s:
-                    line += " oracle_total=%s correct=%s" % (
-                        s["oracle_total"], s["correct"])
-                if "tracemalloc_peak_bytes" in s:
-                    line += " tracemalloc_peak=%s" % s[
-                        "tracemalloc_peak_bytes"]
-                if s["stage"] == "cold_first_refresh":
-                    add(2, line)
-                elif s["stage"] in ("warm_refresh", "append_refresh",
-                                    "codex_append_incremental"):
-                    add(3, line)
-                elif s["stage"] in ("rotation_truncate",
-                                    "restart_with_checkpoint"):
-                    add(4, line)
-                elif s["stage"].startswith("stats"):
-                    add(5, line)
-                if "tracemalloc_peak_bytes" in s or "long" in scenario:
-                    add(6, line)
-    for idx in range(1, 7):
-        if not per_id[idx]:
-            per_id[idx].append("no samples")
-    for idx, lines in per_id.items():
-        (ARTIFACTS / ("PERF-T0%d.windows.log" % idx)).write_text(
-            "\n".join(lines) + "\n", encoding="utf-8")
-    (ARTIFACTS / "PERF-notes.windows.log").write_text(
+    t01 = ["environment=%s" % json.dumps(env, sort_keys=True)]
+    t02 = block("ledger_cold") + block("synth_cold")
+    t03 = block("ledger_warm") + block("ledger_append") + \
+        block("synth_warm") + block("synth_append")
+    t04 = block("ledger_rotate") + block("synth_restart")
+    t05 = block("stats_cold") + block("stats_5_refreshes") + \
+        block("stats_after_ttl")
+    t06 = block("ledger_cold") + block("synth_cold")
+    for idx, lines in ((1, t01), (2, t02), (3, t03), (4, t04), (5, t05),
+                       (6, t06)):
+        (out_dir / ("PERF-T0%d.windows.log" % idx)).write_text(
+            "\n".join(lines or ["no samples"]) + "\n", encoding="utf-8")
+    (out_dir / "PERF-notes.windows.log").write_text(
         "\n".join(notes) + "\n", encoding="utf-8")
 
 
@@ -581,20 +954,32 @@ def main(argv=None):
                         choices=["ci", "small", "large"],
                         help="ci = deterministic small+large profile")
     parser.add_argument("--baseline-ref", default=BASELINE_REF_DEFAULT,
-                        help="git ref of the pre-repair runtime")
+                        help="git ref of the historical runtime")
+    parser.add_argument("--baseline-file", default="",
+                        help="use this runtime file instead of git show "
+                             "(needed when running from the review package)")
+    parser.add_argument("--repeats", type=int, default=5)
     args = parser.parse_args(argv)
 
     scenarios = ["small", "large"] if args.scenario == "ci" else [args.scenario]
     ARTIFACTS.mkdir(exist_ok=True)
     PERF_DIR.mkdir(exist_ok=True)
     notes = []
-    samples_by_scenario = {}
+    samples = []
+    summary = {}
 
     tmp = tempfile.TemporaryDirectory(prefix="perf-bench-")
     perf_root = Path(tmp.name)
     baseline_file = perf_root / "baseline_dashboard.py"
-    _git_show(args.baseline_ref, "opencode_dashboard.py", baseline_file)
+    if args.baseline_file:
+        shutil.copyfile(args.baseline_file, baseline_file)
+        baseline_source = args.baseline_file
+    else:
+        _git_show(args.baseline_ref, "opencode_dashboard.py", baseline_file)
+        baseline_source = "git show %s:opencode_dashboard.py" % args.baseline_ref
     final_file = REPO_ROOT / "opencode_dashboard.py"
+    driver = perf_root / "restart_driver.py"
+    driver.write_text(_RESTART_DRIVER, encoding="utf-8")
 
     env = {
         "started_at": datetime.now().isoformat(timespec="seconds"),
@@ -602,76 +987,77 @@ def main(argv=None):
         "python": sys.version.split()[0],
         "platform": platform.platform(),
         "seed": SEED,
-        "baseline_ref": args.baseline_ref,
+        "repeats": args.repeats,
+        "baseline_source": baseline_source,
         "baseline_sha256": hashlib.sha256(
             baseline_file.read_bytes()).hexdigest(),
         "final_sha256": hashlib.sha256(final_file.read_bytes()).hexdigest(),
+        "runner_sha256": hashlib.sha256(
+            Path(__file__).read_bytes()).hexdigest(),
         "git_head": subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=str(REPO_ROOT),
             capture_output=True, text=True).stdout.strip(),
-        "memory_method": "tracemalloc (tracked memory, not process RSS)",
+        "memory_method": "tracemalloc tracked Python allocations (not RSS)",
+        "instrumentation": "builtins.open read counting classified into "
+                           "raw source / derived index / checkpoint bytes",
     }
 
-    INSTR.install(perf_root)
+    INSTR.install(perf_root, perf_root / "unused-ledger.jsonl",
+                  perf_root / "unused-synth.jsonl", perf_root / "unused-cache")
     try:
         for scenario in scenarios:
             spec = SCENARIOS[scenario]
             src = perf_root / ("fixture_" + scenario)
             src.mkdir()
-            gen = generate_fixture(src, spec)
-            env.setdefault("scenario_sizes", {})[scenario] = {
-                "events": spec["events"], "files": spec["files"],
-                "codex_dir_bytes": sum(
-                    p.stat().st_size for p in gen["codex"].rglob("*.jsonl")),
-                "ledger_bytes": gen["ledger"].stat().st_size,
-            }
-            section = {}
+            generate_fixture(src, spec)
+            env.setdefault("scenario_sizes", {})[scenario] = fixture_counts(
+                {"root": src, "codex": src / "codex" / "sessions",
+                 "ledger": src / "usage-events.jsonl"}, spec)
+            summary[scenario] = {}
             for tag, runtime_file in (("baseline", baseline_file),
                                       ("final", final_file)):
                 run_root = perf_root / ("run_%s_%s" % (scenario, tag))
                 shutil.copytree(src, run_root)
-                fixture = {"root": run_root,
-                           "codex": run_root / "codex" / "sessions",
-                           "ledger": run_root / "usage-events.jsonl",
-                           "db": run_root / "bench.db",
-                           "repo": run_root / "repo",
-                           "codex_bytes": 0, "ledger_bytes": 0}
-                # isolated HOME before importing each runtime
                 home = perf_root / ("home_%s_%s" % (scenario, tag))
                 home.mkdir()
                 os.environ["HOME"] = str(home)
                 os.environ["USERPROFILE"] = str(home)
                 os.environ["LOCALAPPDATA"] = str(home)
-                mod = load_runtime(runtime_file, "bench_%s_%s"
-                                   % (scenario, tag))
-                section[tag] = run_runtime(mod, fixture, tag, [], notes)
-            samples_by_scenario[scenario] = section
+                INSTR.install(run_root, run_root / "usage-events.jsonl",
+                              run_root / "synth.jsonl", run_root / "cache")
+                run_version(runtime_file, tag, scenario, spec, run_root,
+                            driver, home, args.repeats, samples, notes)
+                per = {}
+                for s in samples:
+                    if s.get("scenario") != scenario or s.get("runtime") != tag:
+                        continue
+                    per.setdefault(s["stage"], []).append(s)
+                summary[scenario][tag] = per
     finally:
         INSTR.uninstall()
 
     raw = PERF_DIR / "PERF-samples.windows.jsonl"
     with open(raw, "w", encoding="utf-8", newline="") as fh:
-        for scenario, section in samples_by_scenario.items():
-            for tag, data in section.items():
-                for s in data["samples"]:
-                    row = dict(s)
-                    row["runtime"] = tag
-                    row["scenario"] = scenario
-                    fh.write(json.dumps(row) + "\n")
-    env["scenario_events"] = {k: v["events"] for k, v in SCENARIOS.items()}
+        for scenario in scenarios:
+            for tag in ("baseline", "final"):
+                for s in samples:
+                    if s.get("scenario") != scenario or s.get("runtime") != tag:
+                        continue
+                    fh.write(json.dumps(s) + "\n")
     env["finished_at"] = datetime.now().isoformat(timespec="seconds")
     (PERF_DIR / "PERF-summary.windows.json").write_text(
-        json.dumps({"environment": env, "samples": samples_by_scenario,
-                    "notes": notes}, indent=1), encoding="utf-8")
-    _write_perf_logs(samples_by_scenario, env, notes)
-    for scenario, section in samples_by_scenario.items():
-        for tag, data in section.items():
-            bad = [s for s in data["samples"] if s.get("correct") is False]
-            if bad:
-                print("INCORRECT totals: %s %s %r" % (scenario, tag, bad))
-                return 1
-    print("benchmark done: scenarios=%s samples=%s"
-          % (",".join(scenarios), raw))
+        json.dumps({"environment": env, "summary": summary, "notes": notes},
+                   indent=1), encoding="utf-8")
+    _write_perf_logs(summary, env, notes, ARTIFACTS)
+    bad = [s for s in samples if s.get("correct") is False]
+    if bad:
+        print("INCORRECT totals/shape: %d sample(s)" % len(bad))
+        for s in bad[:5]:
+            print(" ", s.get("scenario"), s.get("runtime"), s.get("stage"),
+                  s.get("detail") or s.get("error") or "")
+        return 1
+    print("benchmark done: scenarios=%s repeats=%s samples=%d raw=%s"
+          % (",".join(scenarios), args.repeats, len(samples), raw))
     return 0
 
 

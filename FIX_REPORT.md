@@ -774,3 +774,88 @@ Contract: spec §7 (`F3: aktywnosc historyczna nie jest stanem wykonania agenta`
 - Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
   only own PIDs/threads handled; no repo files left dirty beyond the intended
   set.
+
+# FIX_REPORT — F6b bounded router tail, line-count cache (RED -> GREEN)
+
+## F6b-1. Repo, base, tested SHA, worktree, environment
+
+- Repo: `D:\TESTY!\V3\little-better-dashboard`, branch `fix/audit-f1-f8`;
+  start HEAD `f36e26a` (F7 reports; F7 code `b911b11`).
+- Worktree: 2 files — `opencode_dashboard.py` (modified),
+  `tests/test_router_events.py` (new, untracked). A cosmetic stat-dirty flag
+  on `tests/test_synth_publish.py` (external deletion incident, content
+  proven equal) is never staged.
+- Tested hashes: `opencode_dashboard.py`
+  `sha256:9e61ca69a7f732ef6d4e22859ff2c3f7aef51272e4286e7f020e195b37988b3e`;
+  `tests/test_router_events.py`
+  `sha256:c5c632cea66bad5fdbe179aa05eb158095eb0164f51f06999180e01b505e2de1`.
+- Environment: Windows, `python` 3.14.3. Test servers `127.0.0.1:0` only
+  (never 8765/8766/8770); fixtures in temp dirs with isolated
+  HOME/USERPROFILE/LOCALAPPDATA.
+
+## F6b-2. Change (TODO -> REPRODUCED -> PATCHED -> VERIFIED -> DONE)
+
+- Contract: spec §13 — bounded tail, full synthesis history, no
+  `readlines()` of the whole file.
+- REPRODUCED (RED): `artifacts/F6b-RED.windows.log` —
+  `python -m unittest tests.test_router_events -v` -> Ran 8, FAILED
+  (failures=1, errors=7).
+- PATCHED (single pass): constants `MAX_ROUTER_RECORD_BYTES = 8 MiB`,
+  `_ROUTER_READ_BLOCK = 65536`, `_ROUTER_COUNT_CACHE = {}`; helpers
+  `_router_count_lines` (fingerprint size/mtime/ino; warm reuse; incremental
+  append; cold recount on truncate/rotation; never `readlines`),
+  `_router_read_tail` (backward byte-block reads; last N complete lines;
+  leading fragment dropped as `partial_head`; per-line byte assembly before
+  utf-8 decode; CRLF strip), `_router_stream_lines` (streaming full read;
+  `_OVERLONG` sentinel with discard-to-newline), plus `_Unterminated` /
+  `_OverlongLine` markers. `parse_router_events` returns `(events, problems)`
+  with new problems keys `candidate_lines`, `valid_records`,
+  `oversize_records`, `pending_tail_line`, `partial_head`, `window_mode`
+  (`full` | `physical_tail`), `lines_total`, `count_cached` (kept in problems
+  only — see note). `query_router_stats` parses first, `total_lines` comes
+  from the cached counter, `truncated = (not full_scan) and window_mode ==
+  "physical_tail"`; payload adds `window_mode`, `candidate_lines`,
+  `pending_tail_line`, `oversize_records`; `blank_router_stats` mirrors the
+  keys zeroed. `full_scan=True` streams the whole file (no `readlines`, no
+  silent 30 000 cap). Test-side fixes during GREEN: t01/t08 got the missing
+  `MAX_ROUTER_EVENTS` patches; t05 cap raised to 600 bytes (record ~268 B);
+  t08 `_ISO` switched to naive local timestamps (the `hour` field is local
+  time). One payload key was removed during verification: `count_cached`
+  (kept in `problems`) because it flipped between calls on an unchanged file
+  and broke the F6a-T07 no-shared-payload-mutation test.
+- VERIFIED: `python -m unittest tests.test_router_events -v` -> Ran 8, OK;
+  `python -m unittest discover -s tests` -> Ran 111, OK (30.3 s);
+  `py_compile` OK; `node --check` N/A (JS embedded; covered by source-scan
+  assertions). Logs: `artifacts/F6b-GREEN.windows.log`. Jev gate
+  (jev-1.13.0, diff 12 468 chars): round 1 `touches_local_path` 0.35 /
+  `bounded_tail_no_readlines` 0.96 / `count_cache_honest_metadata` 0.94 /
+  `oversize_and_pending_reported` 0.92; round 2 (changed-lines-only wording)
+  `touches_local_path` 0.21 LOW, others 0.95/0.94/0.92.
+- Matrix: F6b-T01..T08 rows -> real test IDs, env `windows`, PASS, evidence
+  `artifacts/F6b-GREEN.windows.log`.
+- Retries: one RED-to-GREEN cycle; one payload-key fix (`count_cached`);
+  three test-side fixture fixes.
+
+## F6b-3. Not changed (verified)
+
+- Local session-stats path untouched: `day_total`/`dayTotal`/`outMerged`,
+  token SUM SQL, cache-rate math unchanged (Jev 0.21 changed-lines-only;
+  F1/F3/F4 suites unchanged). A `LOCAL_CACHE` line appears only as diff
+  context in the constants hunk; no local code line changed.
+- Small-file behavior identical: `scanned == len(events)`, same
+  `total_lines`/`truncated` values (F1/F4/F7 suites unchanged).
+- Synthesis history not cut (no 30 000 cap in full scan); recent table still
+  capped by `MAX_ROUTER_ROWS` and sorted by parsed time.
+- Commit attribution (F7) untouched; no new dependencies (stdlib only).
+
+## F6b-4. Verify gate outcome
+
+- `python tools/verify_acceptance.py --gate core --report artifacts/TEST_REPORT.json`
+  -> FAIL (expected/honest): `artifacts/TEST_REPORT.json` is still F1-era
+  (F2..INT rows missing; report hash `sha256:ce11d08f...` != current
+  dashboard hash) -> same honest "GATE CORE FAILED (132 problem(s))" count as
+  the prior steps; the report is rebuilt at the F8-close step.
+  Log: `artifacts/F6b-verify-core.windows.log`.
+- Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
+  only own PIDs/threads handled; no repo files left dirty beyond the intended
+  set.

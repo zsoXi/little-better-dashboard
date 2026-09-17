@@ -52,13 +52,22 @@ def sha256(path):
     return h.hexdigest()
 
 
+def norm_sha256(path):
+    # EOL-normalised identity: the package ships raw git blob bytes (LF) while
+    # an autocrlf worktree may hold CRLF for the same committed file; the
+    # identity must bind the file content, not the checkout style.
+    with open(path, "rb") as fh:
+        data = fh.read()
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
+
+
 def identity():
     def group(pattern):
         out = {}
         for p in sorted(REPO_ROOT.glob(pattern)):
             if p.is_file():
                 out[str(p.relative_to(REPO_ROOT)).replace("\\", "/")] = \
-                    sha256(p)
+                    norm_sha256(p)
         return out
 
     return {

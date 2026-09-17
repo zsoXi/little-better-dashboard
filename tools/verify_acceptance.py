@@ -469,7 +469,24 @@ def main(argv=None):
                 continue
             for rel, digest in recorded.items():
                 cur = REPO_ROOT / rel
-                if not cur.is_file() or sha256_of(cur) != "sha256:" + str(digest):
+                if not cur.is_file():
+                    failures.append(
+                        f"(10) {group} file changed since the recorded "
+                        f"execution: {rel}")
+                    exec10_ok = False
+                    continue
+                want = "sha256:" + str(digest)
+                if sha256_of(cur) == want:
+                    continue
+                # EOL-normalised fallback: the package ships raw git blob
+                # bytes (LF) while an autocrlf worktree may hold CRLF for the
+                # same committed file; identity binds content, not checkout.
+                try:
+                    norm = "sha256:" + hashlib.sha256(
+                        cur.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+                except OSError:
+                    norm = ""
+                if norm != want:
                     failures.append(
                         f"(10) {group} file changed since the recorded "
                         f"execution: {rel}")

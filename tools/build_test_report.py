@@ -113,7 +113,20 @@ def main(argv=None):
     for group in ("tests", "tools"):
         for rel, digest in (ident.get(group) or {}).items():
             p = REPO_ROOT / rel
-            if not p.is_file() or sha256(p) != str(digest):
+            if not p.is_file():
+                print("ERROR: %s changed since the recorded execution: %s; "
+                      "rerun tools/run_acceptance_records.py" % (group, rel))
+                return 2
+            if sha256(p) == str(digest):
+                continue
+            # EOL-normalised fallback: identity binds content, not checkout
+            # (an autocrlf worktree may hold CRLF for a committed LF file).
+            try:
+                norm = hashlib.sha256(
+                    p.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+            except OSError:
+                norm = ""
+            if norm != str(digest):
                 print("ERROR: %s changed since the recorded execution: %s; "
                       "rerun tools/run_acceptance_records.py" % (group, rel))
                 return 2

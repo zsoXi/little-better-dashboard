@@ -674,3 +674,103 @@ Contract: spec §7 (`F3: aktywnosc historyczna nie jest stanem wykonania agenta`
 - Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
   only own PIDs/threads handled; no repo files left dirty beyond the intended
   set.
+
+# FIX_REPORT — F7 commit-window attribution honesty (RED -> GREEN)
+
+## F7-1. Repo, base, tested SHA, worktree, environment
+
+- Repo: `V3/little-better-dashboard`, branch `fix/audit-f1-f8`.
+- Base for this step: HEAD `17da6a6` ("F3 FIX_REPORT + acceptance matrix
+  (report-only)"); F3 code commit `25e76d0` precedes it.
+- Worktree during testing (3 files, uncommitted until the F7 commits):
+  `README.md`, `opencode_dashboard.py`,
+  `tests/test_commit_attribution.py` (new, intent-to-add for diffing).
+  `tests/test_synth_publish.py` carries only a cosmetic stat-dirty flag
+  (content proven equal to HEAD; never staged).
+- Tested SHA-256:
+  - `opencode_dashboard.py` =
+    `sha256:f36940bc43a0f9ca0a72e6c30b7137e7fe8df623c86834ffaa631b982643c787`
+  - `tests/test_commit_attribution.py` =
+    `sha256:41a3a690f2b7573dab0969eb6fbf92f6303b4a89c64d1dcbd128dd7ff03306b8`
+  - `README.md` =
+    `sha256:8604d252a38d9bbe1560e670773104e32a2ed2290ad14001a9956a9e74174fd7`
+- Environment: Windows, Python 3.14.3 (`python`); test servers bind
+  `127.0.0.1` port `0` only (never 8765/8766/8770); fixtures are temp git
+  repos under isolated `HOME`/`USERPROFILE`/`LOCALAPPDATA`.
+
+## F7-2. Change (TODO -> REPRODUCED -> PATCHED -> VERIFIED -> DONE)
+
+- Contract (spec §18): commit rows must present usage "in the 24h before this
+  commit" as an overlapping global window, never as commit cost; warnings must
+  be visible in UI, tooltip and export; no cwd/project inference.
+- RED: `python -m unittest tests.test_commit_attribution -v` ->
+  Ran 6, FAILED (failures=6) — all six F7 tests failed pre-patch (missing
+  `commit_windows` metadata, old "prior 24h" labels, no visible warnings, no
+  commit CSV). Log: `artifacts/F7-RED.windows.log`.
+- PATCHED (single pass, 15 edits in `opencode_dashboard.py` + README):
+  local and Codex commit panels renamed to `Usage in the 24h before each
+  commit`; visible hints added directly at both charts — Codex:
+  `Global time window; may include other projects. Windows overlap. Rows must
+  not be summed.`; local: `Project-matched time window; windows overlap; rows
+  must not be summed; not commit cost.`; tooltip label
+  `Usage in the 24h before commit` (+ Scope row on the Codex tooltip); local
+  insight reworded to `Most usage before a commit: ..., N tokens in the 24h
+  window (not commit cost).`; payloads gained `commit_windows` metadata
+  (`method: time_window`, `window_hours: 24`, `scope: global` for router and
+  blank stats / `project_time_window` for local, `overlap_possible: true`,
+  `additive: false`, note = the visible sentence); export menu gained
+  `CSV (commit windows · not additive)` writing
+  `codex-tokens-commits.csv` / `opencode-tokens-commits.csv` with explicit
+  `method/scope/overlap_possible/additive/window_hours/note` columns; README
+  Notes gained the inclusive-both-ends + global-window caveat.
+- Fixture note: the test helper initially declared a constant
+  `inputTokens=100/outputTokens=20` per event while the dashboard derives the
+  effective total as `input + output` (declared `totalTokens` is only
+  cross-checked via `total_conflicts`); fixed `_events` to emit per-row
+  consistent component fields — one RED-to-GREEN cycle.
+- VERIFIED: `python -m unittest tests.test_commit_attribution -v` -> Ran 6,
+  OK; full `python -m unittest discover -s tests` -> Ran 103, OK (97 + 6).
+  Log: `artifacts/F7-GREEN.windows.log`. `py_compile` OK. `node --check` N/A
+  (no frontend files; the embedded JS is covered by the source assertions of
+  F7-T05/F7-T06).
+- Trust gate (typesafe Jev `jev-1.13.0`, diff 19455 chars, pre-commit):
+  `touches_local_path` 0.44 -> 0.53 -> 0.19 after narrowing the question to
+  the SQL/arithmetic producing local token totals (earlier rounds conflated
+  local-tab UI wording with accounting); `commit_window_meta` 0.97;
+  `boundaries_and_tz` 0.96; `ui_and_export_warnings` 0.93;
+  `no_inferred_attribution` 0.96. All rounds reported honestly.
+- Matrix: F7-T01..T06 rows updated to the real test IDs with env `windows`,
+  PASS, evidence `artifacts/F7-GREEN.windows.log`.
+
+## F7-3. Not changed (verified)
+
+- No cwd/project filtering implemented now (spec): the Codex window stays
+  global; a commit never claims precise project attribution; no
+  title/folder/subsystem inference anywhere in the router commit block
+  (asserted by F7-T06).
+- 24h window semantics kept as before; boundaries documented and tested as
+  inclusive on both ends (F7-T03); timestamps normalized via
+  `_router_time_key` so equal instants with different offsets match (F7-T04).
+- Commit rows are never summed to global cost: global totals come from source
+  events (F7-T01 proves 120 vs 240 in overlapping windows).
+- Local accounting untouched (`day_total`/`dayTotal`/`outMerged`, SQL sums,
+  cache-rate): Jev `touches_local_path` 0.19 with the narrowed question;
+  skeleton regression tests still pass.
+- `equal-split` file description kept honest (not a measure of edit cost);
+  commit history untouched (no deletion/rewrite).
+- Known remaining (honest): rows still expose only the 24h window intent, not
+  a per-project adapter (`cwd` absent upstream), per spec.
+
+## F7-4. Verify gate outcome
+
+- `python tools/verify_acceptance.py --gate core --report artifacts/TEST_REPORT.json`
+  -> FAIL (expected/honest): all 131 canonical IDs present and 131
+  core-mandatory marked; PASS evidence files exist; but
+  `artifacts/TEST_REPORT.json` is still F1-era (F2..INT rows missing, report
+  hash `sha256:ce11d08f...` != current `sha256:f36940bc...`) ->
+  "GATE CORE FAILED (132 problem(s))" (same honest count as the prior steps;
+  the report is rebuilt at the F8-close step).
+  Log: `artifacts/F7-verify-core.windows.log`.
+- Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
+  only own PIDs/threads handled; no repo files left dirty beyond the intended
+  set.

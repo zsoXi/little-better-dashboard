@@ -114,12 +114,12 @@ one row per single environment (`windows` or `linux`).
 | F6f-T02 | F6f | tests/test_inspector.py::TestInspector::test_inspector_display_helpers_pure | windows+linux | core+release | NOT_RUN | - |
 | F6f-T03 | F6f | tests/test_inspector.py::TestInspector::test_inspector_display_helpers_pure | windows+linux | core+release | NOT_RUN | - |
 | F6f-T04 | F6f | tests/test_inspector.py::TestInspector::test_inspector_display_helpers_pure | windows+linux | core+release | NOT_RUN | - |
-| F7-T01 | F7 | tools/run_browser_tests.py::browser-case F7-T01 | windows+linux+browser | core+release | NOT_RUN | - |
-| F7-T02 | F7 | tools/run_browser_tests.py::browser-case F7-T02 | windows+linux+browser | core+release | NOT_RUN | - |
-| F7-T03 | F7 | tools/run_browser_tests.py::browser-case F7-T03 | windows+linux+browser | core+release | NOT_RUN | - |
-| F7-T04 | F7 | tools/run_browser_tests.py::browser-case F7-T04 | windows+linux+browser | core+release | NOT_RUN | - |
-| F7-T05 | F7 | tools/run_browser_tests.py::browser-case F7-T05 | windows+linux+browser | core+release | NOT_RUN | - |
-| F7-T06 | F7 | tools/run_browser_tests.py::browser-case F7-T06 | windows+linux+browser | core+release | NOT_RUN | - |
+| F7-T01 | F7 | tests/test_commit_attribution.py::TestF7CommitWindows::test_f7_t01_two_commits_share_window_not_additive | windows | core+release | PASS | artifacts/F7-GREEN.windows.log |
+| F7-T02 | F7 | tests/test_commit_attribution.py::TestF7CommitWindows::test_f7_t02_two_repos_global_scope | windows | core+release | PASS | artifacts/F7-GREEN.windows.log |
+| F7-T03 | F7 | tests/test_commit_attribution.py::TestF7CommitWindows::test_f7_t03_window_boundaries_inclusive | windows | core+release | PASS | artifacts/F7-GREEN.windows.log |
+| F7-T04 | F7 | tests/test_commit_attribution.py::TestF7CommitWindows::test_f7_t04_timezone_equivalence | windows | core+release | PASS | artifacts/F7-GREEN.windows.log |
+| F7-T05 | F7 | tests/test_commit_attribution.py::TestF7CommitWindows::test_f7_t05_warnings_in_ui_and_export | windows | core+release | PASS | artifacts/F7-GREEN.windows.log |
+| F7-T06 | F7 | tests/test_commit_attribution.py::TestF7CommitWindows::test_f7_t06_no_inferred_attribution | windows | core+release | PASS | artifacts/F7-GREEN.windows.log |
 | F8-T01 | F8 | tools/verify_acceptance.py::skeleton-case F8-T01 | windows+linux | core+release | NOT_RUN | - |
 | F8-T02 | F8 | tools/verify_acceptance.py::skeleton-case F8-T02 | windows+linux | core+release | NOT_RUN | - |
 | F8-T03 | F8 | tools/verify_acceptance.py::skeleton-case F8-T03 | windows+linux | core+release | NOT_RUN | - |

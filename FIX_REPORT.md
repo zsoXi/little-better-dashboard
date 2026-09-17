@@ -958,3 +958,115 @@ Contract: spec §7 (`F3: aktywnosc historyczna nie jest stanem wykonania agenta`
 - Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
   only own PIDs/threads handled; no repo files left dirty beyond the intended
   set.
+
+# FIX_REPORT — F6d independent refresh, deadline covering the body, honest status (RED -> GREEN)
+
+## F6d-1. Repo, base, tested SHA, worktree, environment
+
+- Repo: `D:\TESTY!\V3\little-better-dashboard`, branch `fix/audit-f1-f8`;
+  start HEAD `b97f428` (F6c reports; F6c code `7153172`).
+- Worktree: 3 files — `opencode_dashboard.py` (modified),
+  `tests/test_cache_and_git.py` (modified), `tools/run_browser_tests.py`
+  (rewritten from the honest stub into a real Playwright runner). A cosmetic
+  stat-dirty flag on `tests/test_synth_publish.py` (external deletion
+  incident, content proven equal) is never staged. `HANDOFF.md` stays
+  untracked.
+- Tested hashes: `opencode_dashboard.py`
+  `sha256:1a3a50ffd94e4a01e06b112eaa8829aa667695ff80a9cb432a4ccc8dc4fd7181`;
+  `tests/test_cache_and_git.py`
+  `sha256:a660863e2e6cab174eca7f2ae10fd7deea1b9d748827eefa320455f1bbab602c`;
+  `tools/run_browser_tests.py`
+  `sha256:25b6401a03a2c9db0de969114588362bf98061a7f86e4bbb6665159a730fe721`.
+- Environment: Windows, `python` 3.14.3; Playwright (dev-only) driving real
+  msedge headless (`channel=msedge`); test servers `127.0.0.1:0` only (never
+  8765/8766/8770); fixtures in temp dirs with isolated
+  HOME/USERPROFILE/LOCALAPPDATA; no real user data read.
+
+## F6d-2. Change (TODO -> REPRODUCED -> PATCHED -> VERIFIED -> DONE)
+
+- Contract: spec §15 — independent refresh per source, deadline covering the
+  whole body, honest per-section status; T01/T02/T04/T06/T09 additionally
+  executed in a real browser over the running app (spec requirement).
+- REPRODUCED (RED): `artifacts/F6d-RED.windows.log` —
+  `python -m unittest tests.test_cache_and_git -v` -> Ran 13, FAILED
+  (failures=10) (ten new F6d checks; three skeleton checks stayed green).
+- PATCHED (frontend + backend, one pass plus three follow-up fixes):
+  - shared `fetchJson` helper: F2 auth only for local `/api/` URLs;
+    `AbortController` deadline (default 10 s, injectable via
+    `window.__ocdTimeouts.fetchMs`) covering headers, the whole body and the
+    parse (timer cleared only after the parse, in `finally`); explicit checks
+    for HTTP status, `{error:...}`, `{ok:false}` and invalid JSON; the
+    deadline rejects with `timeout after <ms> ms` before aborting, so the
+    visible error is the timeout, never a bare browser AbortError.
+  - `SECTIONS` registry of the eight sources with per-section state
+    (`state`/`gen`/`inFlight`/`lastSuccess`/`error`), an individual render
+    path, `secUnavailable` (readable unavailability, never fake zeros) and
+    `secStrip` (`#src-status` per-source line).
+  - `load()` = `Promise.allSettled(SECTIONS.map(runSection))`; results are
+    applied individually; single-flight with `pendingRefresh` coalescing
+    (timer + manual refresh + visibilitychange never queue unbounded work);
+    a hanging source cannot leave `loading=true` forever - the refresh
+    button is re-enabled when the cycle ends.
+  - honest global status: `Updated` only when 8/8 sections succeeded;
+    otherwise `Partial update: 7/8 sources (failed: <names>)`.
+  - after an error with earlier data: previous data and `lastSuccess` are
+    kept, the section turns `stale`, and the failure stays visible in the
+    status line and the source strip.
+  - generation guards for sections, search (`_ssGen`, 350 ms debounce) and
+    inspector (`_inspGen`): a late older response can never overwrite a
+    newer one; search/inspect/prompts use the same deadline; prompt loading
+    shows a readable timeout with a retry hint.
+  - 401 keeps the F2 lock behaviour (reopen the launcher link) with no
+    immediate retry loop.
+  - backend: `_CODEX_BUILD_LOCK` (`threading.Condition`) +
+    `_codex_build_in_progress` single-build gate in `ensure_codex_synth`:
+    concurrent callers share one parse; waiters block on the condition
+    (bounded to 30 s) and then reuse the published snapshot (or get an
+    honest bounded error); `notify_all` on completion; a failed or missing
+    checkpoint never blocks a publish.
+- VERIFIED:
+  - `python -m unittest tests.test_cache_and_git -v` -> Ran 13, OK.
+  - `python -m unittest discover -s tests` -> Ran 131, OK (110.7 s).
+  - PAGE JS extracted (91 576 chars) -> `node --check` OK.
+  - real-browser proof (spec-mandated): `python tools/run_browser_tests.py`
+    -> F6d-T01 PASS, F6d-T02 PASS, F6d-T04 PASS, F6d-T06 PASS, F6d-T09 PASS
+    (5/5, exit 0), headless msedge over the real dashboard on synthetic
+    sources; logs `artifacts/F6d-browser.windows.log` + `.json`, screenshots
+    in `artifacts/F6d-browser-shots/`.
+  - Jev gate (jev-1.13.0, diff 70 377 chars): `touches_local_path` 0.15 LOW /
+    `per_section_independence` 0.95 / `deadline_covers_body` 0.92 /
+    `no_fake_success` 0.94 / `single_build_bounded` 0.84.
+- Matrix: F6d-T01..T10 rows -> real test IDs, env `windows`, PASS, evidence
+  `artifacts/F6d-GREEN.windows.log`; the five browser-mandated cases are
+  additionally backed by the browser log above.
+- Retries: condition-gate fix for F6a-T03 (waiters now succeed instead of
+  raising), reject-before-abort deadline fix, evidence-copy fix in the
+  runner, T09 row-selection fix (click by matching text, not row order).
+
+## F6d-3. Not changed (verified)
+
+- Local session-stats path untouched: `day_total`/`dayTotal`/`outMerged`,
+  token SUM SQL, cache-rate math unchanged (Jev `touches_local_path` 0.15
+  changed-lines-only; F1/F3/F4 suites unchanged).
+- No runtime dependencies added; Playwright is dev-only and imported only by
+  `tools/run_browser_tests.py`; the dashboard still runs on the standard
+  library alone.
+- UI not rewritten: filters, selected tab and theme preference survive
+  re-renders; the only additions are the per-source status strip and the
+  per-section error/stale states the spec requires.
+- Checkpoint remains a derived cache (F6c): never source of truth, never
+  blocks publish.
+- Full discovery suite 131 tests green; skeleton checks of previously
+  delivered phases unchanged.
+
+## F6d-4. Verify gate outcome
+
+- `python tools/verify_acceptance.py --gate core --report artifacts/TEST_REPORT.json`
+  -> FAIL (expected/honest, exit 1): `artifacts/TEST_REPORT.json` is still
+  F1-era (F2..INT rows missing; report hash `sha256:ce11d08f...` != current
+  dashboard hash) -> same honest "GATE CORE FAILED (132 problem(s))" count as
+  the prior steps; the report is rebuilt at the F8-close step.
+  Log: `artifacts/F6d-verify-core.windows.log`.
+- Remote operations: none (no push/merge/fetch). Servers `127.0.0.1:0` only;
+  only own PIDs/threads handled; no repo files left dirty beyond the intended
+  set.

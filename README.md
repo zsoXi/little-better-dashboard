@@ -8,7 +8,7 @@ A single-file, zero-dependency usage dashboard for [OpenCode](https://github.com
 
 ## What it shows
 
-**OpenCode tab** covers sessions, turns, tokens and cost, with tokens per day, tokens by model, an activity heatmap and streaks, a session browser that includes search and a click-to-open message inspector, plus projects, warning signals, subagent runs with **live status** (running, idle or finished, auto-refreshed), agent configuration tiles, and a team graph of parent and child sessions.
+**OpenCode tab** covers sessions, turns, tokens and cost, with tokens per day, tokens by model, an activity heatmap and streaks, a session browser that includes search and a click-to-open message inspector, plus projects, warning signals, child and related sessions with **session activity** (recent, no recent activity, older or unknown — based on session updates, not execution status; auto-refreshed), agent configuration tiles, and a team graph of parent and child sessions.
 
 **Codex tab** gives the same treatment to your local Codex sessions, with request, token and model stats synthesized from your rollout files alongside a browsable session table.
 
@@ -63,7 +63,7 @@ It makes no network calls, collects no telemetry and needs no accounts.
 
 - The first start can take up to a minute on large databases while SQLite warms up.
 - Agent tiles group workers under their leads by filename convention (`tl-1`, `tl-1-w1`, and so on).
-- Subagent running and idle state is derived from session recency (active within 2 minutes, idle within 15 minutes).
+- Child-session activity comes from session update recency (recent up to 2 minutes, no recent activity up to 15 minutes, older beyond; unknown when the timestamp is missing or uninterpretable). It is not agent execution status, and a parent_id link is a session relation, not proof of delegation.
 
 ## Project layout
 

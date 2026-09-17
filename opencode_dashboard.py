@@ -446,11 +446,12 @@ def read_agent_defs():
 
 
 def query_agents(con):
-    """Subagent runs: child sessions (parent_id set) joined with parent title.
-    Status is recency-based: running if updated within RUNNING_SEC,
-    idle within IDLE_SEC, else finished."""
-    RUNNING_SEC, IDLE_SEC = 120, 900
-    STORD = {"running": 0, "idle": 1, "finished": 2}
+    """Child/related sessions (parent_id set) joined with parent title.
+    activity_state comes from session updates only: recent (0-120 s),
+    quiet (>120-900 s), stale (>900 s) or unknown (missing/invalid/future
+    timestamp). It is a history signal, not execution status; runtime_status
+    stays 'unknown' because this dashboard has no live agent API."""
+    RECENT_SEC, QUIET_SEC, LIMIT = 120, 900, 100
     now_ms = int(time.time() * 1000)
     runs = []
     for r in con.execute(
@@ -465,27 +466,32 @@ def query_agents(con):
                (SELECT COUNT(*) FROM message m WHERE m.session_id=s.id) AS msgs
         FROM session s LEFT JOIN session p ON p.id=s.parent_id
         WHERE s.parent_id IS NOT NULL AND s.parent_id != ''
-         ORDER BY s.time_created DESC LIMIT 100
-         """
-     ):
-        upd = r["time_updated"] or 0
-        age = max(0, (now_ms - upd)//1000) if upd else 10**9
-        st = "running" if age <= RUNNING_SEC else ("idle" if age <= IDLE_SEC else "finished")
+        ORDER BY s.time_updated DESC, s.id DESC LIMIT 100
+        """
+    ):
+        upd = r["time_updated"]
+        if not (isinstance(upd, int) and not isinstance(upd, bool)) or upd <= 0 or upd > now_ms:
+            age, state, upd_ms = None, "unknown", 0
+        else:
+            age = (now_ms - upd) // 1000
+            state = ("recent" if age <= RECENT_SEC
+                     else ("quiet" if age <= QUIET_SEC else "stale"))
+            upd_ms = upd
         runs.append({
             "id": r["id"], "title": r["title"] or "(untitled)",
             "agent": r["agent"] or "default", "model": r["model"] or "",
             "directory": r["directory"] or "",
             "time_created": r["time_created"] or 0,
-            "time_updated": r["time_updated"] or 0,
+            "time_updated": upd_ms,
             "parent_id": r["parent_id"],
             "parent_title": r["parent_title"] or "(unknown parent)",
             "toks": r["toks"] or 0, "msgs": r["msgs"] or 0,
-            "age_s": age, "status": st,
+            "age_s": age, "activity_state": state,
+            "runtime_status": "unknown", "relation": "child_session",
         })
-    runs.sort(key=lambda r: (STORD.get(r["status"], 9), -(r["time_created"] or 0)))
-    status_counts = {"running": 0, "idle": 0, "finished": 0}
+    activity_counts = {"recent": 0, "quiet": 0, "stale": 0, "unknown": 0}
     for r in runs:
-        status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
+        activity_counts[r["activity_state"]] += 1
     per_agent = defaultdict(lambda: {"n": 0, "toks": 0})
     for r in con.execute(
         "SELECT agent, COUNT(*) AS n FROM session WHERE parent_id IS NOT NULL AND parent_id != '' GROUP BY agent"
@@ -508,13 +514,18 @@ def query_agents(con):
            FROM session GROUP BY agent ORDER BY t DESC"""
     ):
         all_agents.append({"agent": r["agent"] or "(none)", "n": r["n"], "toks": r["t"] or 0})
+    total_child = sum(v["n"] for v in per_agent.values())
     return {"child_runs": runs,
             "child_agents": sorted(
                 [{"agent": a, "n": v["n"], "toks": v["toks"]} for a, v in per_agent.items()],
                 key=lambda x: -x["toks"]),
-            "child_total": sum(v["n"] for v in per_agent.values()),
-            "status_counts": status_counts,
-            "running_sec": RUNNING_SEC, "idle_sec": IDLE_SEC, "now_ms": now_ms,
+            "child_total": total_child,
+            "listed_count": len(runs),
+            "total_child_sessions": total_child,
+            "limit": LIMIT,
+            "truncated": total_child > LIMIT,
+            "activity_counts": activity_counts,
+            "recent_sec": RECENT_SEC, "quiet_sec": QUIET_SEC, "now_ms": now_ms,
             "all_agents": all_agents,
             "config": read_agent_defs()}
 
@@ -2282,7 +2293,7 @@ h2.sec .hint{font-family:var(--mono);font-size:11px;color:var(--subtle);font-wei
 .fchip:hover .fx{color:var(--bad)}
 .fclear{background:none;border:none;color:var(--bad);font-family:var(--sans);font-size:12px;font-weight:600;cursor:pointer;padding:3px 6px}
 .fclear:hover{text-decoration:underline}
-.tiles{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px}.tile{flex:1 1 160px;min-width:150px;max-width:230px;background:var(--chip);border:1px solid var(--line);border-radius:12px;padding:14px;cursor:pointer;transition:border-color .15s,transform .15s}.tile:hover{border-color:var(--accent);transform:translateY(-2px)}.tile.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}.tile .tn{font-weight:800;font-size:15px}.tile .tc{font-size:26px;font-weight:800;color:var(--accent);margin:4px 0}.tile .td{font-size:11.5px;color:var(--muted)}.tile-detail{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin-bottom:12px}.tile-detail .wrow{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px dashed var(--line)}.tile-detail .wrow:last-child{border-bottom:none}tr.clickable{cursor:pointer}tr.clickable:hover td{background:rgba(127,127,127,.09)}.run-detail td{background:var(--panel);font-size:12px;color:var(--muted)}.kv{display:inline-block;margin:2px 14px 2px 0}.kv b{color:var(--text)}.dot{display:inline-block;width:11px;height:11px;border-radius:50%;margin:2px 2px 4px}.dot.running{background:#4ade80;box-shadow:0 0 8px #4ade80;animation:pulse 1.6s infinite}.dot.idle{background:#d8ad44}.dot.finished{background:#6b7280;opacity:.55}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}.tbl-scroll{overflow:auto;max-height:min(62vh,640px)}
+.tiles{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px}.tile{flex:1 1 160px;min-width:150px;max-width:230px;background:var(--chip);border:1px solid var(--line);border-radius:12px;padding:14px;cursor:pointer;transition:border-color .15s,transform .15s}.tile:hover{border-color:var(--accent);transform:translateY(-2px)}.tile.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}.tile .tn{font-weight:800;font-size:15px}.tile .tc{font-size:26px;font-weight:800;color:var(--accent);margin:4px 0}.tile .td{font-size:11.5px;color:var(--muted)}.tile-detail{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin-bottom:12px}.tile-detail .wrow{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px dashed var(--line)}.tile-detail .wrow:last-child{border-bottom:none}tr.clickable{cursor:pointer}tr.clickable:hover td{background:rgba(127,127,127,.09)}.run-detail td{background:var(--panel);font-size:12px;color:var(--muted)}.kv{display:inline-block;margin:2px 14px 2px 0}.kv b{color:var(--text)}.dot{display:inline-block;width:11px;height:11px;border-radius:50%;margin:2px 2px 4px}.dot.recent{background:#7aa2f7}.dot.quiet{background:#8a8f98}.dot.stale{background:#6b7280;opacity:.6}.dot.unknown{background:transparent;border:1.5px dashed #6b7280}.tbl-scroll{overflow:auto;max-height:min(62vh,640px)}
 .tbl{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
 .tbl thead th{position:sticky;top:0;z-index:5;background:var(--panel);text-align:left;font-size:10.5px;font-weight:700;
   text-transform:uppercase;letter-spacing:.08em;color:var(--subtle);padding:10px 12px;
@@ -2585,14 +2596,14 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     </div>
   </div>
 
-  <h2 class="sec" id="sec-subagents">Subagents <span class="hint" id="sub-hint">child sessions · parent → run</span></h2>
+  <h2 class="sec" id="sec-subagents">Subagents <span class="hint" id="sub-hint">child &amp; related sessions · Based on session updates; not execution status</span></h2>
   <div class="card">
     <div class="chips" id="subagents-chips" style="margin-bottom:10px"></div>
     <div class="chips" id="subagents-all" style="margin-bottom:10px"></div>
     <div class="tbl-scroll">
       <table class="tbl" id="subtbl">
         <thead><tr>
-          <th>Status</th><th>Subagent run</th><th>Agent</th><th>Parent session</th><th>Started</th>
+          <th>Activity</th><th>Child session</th><th>Agent</th><th>Parent session</th><th>Started</th>
           <th class="num">Total</th><th class="num">Msgs</th>
         </tr></thead>
         <tbody></tbody>
@@ -3133,11 +3144,13 @@ function renderCodex(){
   }).join('');
 }
 
+const SUB_ACT={recent:'Recent activity',quiet:'No recent activity',stale:'Older activity',unknown:'Unknown'};
+
 function renderSubagents(){
   const tb=$('subtbl').querySelector('tbody');
   if(!SA||SA.error){tb.innerHTML='<tr><td colspan="7"><div class="empty">'+ESC((SA&&SA.error)||'No subagent data.')+'</div></td></tr>';return;}
-  const sc=SA.status_counts||{};
-  $('sub-hint').textContent=(sc.running||0)+' running NOW · '+(sc.idle||0)+' idle · '+(sc.finished||0)+' finished · '+(SA.child_total||0)+' runs total';
+  const ac=SA.activity_counts||{};
+  $('sub-hint').textContent=(ac.recent||0)+' '+SUB_ACT.recent+' · '+(ac.quiet||0)+' '+SUB_ACT.quiet+' · '+(ac.stale||0)+' '+SUB_ACT.stale+' · '+(ac.unknown||0)+' '+SUB_ACT.unknown+' · '+(SA.listed_count||0)+' of '+(SA.total_child_sessions||0)+' child sessions'+(SA.truncated?' (truncated)':'')+' · Based on session updates; not execution status';
   $('subagents-chips').innerHTML=(SA.child_agents||[]).map(a=>'<span class="chip"><i style="width:9px;height:9px;border-radius:3px;background:var(--accent);display:inline-block"></i>'+
     ESC(a.agent)+' · '+a.n+' · '+FN(a.toks)+'</span>').join('')||'<span class="empty">No subagents yet.</span>';
   $('subagents-all').innerHTML='<span class="empty">all sessions by type:</span> '+(SA.all_agents||[]).map(a=>'<span class="chip">'+
@@ -3147,10 +3160,9 @@ function renderSubagents(){
     const diff=Math.round((n-s)/86400000);
     const hh=String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
     return diff===0?'Today '+hh:diff===1?'Yesterday '+hh:(d.getMonth()+1)+'/'+d.getDate()+' '+hh;};
-  const ageLbl=a=>{a=+a||0;if(a<60)return a+' s ago';if(a<3600)return Math.floor(a/60)+' min ago';if(a<86400)return Math.floor(a/3600)+' h ago';return Math.floor(a/86400)+' d ago';};
-  const stLbl={running:'Running',idle:'Idle',finished:'Finished'};
+  const ageLbl=a=>{if(a==null)return 'timestamp unavailable';a=+a||0;if(a<60)return a+' s ago';if(a<3600)return Math.floor(a/60)+' min ago';if(a<86400)return Math.floor(a/3600)+' h ago';return Math.floor(a/86400)+' d ago';};
   tb.innerHTML=(SA.child_runs||[]).map((s,i)=>'<tr class="clickable" data-run="'+i+'">'
-    +'<td><span class="dot '+s.status+'"></span><div style="font-size:11px;color:var(--muted)">'+stLbl[s.status]+'<br>'+ageLbl(s.age_s)+'</div></td>'
+    +'<td><span class="dot '+(s.activity_state||'unknown')+'"></span><div style="font-size:11px;color:var(--muted)">'+SUB_ACT[s.activity_state||'unknown']+'<br>'+ageLbl(s.age_s)+'</div></td>'
     +'<td><div class="t">'+ESC(s.title)+'</div>'+
     '<div class="badges"><span class="badge">'+ESC((s.directory||'').split(/[\\/]/).pop())+'</span></div></td>'
     +'<td><div class="badges mix"><span class="badge agent">'+ESC(s.agent)+'</span><span class="badge model">'+ESC(modelShort(s.model))+'</span></div></td>'
@@ -3167,8 +3179,8 @@ function toggleRun(tr){
   document.querySelectorAll('#subtbl tr.run-detail').forEach(x=>x.remove());
   const s=SA.child_runs[+tr.getAttribute('data-run')];
   const d=document.createElement('tr');d.className='run-detail';
-  d.innerHTML='<td colspan="7"><span class="kv">Status: <b>'+ESC(s.status||'-')+'</b></span>'
-    +'<span class="kv">Last activity: <b>'+F(s.age_s)+' s ago</b></span>'
+  d.innerHTML='<td colspan="7"><span class="kv">Activity: <b>'+ESC(SUB_ACT[s.activity_state||'unknown'])+'</b></span>'
+    +'<span class="kv">Last activity: <b>'+(s.age_s==null?'unknown':F(s.age_s)+' s ago')+'</b></span>'
     +'<span class="kv">Session: <b class="mono">'+ESC(s.id)+'</b></span>'
     +'<span class="kv">Agent: <b>'+ESC(s.agent)+'</b></span>'
     +'<span class="kv">Model: <b>'+ESC(s.model||'-')+'</b></span>'
@@ -4175,7 +4187,10 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     con.close()
             except Exception as e:
-                stats = {"error": str(e), "child_runs": [], "child_agents": [], "child_total": 0, "all_agents": [], "config": []}
+                stats = {"error": str(e), "child_runs": [], "child_agents": [], "child_total": 0,
+                         "listed_count": 0, "total_child_sessions": 0, "limit": 100, "truncated": False,
+                         "activity_counts": {"recent": 0, "quiet": 0, "stale": 0, "unknown": 0},
+                         "all_agents": [], "config": []}
             body = json.dumps(stats).encode("utf-8")
             self._send(200, "application/json", body)
         elif path.startswith("/api/graph"):

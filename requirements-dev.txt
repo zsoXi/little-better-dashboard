@@ -1,0 +1,9 @@
+# Dev-only requirements (comment-only skeleton).
+#
+# No runtime or dev dependencies are installed for the skeleton.
+# Tests use unittest from the standard library only.
+#
+# Playwright is allowed as a dev-only browser dependency later,
+# but DO NOT install anything for the skeleton.
+# Example (kept commented until browser scenarios exist):
+# playwright  # dev-only, browser tests only; never a runtime dependency.

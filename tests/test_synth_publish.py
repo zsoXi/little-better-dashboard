@@ -44,7 +44,7 @@ def _load_dashboard():
         import opencode_dashboard as d
         return d
     except Exception as e:
-        raise unittest.SkipTest(f"opencode_dashboard import failed: {e}")
+        raise RuntimeError(f"opencode_dashboard import failed: {e}")
 
 
 def _rollout_lines(n, ti=100, cache=40, to=20, total=120, tr=5,

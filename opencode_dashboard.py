@@ -1003,6 +1003,7 @@ def _codex_scan_lines(fh, cap, initial_tail=b""):
     offset just past the last newline, ``tail`` the last bytes ending there.
     """
     global _codex_oversize_records
+    oversize = 0
     block = _CODEX_READ_BLOCK
     lines = []
     tail = initial_tail
@@ -1028,6 +1029,7 @@ def _codex_scan_lines(fh, cap, initial_tail=b""):
                     base = base + pos
                     if len(buf) > cap:
                         _codex_oversize_records += 1
+                        oversize += 1
                         overlong = True
                         buf = b""
                         base = fh.tell()
@@ -1040,6 +1042,7 @@ def _codex_scan_lines(fh, cap, initial_tail=b""):
                 line = buf[pos:nl]
                 if len(line) > cap:
                     _codex_oversize_records += 1
+                    oversize += 1
                     tail = (line[-(_CODEX_ANCHOR_LEN - 1):]
                             + b"\n")[-_CODEX_ANCHOR_LEN:]
                 else:
@@ -1047,13 +1050,14 @@ def _codex_scan_lines(fh, cap, initial_tail=b""):
                     tail = (tail + line + b"\n")[-_CODEX_ANCHOR_LEN:]
             used = base + nl + 1
             pos = nl + 1
-    return lines, used, tail
+    return lines, used, tail, oversize
 
 
 def _codex_full_read(p, fp):
     with open(p, "rb") as fh:
-        lines, used, tail = _codex_scan_lines(fh, MAX_ROUTER_RECORD_BYTES)
-    return lines, used, fp, True, tail
+        lines, used, tail, oversize = _codex_scan_lines(
+            fh, MAX_ROUTER_RECORD_BYTES)
+    return lines, used, fp, True, tail, oversize
 
 
 def _codex_anchor_ok(p, off, tail):
@@ -1085,14 +1089,14 @@ def _codex_read_since(p, state):
     if rebuild:
         return _codex_full_read(p, fp)
     if fp[0] == old_off:
-        return [], old_off, fp, False, old_tail
+        return [], old_off, fp, False, old_tail, 0
     with open(p, "rb") as fh:
         fh.seek(old_off)
-        lines, used_abs, tail = _codex_scan_lines(
+        lines, used_abs, tail, oversize = _codex_scan_lines(
             fh, MAX_ROUTER_RECORD_BYTES, old_tail)
     if used_abs <= old_off:
-        return [], old_off, fp, False, old_tail
-    return lines, used_abs, fp, False, tail
+        return [], old_off, fp, False, old_tail, 0
+    return lines, used_abs, fp, False, tail, oversize
 
 
 def _codex_update_row(p, st, state):
@@ -1100,7 +1104,7 @@ def _codex_update_row(p, st, state):
     if state is not None and state.get("fp") == cur_fp:
         return state
     try:
-        lines, off, fp, rebuild, tail = _codex_read_since(p, state)
+        lines, off, fp, rebuild, tail, oversize = _codex_read_since(p, state)
     except OSError:
         # Audit A01 (session list): a transient read error must neither wipe
         # the last good contribution nor be blessed as the current
@@ -1110,10 +1114,12 @@ def _codex_update_row(p, st, state):
             row["_err"] = True
             return {"fp": state.get("fp"),
                     "offset": int(state.get("offset") or 0),
-                    "row": row, "tail": state.get("tail") or b""}
+                    "row": row, "tail": state.get("tail") or b"",
+                    "oversize": int(state.get("oversize") or 0)}
         row = _codex_new_row(p, st)
         row["_err"] = True
-        return {"fp": None, "offset": 0, "row": row, "tail": b""}
+        return {"fp": None, "offset": 0, "row": row, "tail": b"",
+                "oversize": 0}
     if state is not None and not rebuild:
         row = state["row"]
     else:
@@ -1123,7 +1129,10 @@ def _codex_update_row(p, st, state):
     row.pop("_err", None)  # a successful read clears the transient error
     row["_sz"] = st.st_size
     row["_mt"] = int(st.st_mtime)
-    return {"fp": fp, "offset": off, "row": row, "tail": tail}
+    return {"fp": fp, "offset": off, "row": row, "tail": tail,
+            "oversize": ((int(state.get("oversize") or 0) + oversize)
+                         if (state is not None and not rebuild)
+                         else oversize)}
 
 
 def _file_sha256(path):
@@ -1160,6 +1169,7 @@ def _write_codex_index(rows):
                 "model": state.get("model", ""),
                 "provider": state.get("provider", "?"),
                 "tail": (state.get("tail") or b"").hex(),
+                "oversize": int(state.get("oversize") or 0),
                 "events": state.get("events", []),
             }
         doc = {"version": CODEX_PARSER_VERSION, "schema": SYNTH_SCHEMA,
@@ -1240,6 +1250,7 @@ def _load_codex_index(files):
                 "offset": off,
                 "model": str(e.get("model") or ""),
                 "provider": str(e.get("provider") or "?"),
+                "oversize": int(e.get("oversize") or 0),
                 "events": list(e.get("events") or []),
                 "tail": tail,
             }
@@ -1342,7 +1353,8 @@ def _parse_codex_events(p):
         _codex_read_failures.pop(key, None)
         return list(state["events"])
     try:
-        lines, off, fp, rebuild, tail = _codex_read_since(p, state)
+        lines, off, fp, rebuild, tail, oversize = _codex_read_since(
+            p, state)
     except OSError as e:
         _codex_read_failures[key] = "%s: %s" % (type(e).__name__, e)
         return []
@@ -1386,9 +1398,12 @@ def _parse_codex_events(p):
                            "total": _numi(u.get("total_tokens")),
                            "reasoning": _numi(u.get("reasoning_output_tokens")),
                            "cache_write": _numi(u.get("cache_write_input_tokens"))})
-    _codex_ev_state[key] = {"fp": fp, "offset": off, "model": model,
-                            "provider": provider, "events": events,
-                            "tail": tail}
+    _codex_ev_state[key] = {
+        "fp": fp, "offset": off, "model": model,
+        "provider": provider, "events": events, "tail": tail,
+        "oversize": (int(state.get("oversize") or 0) + oversize)
+                    if (state is not None and not rebuild) else oversize,
+    }
     return list(events)
 
 
@@ -1456,8 +1471,8 @@ def ensure_codex_synth(force=False):
     try:
         rows = {}
         failures = {}
-        # A05: count oversize lines skipped for THIS build only.
-        _codex_oversize_records = 0
+        # A05: oversize counts are per-file (state['oversize']); the published
+        # generation reports their sum, so appends and restarts keep them.
         for p in files:
             key = str(p)
             try:
@@ -1512,7 +1527,9 @@ def ensure_codex_synth(force=False):
                 _codex_ev_cache = rows
                 _codex_ev_sig = sig
                 _codex_last_ok = str(CODEX_SYNTH)
-                _codex_last_oversize = _codex_oversize_records
+                _codex_last_oversize = sum(
+                    int(_codex_ev_state.get(k, {}).get("oversize") or 0)
+                    for k in rows)
                 _codex_last_error = None
                 _write_codex_index(rows)
                 return str(CODEX_SYNTH), None
@@ -4795,7 +4812,7 @@ function secUnavailable(key,msg){
 function secStrip(){
   var sts=SEC.sections,parts=[];
   SECTIONS.forEach(function(s){var st=sts[s.key];if(!st)return;var t=s.key+': '+st.state;
-    if((st.state==='stale'||st.state==='error')&&st.error)t+=' ('+st.error+')';
+    if(st.error)t+=' ('+st.error+')';
     if((st.state==='stale'||st.state==='error')&&st.lastSuccess)t+=' last ok '+new Date(st.lastSuccess).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
     parts.push(t);});
   var el=document.getElementById('src-status');if(el){el.textContent=parts.join(' · ');el.title=parts.join('; ');}
@@ -4827,8 +4844,23 @@ async function runSection(s){
     var d=await fetchJson(s.url+((s.url.indexOf('?')<0)?'?':'&')+'_='+Date.now(),ac?{signal:ac.signal}:{});
     if(!s.validate(d))throw new Error('unexpected payload shape');
     if(gen!==st.gen)return true;
-    st.data=d;st.state='success';st.lastSuccess=Date.now();st.error=null;
+    /* A01/A05: a retained snapshot with a failed refresh is stale (never a
+       plain success, and it must not advance lastSuccess); an explicitly
+       skipped raw record is partial coverage of the source. Both stay
+       visible in the data and in the source strip. */
+    var staleMsg=null,partialMsg=null;
+    if(d&&d.synth_stale){staleMsg='stale snapshot: '+(d.synth_error||'source refresh failed');}
+    if(d&&d.synth_oversize_records>0){partialMsg='partial source coverage: '+d.synth_oversize_records+' oversize record(s) skipped';}
+    if(staleMsg){
+      st.data=d;st.state='stale';st.error=staleMsg;
+      s.render(d);
+      console.warn('ocd source '+s.key+' stale: '+staleMsg);
+      return false;
+    }
+    st.data=d;st.state='success';st.lastSuccess=Date.now();
+    st.error=null;if(partialMsg)st.error=partialMsg;
     s.render(d);
+    if(partialMsg){console.warn('ocd source '+s.key+' partial: '+partialMsg);return false;}
     return true;
   }catch(e){
     if(e&&e.status===401){noteAuthFailure();return false;}

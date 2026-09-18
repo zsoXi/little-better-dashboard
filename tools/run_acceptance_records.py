@@ -41,6 +41,13 @@ COMMANDS = [
      ["python", "-m", "unittest", "tests.test_publication_checks"]),
     ("integration",
      ["python", "-m", "unittest", "tests.test_integration"]),
+    ("browser_f6d",
+     ["python", "tools/run_browser_tests.py", "--log-prefix", "F6d-browser",
+      "--cases", "F6d-T01,F6d-T02,F6d-T04,F6d-T06,F6d-T09"]),
+    ("browser_f8",
+     ["python", "tools/run_browser_tests.py", "--log-prefix", "F8-browser"]),
+    ("benchmark",
+     ["python", "tools/benchmark_dashboard.py", "--scenario", "ci"]),
 ]
 
 
@@ -74,7 +81,8 @@ def identity():
         "runtime_sha256": sha256(REPO_ROOT / "opencode_dashboard.py"),
         "tests": group("tests/*.py"),
         "tools": group("tools/*.py"),
-        "matrix_sha256": sha256(REPO_ROOT / "docs" / "ACCEPTANCE_MATRIX.md"),
+        "matrix_sha256": norm_sha256(
+            REPO_ROOT / "docs" / "ACCEPTANCE_MATRIX.md"),
         "runner_sha256": sha256(Path(__file__)),
     }
 

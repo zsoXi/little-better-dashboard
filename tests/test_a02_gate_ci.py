@@ -89,14 +89,27 @@ class A02GateCiTests(unittest.TestCase):
         # A03 rule (10): every synthetic report carries an explicit, synthetic
         # execution block (honest fixture: real files, real hashes, marked
         # commands) and marks its PASS rows as executed.
+        def _group(pattern):
+            out = {}
+            for p in sorted(REPO_ROOT.glob(pattern)):
+                if p.is_file():
+                    out[str(p.relative_to(REPO_ROOT)).replace("\\", "/")] = \
+                        hashlib.sha256(
+                            p.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+            return out
+
+        matrix = REPO_ROOT / "docs" / "ACCEPTANCE_MATRIX.md"
         report["execution"] = {
             "records_file": "artifacts/execution-records.json",
             "identity": {
                 "runtime_sha256": self.code_hash.split(":", 1)[1],
-                "tests": {self.tests_rel: self.tests_digest},
-                "tools": {self.tools_rel: self.tools_digest},
+                "tests": _group("tests/*.py"),
+                "tools": _group("tools/*.py"),
+                "matrix_sha256": hashlib.sha256(
+                    matrix.read_bytes().replace(b"\r\n", b"\n")).hexdigest(),
             },
-            "commands": [{"name": "import_check", "exit_code": 0}, {"name": "py_compile", "exit_code": 0},
+            "commands": [{"name": "import_check", "exit_code": 0},
+                         {"name": "py_compile", "exit_code": 0},
                          {"name": "unittest_discover", "exit_code": 0}],
         }
         for entry in report.get("results", []):

@@ -156,7 +156,7 @@ class TestPublicationChecks(unittest.TestCase):
         digest = hashlib.sha256(shot.read_bytes()).hexdigest()
         self.assertEqual(
             digest,
-            "7994c83022774ef5857dd554caaaef7fb83c8f96726556e267a4472b7ed9575e",
+            "5c11771f7fbac8f5e236402e884661886d114a16757d9573c47b2e25f053ddd0",
             "screenshot.png must be the committed capture of the synthetic "
             "fixture (regenerate: tools/run_browser_tests.py F8-B01 writes "
             "artifacts/F6d-browser-shots/F8-B01-01-tabs-120-reasoning.png "

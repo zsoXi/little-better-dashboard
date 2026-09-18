@@ -491,6 +491,33 @@ def main(argv=None):
                         f"(10) {group} file changed since the recorded "
                         f"execution: {rel}")
                     exec10_ok = False
+        for group, pattern in (("tests", "tests/*.py"),
+                               ("tools", "tools/*.py")):
+            recorded = set((ident.get(group) or {}).keys())
+            current = {str(p.relative_to(REPO_ROOT)).replace("\\", "/")
+                       for p in REPO_ROOT.glob(pattern) if p.is_file()}
+            added = sorted(current - recorded)
+            removed = sorted(recorded - current)
+            if added:
+                failures.append(
+                    f"(10) {group} files added since the recorded execution: "
+                    f"{added[:5]}")
+                exec10_ok = False
+            if removed:
+                failures.append(
+                    f"(10) {group} files removed since the recorded "
+                    f"execution: {removed[:5]}")
+                exec10_ok = False
+        matrix = REPO_ROOT / "docs" / "ACCEPTANCE_MATRIX.md"
+        try:
+            mnorm = hashlib.sha256(
+                matrix.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+        except OSError:
+            mnorm = ""
+        if str(ident.get("matrix_sha256", "")) != mnorm:
+            failures.append(
+                "(10) acceptance matrix changed since the recorded execution.")
+            exec10_ok = False
         commands = execution.get("commands") or []
         names = {str(c.get("name")) for c in commands if isinstance(c, dict)}
         for required in ("import_check", "py_compile", "unittest_discover"):

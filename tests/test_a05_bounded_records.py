@@ -131,7 +131,7 @@ class A05BoundedRecordTests(unittest.TestCase):
                          .encode("utf-8"))
         d._codex_oversize_records = 0
         with _mock.patch.object(d, "MAX_ROUTER_RECORD_BYTES", CAP):
-            (lines, used, fp, rebuild, tail), peak = _measure(
+            (lines, used, fp, rebuild, tail, oversize), peak = _measure(
                 lambda: d._codex_full_read(
                     roll, (roll.stat().st_size, 0, 0)))
         self.assertEqual(d._codex_oversize_records, 1)
@@ -262,6 +262,88 @@ class A05BoundedRecordTests(unittest.TestCase):
             d._codex_last_oversize = 0
             d._load_codex_index([roll])
             self.assertEqual(d._codex_last_oversize, 1)
+        finally:
+            d.CODEX_DIR, d.CODEX_SYNTH, d.CODEX_INDEX = backup
+
+
+    def test_a05_oversize_counter_survives_append_and_restart(self):
+        d = self.d
+        codex_dir = self.root / "codex"
+        codex_dir.mkdir()
+        roll = codex_dir / "rollout-2026-01-01T00-00-00-a05c.jsonl"
+        lines = [
+            json.dumps({"type": "session_meta",
+                        "payload": {"model_provider": "codex"}}),
+            json.dumps({"type": "turn_context",
+                        "payload": {"model": "muse-spark"}}),
+            json.dumps({"type": "token_usage_record", "payload": {"usage": {
+                "input_tokens": 10, "cached_input_tokens": 0,
+                "output_tokens": 0, "total_tokens": 10,
+                "reasoning_output_tokens": 0,
+                "cache_write_input_tokens": 0}}}),
+            json.dumps({"type": "token_usage_record",
+                        "note": "x" * 2000, "payload": {"usage": {
+                            "input_tokens": 900, "cached_input_tokens": 0,
+                            "output_tokens": 0, "total_tokens": 900,
+                            "reasoning_output_tokens": 0,
+                            "cache_write_input_tokens": 0}}}),
+            json.dumps({"type": "token_usage_record", "payload": {"usage": {
+                "input_tokens": 20, "cached_input_tokens": 0,
+                "output_tokens": 0, "total_tokens": 20,
+                "reasoning_output_tokens": 0,
+                "cache_write_input_tokens": 0}}}),
+        ]
+        roll.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+        backup = (getattr(d, "CODEX_DIR", None), d.CODEX_SYNTH, d.CODEX_INDEX)
+        try:
+            d.CODEX_DIR = codex_dir
+            d.CODEX_SYNTH = self.root / "synth-c.jsonl"
+            d.CODEX_INDEX = self.root / "codex_index_c.json"
+            d._codex_ev_cache = {}
+            d._codex_ev_sig = None
+            if hasattr(d, "_codex_ev_state"):
+                d._codex_ev_state.clear()
+            if hasattr(d, "_codex_read_failures"):
+                d._codex_read_failures.clear()
+            with _mock.patch.object(d, "MAX_ROUTER_RECORD_BYTES", CAP):
+                _, err = d.ensure_codex_synth(force=True)
+                self.assertIsNone(err)
+                self.assertEqual(d._codex_last_oversize, 1)
+                # Unchanged refresh keeps the contribution.
+                _, err = d.ensure_codex_synth()
+                self.assertIsNone(err)
+                self.assertEqual(d._codex_last_oversize, 1)
+                # A valid append must not reset the skipped-record count.
+                with open(roll, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({
+                        "type": "token_usage_record",
+                        "payload": {"usage": {
+                            "input_tokens": 5, "cached_input_tokens": 0,
+                            "output_tokens": 0, "total_tokens": 5,
+                            "reasoning_output_tokens": 0,
+                            "cache_write_input_tokens": 0}}}) + "\n")
+                _, err = d.ensure_codex_synth()
+                self.assertIsNone(err)
+                self.assertEqual(
+                    d._codex_last_oversize, 1,
+                    "append must not erase the skipped-record count")
+                published = [json.loads(l)["totalTokens"]
+                             for l in Path(str(d.CODEX_SYNTH)).read_text(
+                                 encoding="utf-8").splitlines() if l.strip()]
+                self.assertEqual(published, [10.0, 20.0, 5.0])
+                # A real restart adopts the per-file contributions.
+                d._codex_ev_cache = {}
+                d._codex_ev_sig = None
+                d._codex_ev_state.clear()
+                d._codex_last_oversize = 0
+                d._load_codex_index([roll])
+                self.assertEqual(d._codex_last_oversize, 1)
+                _, err = d.ensure_codex_synth()
+                self.assertIsNone(err)
+                self.assertEqual(
+                    d._codex_last_oversize, 1,
+                    "the first plain publish after adoption must keep the "
+                    "count")
         finally:
             d.CODEX_DIR, d.CODEX_SYNTH, d.CODEX_INDEX = backup
 

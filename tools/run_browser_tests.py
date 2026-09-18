@@ -853,6 +853,37 @@ def case_b07(ctx):
     return ctx.shot("no-xss-no-console-no-external")
 
 
+def case_b08(ctx):
+    """A stale synth refresh (HTTP 200 + synth_stale) keeps the old data,
+    marks the router section stale and never presents a full success."""
+    ctx.new_page()
+    payload = {
+        "totals": {"tokens_total": 120.0}, "days": [], "day_total": None,
+        "is_synth": True, "synth_stale": True,
+        "synth_error": "codex read failed for 1 file(s): injected denied",
+        "synth_oversize_records": 0,
+    }
+    ctx.page.route("**/api/router*", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body=json.dumps(payload)))
+    ctx.goto()
+    ctx.cycle_finished()
+    secs = ctx.sections()
+    _assert(secs["router"]["state"] == "stale",
+            "router should be stale, got %r" % secs["router"])
+    _assert("codex read failed" in (secs["router"]["error"] or ""),
+            "router error should carry the synth error, got %r"
+            % secs["router"]["error"])
+    strip = ctx.page.evaluate(
+        "document.getElementById('src-status').textContent")
+    _assert("router: stale" in strip,
+            "source strip should show stale, got %r" % strip)
+    _assert("Partial update" in ctx.status(),
+            "status should be a partial update, got %r" % ctx.status())
+    ctx.evidence["router_state"] = secs["router"]
+    return ctx.shot("synth-stale-kept")
+
+
 CASES = [
     ("F6d-T01", "7 sections render while the 8th never sends headers", case_t01),
     ("F6d-T02", "200 headers, body never ends -> deadline still fires", case_t02),
@@ -866,6 +897,7 @@ CASES = [
     ("F8-B05", "inspector paging footer + content", case_b05),
     ("F8-B06", "legal auth + two tabs + 401 after restart", case_b06),
     ("F8-B07", "no synthetic script execution, console, externals", case_b07),
+    ("F8-B08", "stale synth refresh keeps data + marks router stale", case_b08),
 ]
 BROWSER_CASES = [c[0] for c in CASES]
 

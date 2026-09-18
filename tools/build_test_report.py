@@ -60,23 +60,23 @@ def parse_matrix(path):
     return rows
 
 
-def _record_for(evidence, records, want):
-    """The execution record matching an evidence path, with a documented
-    fallback: browser rows without a browser record bind to the unit suite
-    record (their own browser logs carry their timestamps)."""
+def _record_for(records, want):
+    """The execution record of the row's own runner. No fallback: a browser
+    or benchmark row must never borrow the unit-suite execution (audit A03)."""
     for rec in records:
         if rec.get("name") == want:
-            return rec
-    for rec in records:
-        if rec.get("name") == "unittest_discover":
             return rec
     return None
 
 
 def _want_for(evidence):
     ev = (evidence or "").lower()
-    if "browser" in ev:
-        return "browser"
+    if "f6d-browser" in ev:
+        return "browser_f6d"
+    if "f8-browser" in ev or "browser" in ev:
+        return "browser_f8"
+    if "perf-" in ev or "performance" in ev:
+        return "benchmark"
     if "pub-t02" in ev:
         return "publication_checks"
     return "unittest_discover"
@@ -130,6 +130,28 @@ def main(argv=None):
                 print("ERROR: %s changed since the recorded execution: %s; "
                       "rerun tools/run_acceptance_records.py" % (group, rel))
                 return 2
+    for group, pattern in (("tests", "tests/*.py"), ("tools", "tools/*.py")):
+        recorded = set((ident.get(group) or {}).keys())
+        current = {str(p.relative_to(REPO_ROOT)).replace("\\", "/")
+                   for p in REPO_ROOT.glob(pattern) if p.is_file()}
+        added = sorted(current - recorded)
+        removed = sorted(recorded - current)
+        if added or removed:
+            print("ERROR: %s file set changed since the recorded execution "
+                  "(added=%s removed=%s); rerun "
+                  "tools/run_acceptance_records.py"
+                  % (group, added[:5], removed[:5]))
+            return 2
+    matrix = REPO_ROOT / "docs" / "ACCEPTANCE_MATRIX.md"
+    try:
+        mnorm = hashlib.sha256(
+            matrix.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+    except OSError:
+        mnorm = ""
+    if str(ident.get("matrix_sha256", "")) != mnorm:
+        print("ERROR: acceptance matrix changed since the recorded execution; "
+              "rerun tools/run_acceptance_records.py")
+        return 2
     records = doc.get("commands") or []
     os_label = (doc.get("environment") or {}).get("os") or (
         "windows" if os.name == "nt" else "linux")
@@ -141,7 +163,7 @@ def main(argv=None):
               "skipped": 0}
     for r in rows:
         if r["result"] == "PASS":
-            rec = _record_for(r["evidence"], records, _want_for(r["evidence"]))
+            rec = _record_for(records, _want_for(r["evidence"]))
             res = {"acceptance_id": r["id"], "result": "PASS",
                    "environment": os_label, "evidence": r["evidence"],
                    "command": r["case"],
@@ -169,7 +191,7 @@ def main(argv=None):
     # the matrix row that records the git-mode side of the same scenario.
     extra_evidence = "artifacts/PUB-T02-gitbash.windows.log"
     if (REPO_ROOT / extra_evidence).is_file():
-        rec = _record_for(extra_evidence, records, "publication_checks")
+        rec = _record_for(records, "publication_checks")
         results.append({"acceptance_id": "PUB-T02", "result": "PASS",
                         "environment": os_label,
                         "evidence": extra_evidence,

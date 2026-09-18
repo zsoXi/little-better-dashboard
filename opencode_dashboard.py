@@ -1,6 +1,9 @@
 import argparse
 import json
+import math
 import os
+import re
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -25,7 +28,10 @@ LOCAL_CACHE = {"key": None, "stats": None}
 ROUTER_CACHE = {"key": None, "stats": None}
 MAX_ROUTER_EVENTS = 30000  # most-recent lines scanned from usage-events.jsonl
 MAX_ROUTER_ROWS = 400  # recent requests kept in the /api/router payload
-SYNTH_SCHEMA = 2  # bump to force codex-synth rebuild when the writer changes
+MAX_ROUTER_RECORD_BYTES = 8 * 1024 * 1024  # F6b: per-record read cap
+_ROUTER_READ_BLOCK = 65536  # F6b: byte block size for tail reads/counts
+_ROUTER_COUNT_CACHE = {}  # F6b: str(path) -> line count + fingerprint
+SYNTH_SCHEMA = 3  # bump to force codex-synth rebuild when the writer changes
 
 # What-if paid pricing per 1M tokens (input, output) for known *-free models.
 # Actual free cost is always $0; this estimates what the same tokens would cost.
@@ -44,6 +50,51 @@ COMMIT_WINDOW_HOURS = 24  # sessions in this window before a commit count toward
 MAX_COMMITS_PER_REPO = 200  # recent commits scanned per worktree
 MAX_FILE_ROWS = 15  # top files/subsystems kept in the payload (+ implicit Other)
 MAX_COMMIT_ROWS = 60  # commit rows kept in the payload, by tokens desc
+
+# F2 access protection: per-instance bearer token + strict Host/Origin.
+# The token is generated at startup (secrets.token_urlsafe(32)), kept only
+# on the server instance, and never sent in query strings or logs.
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{20,128}")
+
+
+def _new_token():
+    return secrets.token_urlsafe(32)
+
+
+def _expected_host(server):
+    try:
+        port = server.server_address[1]
+    except Exception:
+        return ""
+    return "127.0.0.1:%s" % port
+
+
+def _expected_origin(server):
+    try:
+        port = server.server_address[1]
+    except Exception:
+        return ""
+    return "http://127.0.0.1:%s" % port
+
+
+def _header_all(handler, name):
+    try:
+        get_all = handler.headers.get_all
+    except AttributeError:
+        v = handler.headers.get(name)
+        return [] if v is None else [v]
+    try:
+        vals = get_all(name)
+    except Exception:
+        v = handler.headers.get(name)
+        return [] if v is None else [v]
+    if vals is None:
+        return []
+    return list(vals)
+
+
+def _is_private_path(path):
+    return path == "/api/close" or path.startswith("/api/")
 
 
 def connect(db_path):
@@ -139,8 +190,13 @@ def router_cache_rate(input_total, cached_input):
 
 
 def _router_day_tokens(d):
-    """Router day total without double-counting cached input (subset of input)."""
-    return (d.get("ti", 0) or 0) + (d.get("to", 0) or 0) + (d.get("tr", 0) or 0)
+    """Router day total: ti + to only.
+
+    Cached input is a subset of input and reasoning is a subset of output,
+    so neither is ever additive here. (Local OpenCode day_total is a
+    different contract and is intentionally untouched.)
+    """
+    return (d.get("ti", 0) or 0) + (d.get("to", 0) or 0)
 
 
 def compute_streaks(activity, tokens_only=False):
@@ -242,87 +298,141 @@ def db_worktrees(db_path):
         return []
 
 
-def repo_heads(worktrees):
-    """Current HEAD per worktree, cheap git fingerprint for cache invalidation."""
-    heads = []
-    seen = set()
-    for _, wt in worktrees or []:
-        if not wt or wt in seen:
-            continue
-        seen.add(wt)
-        try:
-            if not Path(wt).is_dir():
-                heads.append((wt, None))
-                continue
+# F6f: per-worktree TTL caches for the expensive git calls. SQLite stats
+# freshness stays cheap; HEAD/commit reads are shared between parallel
+# requests and refreshed at most once per TTL window. Failures keep the last
+# known value with a stale state; a fresh failure without history reads as
+# unavailable. Args are always a list; nothing is shell-interpreted.
+GIT_TTL_SECONDS = 10.0
+_GIT_LOCK = threading.Lock()
+_HEADS_CACHE = {}
+_COMMITS_CACHE = {}
+
+
+def _head_for(wt, now, force=False):
+    with _GIT_LOCK:
+        entry = _HEADS_CACHE.get(wt)
+        if entry is not None and not force and (now - entry["at"]) < GIT_TTL_SECONDS:
+            return entry["head"]
+    head = None
+    state = "unavailable"
+    try:
+        if Path(wt).is_dir():
             out = subprocess.run(
                 ["git", "-C", wt, "rev-parse", "HEAD"],
                 capture_output=True, text=True, timeout=5,
             )
-            heads.append((wt, out.stdout.strip() if out.returncode == 0 else None))
-        except (OSError, ValueError, subprocess.SubprocessError):
-            heads.append((wt, None))
+            if out.returncode == 0 and out.stdout.strip():
+                head = out.stdout.strip()
+                state = "ok"
+    except (OSError, ValueError, subprocess.SubprocessError):
+        state = "unavailable"
+    with _GIT_LOCK:
+        prev = _HEADS_CACHE.get(wt)
+        if state != "ok" and prev is not None and prev.get("head"):
+            _HEADS_CACHE[wt] = {"head": prev["head"], "at": now,
+                                "state": "stale"}
+            return prev["head"]
+        _HEADS_CACHE[wt] = {"head": head, "at": now, "state": state}
+        return head
+
+
+def repo_heads(worktrees, force=False):
+    """Current HEAD per worktree, served from the per-worktree TTL cache."""
+    heads = []
+    seen = set()
+    now = time.time()
+    for _, wt in worktrees or []:
+        if not wt or wt in seen:
+            continue
+        seen.add(wt)
+        heads.append((wt, _head_for(wt, now, force)))
     return tuple(heads)
 
 
+def _parse_repo_log(stdout, name):
+    commits = []
+    cur = None
+    for line in stdout.splitlines():
+        if "\x1f" in line:
+            if cur:
+                commits.append(cur)
+            parts = line.split("\x1f")
+            try:
+                ts = int(parts[2])
+            except (ValueError, IndexError):
+                cur = None
+                continue
+            cur = {
+                "sha": parts[0],
+                "subject": parts[1] if len(parts) > 1 else "",
+                "time": ts * 1000,
+                "date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d"),
+                "project": name,
+                "files": 0,
+                "add": 0,
+                "del": 0,
+            }
+        elif cur and line.strip():
+            bits = line.split()
+            if len(bits) >= 3:
+                cur["files"] += 1
+                try:
+                    cur["add"] += int(bits[0])
+                except ValueError:
+                    pass
+                try:
+                    cur["del"] += int(bits[1])
+                except ValueError:
+                    pass
+    if cur:
+        commits.append(cur)
+    return commits
+
+
+def _commits_for(name, wt, per_repo, now, force=False):
+    with _GIT_LOCK:
+        entry = _COMMITS_CACHE.get(wt)
+        if entry is not None and not force and (now - entry["at"]) < GIT_TTL_SECONDS:
+            return entry["commits"]
+    parsed = []
+    state = "unavailable"
+    try:
+        if Path(wt).is_dir():
+            out = subprocess.run(
+                ["git", "-C", wt, "log", f"-n{per_repo}",
+                 "--format=%H\x1f%s\x1f%ct", "--numstat"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if out.returncode == 0:
+                state = "ok"
+                parsed = _parse_repo_log(out.stdout, name)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    with _GIT_LOCK:
+        prev = _COMMITS_CACHE.get(wt)
+        if state != "ok" and prev is not None and prev.get("commits"):
+            _COMMITS_CACHE[wt] = {"commits": prev["commits"], "at": now,
+                                  "state": "stale"}
+            return prev["commits"]
+        _COMMITS_CACHE[wt] = {"commits": parsed, "at": now, "state": state}
+        return parsed
+
+
 def collect_repo_commits(worktrees, per_repo=MAX_COMMITS_PER_REPO):
-    """Recent commits per worktree: sha/subject/date/files/+/-.
+    """Recent commits per worktree, served from the per-worktree TTL cache.
 
     Skips missing dirs and non-git worktrees silently, the panels simply
     show fewer repos. Never raises for git failures.
     """
     commits = []
     seen = set()
+    now = time.time()
     for name, wt in worktrees or []:
         if not wt or wt in seen:
             continue
         seen.add(wt)
-        try:
-            if not Path(wt).is_dir():
-                continue
-            out = subprocess.run(
-                ["git", "-C", wt, "log", f"-n{per_repo}",
-                 "--format=%H\x1f%s\x1f%ct", "--numstat"],
-                capture_output=True, text=True, timeout=15,
-            )
-            if out.returncode != 0:
-                continue
-        except (OSError, ValueError, subprocess.SubprocessError):
-            continue
-        cur = None
-        for line in out.stdout.splitlines():
-            if "\x1f" in line:
-                if cur:
-                    commits.append(cur)
-                parts = line.split("\x1f")
-                try:
-                    ts = int(parts[2])
-                except (ValueError, IndexError):
-                    cur = None
-                    continue
-                cur = {
-                    "sha": parts[0],
-                    "subject": parts[1] if len(parts) > 1 else "",
-                    "time": ts * 1000,
-                    "date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d"),
-                    "project": name,
-                    "files": 0,
-                    "add": 0,
-                    "del": 0,
-                }
-            elif cur and line.strip():
-                bits = line.split()
-                if len(bits) >= 3:
-                    cur["files"] += 1
-                    try:
-                        cur["add"] += int(bits[0])
-                    except ValueError:
-                        pass
-                    try:
-                        cur["del"] += int(bits[1])
-                    except ValueError:
-                        pass
-        if cur:
-            commits.append(cur)
+        commits.extend(_commits_for(name, wt, per_repo, now))
     return commits
 
 
@@ -393,11 +503,12 @@ def read_agent_defs():
 
 
 def query_agents(con):
-    """Subagent runs: child sessions (parent_id set) joined with parent title.
-    Status is recency-based: running if updated within RUNNING_SEC,
-    idle within IDLE_SEC, else finished."""
-    RUNNING_SEC, IDLE_SEC = 120, 900
-    STORD = {"running": 0, "idle": 1, "finished": 2}
+    """Child/related sessions (parent_id set) joined with parent title.
+    activity_state comes from session updates only: recent (0-120 s),
+    quiet (>120-900 s), stale (>900 s) or unknown (missing/invalid/future
+    timestamp). It is a history signal, not execution status; runtime_status
+    stays 'unknown' because this dashboard has no live agent API."""
+    RECENT_SEC, QUIET_SEC, LIMIT = 120, 900, 100
     now_ms = int(time.time() * 1000)
     runs = []
     for r in con.execute(
@@ -412,27 +523,32 @@ def query_agents(con):
                (SELECT COUNT(*) FROM message m WHERE m.session_id=s.id) AS msgs
         FROM session s LEFT JOIN session p ON p.id=s.parent_id
         WHERE s.parent_id IS NOT NULL AND s.parent_id != ''
-         ORDER BY s.time_created DESC LIMIT 100
-         """
-     ):
-        upd = r["time_updated"] or 0
-        age = max(0, (now_ms - upd)//1000) if upd else 10**9
-        st = "running" if age <= RUNNING_SEC else ("idle" if age <= IDLE_SEC else "finished")
+        ORDER BY s.time_updated DESC, s.id DESC LIMIT 100
+        """
+    ):
+        upd = r["time_updated"]
+        if not (isinstance(upd, int) and not isinstance(upd, bool)) or upd <= 0 or upd > now_ms:
+            age, state, upd_ms = None, "unknown", 0
+        else:
+            age = (now_ms - upd) // 1000
+            state = ("recent" if age <= RECENT_SEC
+                     else ("quiet" if age <= QUIET_SEC else "stale"))
+            upd_ms = upd
         runs.append({
             "id": r["id"], "title": r["title"] or "(untitled)",
             "agent": r["agent"] or "default", "model": r["model"] or "",
             "directory": r["directory"] or "",
             "time_created": r["time_created"] or 0,
-            "time_updated": r["time_updated"] or 0,
+            "time_updated": upd_ms,
             "parent_id": r["parent_id"],
             "parent_title": r["parent_title"] or "(unknown parent)",
             "toks": r["toks"] or 0, "msgs": r["msgs"] or 0,
-            "age_s": age, "status": st,
+            "age_s": age, "activity_state": state,
+            "runtime_status": "unknown", "relation": "child_session",
         })
-    runs.sort(key=lambda r: (STORD.get(r["status"], 9), -(r["time_created"] or 0)))
-    status_counts = {"running": 0, "idle": 0, "finished": 0}
+    activity_counts = {"recent": 0, "quiet": 0, "stale": 0, "unknown": 0}
     for r in runs:
-        status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
+        activity_counts[r["activity_state"]] += 1
     per_agent = defaultdict(lambda: {"n": 0, "toks": 0})
     for r in con.execute(
         "SELECT agent, COUNT(*) AS n FROM session WHERE parent_id IS NOT NULL AND parent_id != '' GROUP BY agent"
@@ -455,13 +571,18 @@ def query_agents(con):
            FROM session GROUP BY agent ORDER BY t DESC"""
     ):
         all_agents.append({"agent": r["agent"] or "(none)", "n": r["n"], "toks": r["t"] or 0})
+    total_child = sum(v["n"] for v in per_agent.values())
     return {"child_runs": runs,
             "child_agents": sorted(
                 [{"agent": a, "n": v["n"], "toks": v["toks"]} for a, v in per_agent.items()],
                 key=lambda x: -x["toks"]),
-            "child_total": sum(v["n"] for v in per_agent.values()),
-            "status_counts": status_counts,
-            "running_sec": RUNNING_SEC, "idle_sec": IDLE_SEC, "now_ms": now_ms,
+            "child_total": total_child,
+            "listed_count": len(runs),
+            "total_child_sessions": total_child,
+            "limit": LIMIT,
+            "truncated": total_child > LIMIT,
+            "activity_counts": activity_counts,
+            "recent_sec": RECENT_SEC, "quiet_sec": QUIET_SEC, "now_ms": now_ms,
             "all_agents": all_agents,
             "config": read_agent_defs()}
 
@@ -469,6 +590,12 @@ def query_agents(con):
 GRAPH_LIMIT = 200
 SESS_LIMIT = 100
 INSP_PREVIEW = 1500
+INSP_PAGE_DEFAULT = 50
+INSP_PAGE_MAX = 200
+INSP_PARTS_PER_MSG = 20
+INSP_MSG_JSON_CAP = 16384
+INSP_PART_DATA_CAP = 8192
+INSP_BUDGET_BYTES = 1024 * 1024
 
 def _row_dict(r):
     return {k: r[k] for k in r.keys()}
@@ -521,45 +648,127 @@ def query_sessions(con, q="", agent="", model="", limit=SESS_LIMIT):
         rows.append(d)
     return {"rows": rows, "limit": limit}
 
-def query_inspect(con, sid):
+def query_inspect(con, sid, cursor=None, limit=None):
+    """Bounded inspector page (spec ch.16).
+
+    One page of messages ordered by (time_created, id) with a cursor, a
+    hard limit, parts fetched in ONE batched query (capped per message),
+    raw JSON reads bounded by substr()/LENGTH(), and a whole-response
+    UTF-8 budget. Invalid input returns a controlled dict; read-only.
+    """
+    try:
+        lim = int(limit) if limit is not None else INSP_PAGE_DEFAULT
+    except (TypeError, ValueError):
+        lim = INSP_PAGE_DEFAULT
+    if lim < 1:
+        lim = INSP_PAGE_DEFAULT
+    if lim > INSP_PAGE_MAX:
+        lim = INSP_PAGE_MAX
     s = con.execute("SELECT id, title, agent, model, directory, parent_id, time_created, time_updated FROM session WHERE id = ?", (sid,)).fetchone()
     if not s:
         return {"found": False, "id": sid}
-    msgs = []
-    for m in con.execute("SELECT id, data, time_created FROM message WHERE session_id = ? ORDER BY time_created", (sid,)):
+    after = None
+    if cursor:
+        cparts = str(cursor).split("|", 1)
+        if len(cparts) != 2:
+            return {"found": False, "id": sid, "error": "invalid cursor"}
         try:
-            md = json.loads(m["data"]) if isinstance(m["data"], str) else (m["data"] or {})
+            after = (int(cparts[0]), cparts[1])
+        except (TypeError, ValueError):
+            return {"found": False, "id": sid, "error": "invalid cursor"}
+    page_sql = ("SELECT id, substr(data,1,?) AS djson, LENGTH(data) AS dlen, "
+                "time_created FROM message WHERE session_id = ?")
+    args = [INSP_MSG_JSON_CAP, sid]
+    if after is not None:
+        page_sql += " AND (time_created > ? OR (time_created = ? AND id > ?))"
+        args += [after[0], after[0], after[1]]
+    page_sql += " ORDER BY time_created, id LIMIT ?"
+    args.append(lim + 1)
+    rows = list(con.execute(page_sql, args))
+    has_more = len(rows) > lim
+    rows = rows[:lim]
+    msg_ids = [r["id"] for r in rows]
+    parts_by_msg = {}
+    parts_total = {}
+    if msg_ids:
+        qmarks = ",".join("?" for _ in msg_ids)
+        parts_sql = ("SELECT id, message_id, substr(data,1,?) AS pjson, "
+                     "LENGTH(data) AS size FROM (SELECT id, message_id, data, "
+                     "ROW_NUMBER() OVER (PARTITION BY message_id ORDER BY id) AS rn "
+                     "FROM part WHERE message_id IN (" + qmarks + ")) WHERE rn <= ? "
+                     "ORDER BY message_id, id")
+        pargs = [INSP_PART_DATA_CAP] + msg_ids + [INSP_PARTS_PER_MSG]
+        for p in con.execute(parts_sql, pargs):
+            parts_by_msg.setdefault(p["message_id"], []).append(p)
+        cnt_sql = ("SELECT message_id, COUNT(*) AS c FROM part "
+                   "WHERE message_id IN (" + qmarks + ") GROUP BY message_id")
+        for c in con.execute(cnt_sql, msg_ids):
+            parts_total[c["message_id"]] = c["c"]
+    msgs = []
+    for r in rows:
+        raw = r["djson"]
+        try:
+            md = json.loads(raw) if isinstance(raw, str) else {}
         except Exception:
             md = {}
         if not isinstance(md, dict):
             md = {}
-        mid = m["id"]
-        parts = []
-        try:
-            for p in con.execute("SELECT id, data FROM part WHERE message_id = ? ORDER BY id", (mid,)):
-                raw = p["data"]
-                size = len(raw) if isinstance(raw, str) else 0
-                try:
-                    pd = json.loads(raw) if isinstance(raw, str) else {}
-                except Exception:
-                    pd = {}
-                if not isinstance(pd, dict):
-                    pd = {}
-                ptype = pd.get("type", "?")
-                prev = ""
-                for k in ("text", "content", "reasoning", "summary"):
-                    v = pd.get(k)
-                    if isinstance(v, str) and v:
-                        prev = v[:INSP_PREVIEW]
-                        break
-                if not prev and isinstance(raw, str):
-                    prev = raw[:500]
-                parts.append({"id": p["id"], "type": ptype, "size": size, "preview": prev, "truncated": size > INSP_PREVIEW})
-        except Exception as e:
-            parts = [{"error": str(e)}]
-        msgs.append({"id": mid, "role": md.get("role", "?"), "agent": md.get("agent", ""), "model": md.get("model", ""), "time": m["time_created"], "summary": _sstr(md.get("summary", ""))[:500], "parts": parts})
+        mid = r["id"]
+        plist = []
+        for p in parts_by_msg.get(mid, []):
+            praw = p["pjson"]
+            size = p["size"] if isinstance(p["size"], int) else (len(praw) if isinstance(praw, str) else 0)
+            truncated = size > INSP_PART_DATA_CAP
+            raw_frag = False
+            try:
+                pd = json.loads(praw) if isinstance(praw, str) else {}
+            except Exception:
+                pd = {}
+            if not isinstance(pd, dict):
+                pd = {}
+            ptype = pd.get("type", "?")
+            prev = ""
+            for k in ("text", "content", "reasoning", "summary"):
+                v = pd.get(k)
+                if isinstance(v, str) and v:
+                    prev = v[:INSP_PREVIEW]
+                    break
+            if not prev and isinstance(praw, str):
+                prev = praw[:500]
+                raw_frag = truncated
+            plist.append({"id": p["id"], "type": ptype, "size": size,
+                          "preview": prev, "truncated": truncated,
+                          "raw_fragment": raw_frag})
+        mdict = {"id": mid, "role": md.get("role", "?"),
+                 "agent": md.get("agent", ""), "model": md.get("model", ""),
+                 "time": r["time_created"],
+                 "summary": _sstr(md.get("summary", ""))[:500],
+                 "parts": plist}
+        omitted = max(0, parts_total.get(mid, 0) - INSP_PARTS_PER_MSG)
+        if omitted:
+            mdict["parts_omitted"] = omitted
+        if isinstance(r["dlen"], int) and r["dlen"] > INSP_MSG_JSON_CAP:
+            mdict["data_truncated"] = True
+        msgs.append(mdict)
     out = _row_dict(s)
-    out.update({"found": True, "messages": msgs})
+    out.update({"found": True, "messages": msgs, "has_more": has_more,
+                "cursor": ((str(msgs[-1]["time"]) + "|" + str(msgs[-1]["id"]))
+                           if msgs else None),
+                "count": len(msgs), "limit": lim,
+                "response_truncated": False,
+                "parts_truncated": any(m.get("parts_omitted") for m in msgs)
+                or any(p.get("truncated") for m in msgs for p in m["parts"])})
+    while (len(json.dumps(out).encode("utf-8")) > INSP_BUDGET_BYTES
+           and out["messages"]):
+        out["messages"].pop()
+        out["response_truncated"] = True
+        out["has_more"] = True
+        out["count"] = len(out["messages"])
+        if out["messages"]:
+            last = out["messages"][-1]
+            out["cursor"] = str(last["time"]) + "|" + str(last["id"])
+    if not out["messages"]:
+        out["cursor"] = cursor
     return out
 
 def query_projects(con):
@@ -591,16 +800,27 @@ def query_signals(con):
         con.execute("SELECT * FROM router LIMIT 1").fetchone()
     except Exception as e:
         sigs.append({"level": "info", "text": "Router table unreadable: " + str(e)[:120]})
-    import os as _os, time as _time
+    import time as _time
     try:
-        cx = str(CODEX_DIR)
-        files = [f for f in _os.listdir(cx) if f.endswith(".jsonl")]
-        if files:
-            newest = max(_os.path.getmtime(_os.path.join(cx, f)) for f in files)
-            age_h = (_time.time() - newest) / 3600
-            sigs.append({"level": "ok" if age_h < 72 else "warn", "text": "Codex: " + str(len(files)) + " files, newest " + ("%.1f" % age_h) + "h ago"})
+        files, cstate, cskip = _codex_rollout_files()
+        n_ok, newest, sskip = _codex_rollout_stats(files)
+        skipped = cskip + sskip
+        if cstate == "missing":
+            sigs.append({"level": "warn", "text": "Codex sessions dir missing"})
+        elif cstate == "unreadable":
+            sigs.append({"level": "warn", "text": "Codex dir unreadable"})
+        elif not n_ok:
+            if skipped:
+                sigs.append({"level": "warn", "text": "Codex: rollout files unreadable (skipped " + str(skipped) + ")"})
+            else:
+                sigs.append({"level": "warn", "text": "Codex sessions dir empty"})
         else:
-            sigs.append({"level": "warn", "text": "Codex sessions dir empty"})
+            age_h = (_time.time() - newest) / 3600
+            txt = "Codex: " + str(n_ok) + " files, newest " + ("%.1f" % age_h) + "h ago"
+            if skipped:
+                txt += " (partial: " + str(skipped) + " skipped)"
+            sigs.append({"level": "ok" if (age_h < 72 and not skipped) else "warn",
+                         "text": txt})
     except Exception as e:
         sigs.append({"level": "warn", "text": "Codex dir unreadable: " + str(e)[:120]})
     return {"signals": sigs}
@@ -608,6 +828,68 @@ def query_signals(con):
 CODEX_DIR = _HOME / ".codex" / "sessions"
 _codex_cache = {}
 _codex_sig = None
+
+CODEX_PARSER_VERSION = 1
+CODEX_CACHE_DIR = Path(__file__).with_name(".cache")
+CODEX_INDEX = CODEX_CACHE_DIR / "codex_index.json"
+_codex_file_state = {}
+_codex_ev_state = {}
+_codex_index_note = None
+_CODEX_ANCHOR_LEN = 64
+# A05: bounded record scans. Lines above the cap are skipped whole while
+# reading (their remainder is discarded in block-sized pieces) and counted;
+# the scan buffer never exceeds cap + one read block.
+_CODEX_READ_BLOCK = 65536
+_codex_oversize_records = 0
+
+# F5b: one shared rollout enumeration for diagnostics, the session list and
+# the synth reader - same root, same name pattern, same states.
+CODEX_ROLLOUT_GLOB = "rollout-*.jsonl"
+
+def _codex_rollout_files():
+    # Returns (files, state, skipped). state: missing (no dir), unreadable
+    # (listing failed), empty (no matching file), partial (some matching
+    # entries vanished or were unreadable while enumerating), ok.
+    try:
+        if not CODEX_DIR.is_dir():
+            return [], "missing", 0
+    except OSError:
+        return [], "missing", 0
+    try:
+        cand = sorted(CODEX_DIR.rglob(CODEX_ROLLOUT_GLOB))
+    except OSError:
+        return [], "unreadable", 0
+    files = []
+    skipped = 0
+    for p in cand:
+        try:
+            ok = p.is_file()
+        except OSError:
+            ok = False
+        if ok:
+            files.append(p)
+        else:
+            skipped += 1
+    if skipped:
+        return files, ("partial" if files else "empty"), skipped
+    return files, ("ok" if files else "empty"), 0
+
+def _codex_rollout_stats(files):
+    # File count and newest mtime over the same set the parsers read; stat
+    # failures are counted as skipped (partial read), never as success.
+    ok = 0
+    newest = 0
+    skipped = 0
+    for p in files:
+        try:
+            st = p.stat()
+        except OSError:
+            skipped += 1
+            continue
+        ok += 1
+        if st.st_mtime > newest:
+            newest = st.st_mtime
+    return ok, newest, skipped
 
 def _ctext(blocks):
     if not isinstance(blocks, list):
@@ -618,111 +900,439 @@ def _ctext(blocks):
             out.append(b["text"])
     return " ".join(out)
 
-def _parse_codex_file(p, st):
-    row = {"file": str(p), "name": p.stem, "n": 0, "tok": 0, "tools": {},
-           "previews": [], "model": "", "provider": "", "cwd": "",
-           "sid": "", "first": "", "last": "",
-           "_sz": st.st_size, "_mt": int(st.st_mtime)}
+def _codex_new_row(p, st):
+    return {"file": str(p), "name": p.stem, "n": 0, "tok": 0, "tools": {},
+            "previews": [], "model": "", "provider": "", "cwd": "",
+            "sid": "", "first": "", "last": "",
+            "_sz": st.st_size, "_mt": int(st.st_mtime),
+            "_invalid": 0, "_err": False}
+
+
+def _codex_finish(row):
+    out = dict(row)
+    out["tools"] = sorted(row["tools"].items(), key=lambda kv: kv[1],
+                          reverse=True)[:8]
+    return out
+
+
+def _codex_consume(row, line):
+    line = line.strip()
+    if not line:
+        return
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(rec, dict):
+        row["_invalid"] += 1
+        return
+    t = rec.get("type")
+    pl = rec.get("payload")
+    if not isinstance(pl, dict):
+        pl = {}
+    ts = rec.get("timestamp") or ""
+    if ts:
+        if not row["first"]:
+            row["first"] = ts
+        row["last"] = ts
+    if t == "session_meta":
+        row["sid"] = pl.get("id") or row["sid"]
+        row["cwd"] = pl.get("cwd") or row["cwd"]
+        row["provider"] = pl.get("model_provider") or row["provider"]
+    elif t == "event_msg":
+        row["n"] += 1
+        txt = _ctext((pl.get("item") or {}).get("content"))
+        if txt and len(row["previews"]) < 3:
+            row["previews"].append(txt[:200])
+    elif t == "response_item":
+        nm = pl.get("name")
+        if nm:
+            row["tools"][nm] = row["tools"].get(nm, 0) + 1
+        txt = _ctext(pl.get("content"))
+        if txt and len(row["previews"]) < 3:
+            row["previews"].append(txt[:200])
+    elif t == "turn_context":
+        if not row["model"] and pl.get("model"):
+            row["model"] = pl["model"]
+    elif t == "token_usage_record":
+        u = pl.get("usage") or {}
+        try:
+            row["tok"] += int(u.get("total_tokens") or 0)
+        except (TypeError, ValueError):
+            pass
+
+
+def _parse_codex_file(p, st, row=None):
+    if row is None:
+        row = _codex_new_row(p, st)
     try:
         fh = open(p, encoding="utf-8", errors="replace")
     except OSError:
-        return row
+        row["_err"] = True
+        return _codex_finish(row)
     with fh:
         for line in fh:
-            line = line.strip()
-            if not line:
+            _codex_consume(row, line)
+    row["_sz"] = st.st_size
+    row["_mt"] = int(st.st_mtime)
+    return _codex_finish(row)
+
+
+def _codex_files_sig(files, schema=None):
+    parts = []
+    for p in files:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        parts.append((str(p), st.st_size, st.st_mtime_ns,
+                      getattr(st, "st_ino", 0)))
+    if schema is None:
+        return (CODEX_PARSER_VERSION, tuple(sorted(parts)))
+    return (schema, CODEX_PARSER_VERSION, tuple(sorted(parts)))
+
+
+def _codex_scan_lines(fh, cap, initial_tail=b""):
+    """Scan physical source lines with bounded memory (A05).
+
+    Only newline-terminated lines are kept. A complete line above ``cap``
+    bytes is skipped whole - its remainder is discarded while scanning for
+    the newline - and counted in ``_codex_oversize_records``. An
+    unterminated trailing fragment is ignored (the previous ``_codex_split``
+    semantics). Returns ``(lines, used, tail)``: ``used`` is the absolute
+    offset just past the last newline, ``tail`` the last bytes ending there.
+    """
+    global _codex_oversize_records
+    oversize = 0
+    block = _CODEX_READ_BLOCK
+    lines = []
+    tail = initial_tail
+    buf = b""
+    base = fh.tell()
+    used = base
+    overlong = False
+    while True:
+        chunk = fh.read(block)
+        if not chunk:
+            break
+        buf += chunk
+        base = fh.tell() - len(buf)
+        pos = 0
+        while True:
+            nl = buf.find(b"\n", pos)
+            if nl < 0:
+                if overlong:
+                    buf = b""
+                    base = fh.tell()
+                else:
+                    buf = buf[pos:]
+                    base = base + pos
+                    if len(buf) > cap:
+                        _codex_oversize_records += 1
+                        oversize += 1
+                        overlong = True
+                        buf = b""
+                        base = fh.tell()
+                break
+            if overlong:
+                overlong = False
+                tail = (buf[max(pos, nl - (_CODEX_ANCHOR_LEN - 1)):nl]
+                        + b"\n")[-_CODEX_ANCHOR_LEN:]
+            else:
+                line = buf[pos:nl]
+                if len(line) > cap:
+                    _codex_oversize_records += 1
+                    oversize += 1
+                    tail = (line[-(_CODEX_ANCHOR_LEN - 1):]
+                            + b"\n")[-_CODEX_ANCHOR_LEN:]
+                else:
+                    lines.append(line.decode("utf-8", "replace"))
+                    tail = (tail + line + b"\n")[-_CODEX_ANCHOR_LEN:]
+            used = base + nl + 1
+            pos = nl + 1
+    return lines, used, tail, oversize
+
+
+def _codex_full_read(p, fp):
+    with open(p, "rb") as fh:
+        lines, used, tail, oversize = _codex_scan_lines(
+            fh, MAX_ROUTER_RECORD_BYTES)
+    return lines, used, fp, True, tail, oversize
+
+
+def _codex_anchor_ok(p, off, tail):
+    want = (tail or b"")[-_CODEX_ANCHOR_LEN:]
+    begin = off - len(want)
+    if begin < 0 or not want:
+        return False
+    with open(p, "rb") as fh:
+        fh.seek(begin)
+        got = fh.read(len(want))
+    return got == want
+
+
+def _codex_read_since(p, state):
+    st = p.stat()
+    fp = (st.st_size, st.st_mtime_ns, getattr(st, "st_ino", 0))
+    if state is None:
+        return _codex_full_read(p, fp)
+    old_fp = state.get("fp") or (0, 0, 0)
+    old_off = int(state.get("offset") or 0)
+    old_tail = state.get("tail")
+    rebuild = (old_tail is None or fp[0] < old_off or fp[2] != old_fp[2]
+               or (old_fp[1] is not None and fp[1] < (old_fp[1] or 0)))
+    if not rebuild and fp != old_fp and old_off > 0:
+        if fp[0] == old_off:
+            rebuild = True
+        else:
+            rebuild = not _codex_anchor_ok(p, old_off, old_tail)
+    if rebuild:
+        return _codex_full_read(p, fp)
+    if fp[0] == old_off:
+        return [], old_off, fp, False, old_tail, 0
+    with open(p, "rb") as fh:
+        fh.seek(old_off)
+        lines, used_abs, tail, oversize = _codex_scan_lines(
+            fh, MAX_ROUTER_RECORD_BYTES, old_tail)
+    if used_abs <= old_off:
+        return [], old_off, fp, False, old_tail, 0
+    return lines, used_abs, fp, False, tail, oversize
+
+
+def _codex_update_row(p, st, state):
+    cur_fp = (st.st_size, st.st_mtime_ns, getattr(st, "st_ino", 0))
+    if state is not None and state.get("fp") == cur_fp:
+        return state
+    try:
+        lines, off, fp, rebuild, tail, oversize = _codex_read_since(p, state)
+    except OSError:
+        # Audit A01 (session list): a transient read error must neither wipe
+        # the last good contribution nor be blessed as the current
+        # fingerprint - the next plain call retries the read.
+        if state is not None:
+            row = dict(state.get("row") or {})
+            row["_err"] = True
+            return {"fp": state.get("fp"),
+                    "offset": int(state.get("offset") or 0),
+                    "row": row, "tail": state.get("tail") or b"",
+                    "oversize": int(state.get("oversize") or 0)}
+        row = _codex_new_row(p, st)
+        row["_err"] = True
+        return {"fp": None, "offset": 0, "row": row, "tail": b"",
+                "oversize": 0}
+    if state is not None and not rebuild:
+        row = state["row"]
+    else:
+        row = _codex_new_row(p, st)
+    for line in lines:
+        _codex_consume(row, line)
+    row.pop("_err", None)  # a successful read clears the transient error
+    row["_sz"] = st.st_size
+    row["_mt"] = int(st.st_mtime)
+    return {"fp": fp, "offset": off, "row": row, "tail": tail,
+            "oversize": ((int(state.get("oversize") or 0) + oversize)
+                         if (state is not None and not rebuild)
+                         else oversize)}
+
+
+def _file_sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_codex_index(rows):
+    # Checkpoint is a restart optimization, never a source of truth: a write
+    # failure must not fail the publish or roll back published data.
+    global _codex_index_note
+    tmp = None
+    try:
+        CODEX_INDEX.parent.mkdir(parents=True, exist_ok=True)
+        generation = _file_sha256(CODEX_SYNTH) if CODEX_SYNTH.is_file() else None
+        files_doc = {}
+        for key, state in _codex_ev_state.items():
+            try:
+                st = Path(key).stat()
+            except OSError:
+                continue
+            files_doc[key] = {
+                "size": st.st_size,
+                "mtime_ns": st.st_mtime_ns,
+                "ino": getattr(st, "st_ino", 0),
+                "offset": int(state.get("offset") or 0),
+                "model": state.get("model", ""),
+                "provider": state.get("provider", "?"),
+                "tail": (state.get("tail") or b"").hex(),
+                "oversize": int(state.get("oversize") or 0),
+                "events": state.get("events", []),
+            }
+        doc = {"version": CODEX_PARSER_VERSION, "schema": SYNTH_SCHEMA,
+               "generation": generation, "files": files_doc,
+               "oversize": int(_codex_last_oversize)}
+        tmp = CODEX_INDEX.with_name(CODEX_INDEX.name + ".tmp.%d.%d" % (
+            os.getpid(), threading.get_ident()))
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            # Single serialization call: json.dump streams hundreds of small
+            # write() calls for a large index; one write keeps the checkpoint
+            # cheap even on slow/filtered filesystems (and for tests whose
+            # writer proxies count writes).
+            f.write(json.dumps(doc))
+            f.flush()
+        os.replace(str(tmp), str(CODEX_INDEX))
+        _codex_index_note = None
+        return True
+    except OSError:
+        if tmp is not None:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+        _codex_index_note = "codex index write failed (restart optimization lost)"
+        return False
+
+
+def _load_codex_index(files):
+    # Adopt a checkpoint only when it matches the published generation and the
+    # sources still line up; otherwise reject the checkpoint (never the user
+    # logs) and let the caller rebuild from scratch.
+    global _codex_last_oversize
+    if _codex_ev_state:
+        return False
+    try:
+        doc = json.loads(CODEX_INDEX.read_bytes().decode("utf-8"))
+        if doc.get("version") != CODEX_PARSER_VERSION:
+            return False
+        if doc.get("schema") != SYNTH_SCHEMA:
+            return False
+        if not CODEX_SYNTH.is_file():
+            return False
+        if doc.get("generation") != _file_sha256(CODEX_SYNTH):
+            return False
+        entries = doc.get("files")
+        if not isinstance(entries, dict):
+            return False
+        adopted = {}
+        for p in files:
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            e = entries.get(str(p))
+            if not isinstance(e, dict):
                 continue
             try:
-                rec = json.loads(line)
+                off = int(e.get("offset") or 0)
+            except (TypeError, ValueError):
+                continue
+            if off < 0 or st.st_size < off:
+                continue
+            saved_ino = e.get("ino") or 0
+            ino = getattr(st, "st_ino", 0)
+            if saved_ino and ino and saved_ino != ino:
+                continue
+            raw_tail = e.get("tail")
+            if not isinstance(raw_tail, str):
+                continue
+            try:
+                tail = bytes.fromhex(raw_tail)
             except ValueError:
                 continue
-            t = rec.get("type")
-            pl = rec.get("payload")
-            if not isinstance(pl, dict):
-                pl = {}
-            ts = rec.get("timestamp") or ""
-            if ts:
-                if not row["first"]:
-                    row["first"] = ts
-                row["last"] = ts
-            if t == "session_meta":
-                row["sid"] = pl.get("id") or row["sid"]
-                row["cwd"] = pl.get("cwd") or row["cwd"]
-                row["provider"] = pl.get("model_provider") or row["provider"]
-            elif t == "event_msg":
-                row["n"] += 1
-                txt = _ctext((pl.get("item") or {}).get("content"))
-                if txt and len(row["previews"]) < 3:
-                    row["previews"].append(txt[:200])
-            elif t == "response_item":
-                nm = pl.get("name")
-                if nm:
-                    row["tools"][nm] = row["tools"].get(nm, 0) + 1
-                txt = _ctext(pl.get("content"))
-                if txt and len(row["previews"]) < 3:
-                    row["previews"].append(txt[:200])
-            elif t == "turn_context":
-                if not row["model"] and pl.get("model"):
-                    row["model"] = pl["model"]
-            elif t == "token_usage_record":
-                u = pl.get("usage") or {}
-                try:
-                    row["tok"] += int(u.get("total_tokens") or 0)
-                except (TypeError, ValueError):
-                    pass
-    tl = row.pop("tools")
-    row["tools"] = sorted(tl.items(), key=lambda kv: kv[1], reverse=True)[:8]
-    return row
+            adopted[str(p)] = {
+                "fp": (int(e.get("size") or 0), int(e.get("mtime_ns") or 0),
+                       saved_ino or ino),
+                "offset": off,
+                "model": str(e.get("model") or ""),
+                "provider": str(e.get("provider") or "?"),
+                "oversize": int(e.get("oversize") or 0),
+                "events": list(e.get("events") or []),
+                "tail": tail,
+            }
+        if not adopted:
+            return False
+        _codex_ev_state.update(adopted)
+        try:
+            _codex_last_oversize = int(doc.get("oversize") or 0)
+        except (TypeError, ValueError):
+            _codex_last_oversize = 0
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
 
 def query_codex(force=False):
     global _codex_cache, _codex_sig
-    try:
-        files = sorted(CODEX_DIR.rglob("rollout-*.jsonl")) if CODEX_DIR.is_dir() else []
-    except OSError:
-        files = []
-    tot = 0
-    for p in files:
-        try:
-            s = p.stat()
-            tot += s.st_size + int(s.st_mtime)
-        except OSError:
-            pass
-    sig = (len(files), tot)
+    files, _cstate, cskip = _codex_rollout_files()
+    skipped = cskip
+    sig = _codex_files_sig(files)
     if force or _codex_sig != sig:
-        rows = {}
+        new_states = {}
         for p in files:
             try:
                 st = p.stat()
             except OSError:
                 continue
             key = str(p)
-            old = _codex_cache.get(key)
-            if (not force and old and old.get("_sz") == st.st_size
-                    and old.get("_mt") == int(st.st_mtime)):
-                rows[key] = old
-                continue
-            rows[key] = _parse_codex_file(p, st)
-        _codex_cache = rows
-        _codex_sig = sig
-    sess = [r for r in _codex_cache.values() if r.get("n")]
+            new_states[key] = _codex_update_row(
+                p, st, None if force else _codex_file_state.get(key))
+        _codex_file_state.clear()
+        _codex_file_state.update(new_states)
+        # Audit A01: do not bless a signature that includes failed reads;
+        # the next plain call retries them instead of serving a stale empty.
+        if not any((s.get("row") or {}).get("_err")
+                   for s in new_states.values()):
+            _codex_sig = sig
+    sess = []
+    invalid = 0
+    for key in sorted(_codex_file_state):
+        row = _codex_file_state[key]["row"]
+        if row.get("_err"):
+            skipped += 1
+        invalid += row.get("_invalid", 0)
+        if row.get("n") or row.get("tok"):
+            sess.append(_codex_finish(row))
     sess.sort(key=lambda r: r.get("last") or "", reverse=True)
-    models = {}
-    t_tok = 0
-    t_msg = 0
-    for r in sess:
-        m = r.get("model") or r.get("provider") or "?"
-        e = models.setdefault(m, {"n": 0, "tok": 0})
-        e["n"] += 1
-        e["tok"] += r.get("tok", 0)
-        t_tok += r.get("tok", 0)
-        t_msg += r.get("n", 0)
-    return {"ok": True, "total": len(sess), "files": len(files),
-            "tokens": t_tok, "msgs": t_msg, "models": models,
-            "sessions": sess[:200]}
+    models = sorted({(r.get("model") or r.get("provider") or "?") for r in sess})
+    tokens = sum(r.get("tok", 0) for r in sess)
+    msgs = sum(r.get("n", 0) for r in sess)
+    return {
+        "ok": True,
+        "total": len(sess),
+        "files": len(files),
+        "tokens": tokens,
+        "msgs": msgs,
+        "models": models,
+        "invalid_records": invalid,
+        "partial": bool(skipped),
+        "sessions": sess[:200],
+    }
+
 
 CODEX_SYNTH = Path(__file__).with_name("codex_router_events.jsonl")
 _codex_ev_cache = {}
 _codex_ev_sig = None
+_codex_last_error = None  # F5a: last synth publish failure text
+_codex_last_ok = None  # F5a: path of the last successful publish
+_codex_last_oversize = 0  # A05: oversize source lines skipped in the last publish
+# A01: per-file read failures recorded by _parse_codex_events. A build with
+# any recorded failure must not publish a new generation (no fake emptiness).
+_codex_read_failures = {}
+# F6a: publish-stage lock only; thread scope within this process. It is not
+# held while parsing rollouts or writing the candidate tmp file.
+_SYNTH_LOCK = threading.Lock()
+_synth_tmp_active = set()
+_synth_tmp_seq = 0
+# F6d: single-build gate. Concurrent callers share one parse: waiters block
+# on the builder's condition (bounded to 30 s) and then reuse the published
+# snapshot; heavy work never multiplies per client request.
+_CODEX_BUILD_LOCK = threading.Condition()
+_codex_build_in_progress = False
 
 def _numi(v):
     try:
@@ -731,90 +1341,216 @@ def _numi(v):
         return 0
 
 def _parse_codex_events(p):
-    evs = []
-    provider = "?"
-    model = ""
+    key = str(p)
+    state = _codex_ev_state.get(key)
     try:
-        fh = open(p, "r", encoding="utf-8", errors="replace")
-    except OSError:
-        return evs
-    with fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
+        st = p.stat()
+    except OSError as e:
+        _codex_read_failures[key] = "%s: %s" % (type(e).__name__, e)
+        return []
+    fp = (st.st_size, st.st_mtime_ns, getattr(st, "st_ino", 0))
+    if state is not None and state.get("fp") == fp:
+        _codex_read_failures.pop(key, None)
+        return list(state["events"])
+    try:
+        lines, off, fp, rebuild, tail, oversize = _codex_read_since(
+            p, state)
+    except OSError as e:
+        _codex_read_failures[key] = "%s: %s" % (type(e).__name__, e)
+        return []
+    _codex_read_failures.pop(key, None)
+    if state is not None and not rebuild:
+        model = state.get("model", "")
+        provider = state.get("provider", "?")
+        events = state["events"]
+    else:
+        model = ""
+        provider = "?"
+        events = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        pay = rec.get("payload")
+        if not isinstance(pay, dict):
+            continue
+        t = rec.get("type")
+        if t == "session_meta":
+            provider = str(pay.get("model_provider") or pay.get("provider")
+                           or provider)
+        elif t == "turn_context":
+            model = str(pay.get("model") or model)
+        elif t == "token_usage_record":
+            u = pay.get("usage")
+            if not isinstance(u, dict):
+                continue
+            events.append({"at": rec.get("timestamp"), "model": model,
+                           "provider": provider,
+                           "ti": _numi(u.get("input_tokens")),
+                           "cache": _numi(u.get("cached_input_tokens")),
+                           "to": _numi(u.get("output_tokens")),
+                           "total": _numi(u.get("total_tokens")),
+                           "reasoning": _numi(u.get("reasoning_output_tokens")),
+                           "cache_write": _numi(u.get("cache_write_input_tokens"))})
+    _codex_ev_state[key] = {
+        "fp": fp, "offset": off, "model": model,
+        "provider": provider, "events": events, "tail": tail,
+        "oversize": (int(state.get("oversize") or 0) + oversize)
+                    if (state is not None and not rebuild) else oversize,
+    }
+    return list(events)
+
+
+def _synth_sig_of(files):
+    # Non-additive per-file fingerprint: identity, size, mtime_ns, inode.
+    return _codex_files_sig(files, schema=SYNTH_SCHEMA)
+
+
+def _cleanup_synth_tmps():
+    # F6a: remove stale candidates matching our own naming pattern only.
+    # Candidates currently being written in this process are spared.
+    try:
+        pat = CODEX_SYNTH.name + ".tmp."
+        for p in CODEX_SYNTH.parent.glob(pat + "*"):
+            if p.name in _synth_tmp_active:
                 continue
             try:
-                rec = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(rec, dict):
-                continue
-            pay = rec.get("payload")
-            if not isinstance(pay, dict):
-                continue
-            t = rec.get("type")
-            if t == "session_meta":
-                provider = str(pay.get("model_provider") or pay.get("provider") or provider)
-            elif t == "turn_context":
-                model = str(pay.get("model") or model)
-            elif t == "token_usage_record":
-                u = pay.get("usage")
-                if not isinstance(u, dict):
-                    continue
-                evs.append({"at": rec.get("timestamp"), "model": model,
-                            "provider": provider,
-                            "ti": _numi(u.get("input_tokens")),
-                            "cache": _numi(u.get("cached_input_tokens")),
-                            "to": _numi(u.get("output_tokens")),
-                            "total": _numi(u.get("total_tokens")),
-                            "reasoning": _numi(u.get("reasoning_output_tokens")),
-                            "cache_write": _numi(u.get("cache_write_input_tokens"))})
-    return evs
+                if p.is_file():
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+def _synth_next_seq():
+    global _synth_tmp_seq
+    _synth_tmp_seq += 1
+    return _synth_tmp_seq
 
 def ensure_codex_synth(force=False):
-    global _codex_ev_cache, _codex_ev_sig
+    # F5a/F6a: the candidate generation is parsed and written to a unique
+    # tmp file, then published by os.replace under _SYNTH_LOCK; only after a
+    # successful swap do the signature and parse cache become committed.
+    # Returns (path, error): error is None on success; a publish failure
+    # keeps the previous generation and returns its error; with no usable
+    # previous generation a RuntimeError states the source is unavailable.
+    # Readers are lock-free: os.replace yields a complete A or B snapshot.
+    # Lock scope is thread-level within this process (single instance).
+    global _codex_ev_cache, _codex_ev_sig, _codex_last_error, _codex_last_ok
+    global _codex_last_oversize, _codex_oversize_records
+    global _codex_build_in_progress
+    _cleanup_synth_tmps()
+    files, _cstate, _cskip = _codex_rollout_files()
+    _load_codex_index(files)
+    sig = _synth_sig_of(files)
+    if not force and _codex_ev_sig == sig and CODEX_SYNTH.is_file():
+        _codex_last_error = None
+        return str(CODEX_SYNTH), None
+    if not force:
+        deadline = time.time() + 30.0
+        with _CODEX_BUILD_LOCK:
+            while True:
+                if _codex_ev_sig == sig and CODEX_SYNTH.is_file():
+                    _codex_last_error = None
+                    return str(CODEX_SYNTH), None
+                if not _codex_build_in_progress:
+                    _codex_build_in_progress = True
+                    break
+                if time.time() > deadline:
+                    msg = "codex synth build still in progress after 30 s"
+                    _codex_last_error = msg
+                    raise RuntimeError(msg)
+                _CODEX_BUILD_LOCK.wait(
+                    timeout=min(5.0, max(0.05, deadline - time.time())))
     try:
-        files = sorted(CODEX_DIR.rglob("rollout-*.jsonl")) if CODEX_DIR.is_dir() else []
-    except OSError:
-        files = []
-    tot = 0
-    for p in files:
-        try:
-            st = p.stat()
-            tot += st.st_size + int(st.st_mtime)
-        except OSError:
-            pass
-    sig = (SYNTH_SCHEMA, len(files), tot)
-    if force or _codex_ev_sig != sig:
         rows = {}
+        failures = {}
+        # A05: oversize counts are per-file (state['oversize']); the published
+        # generation reports their sum, so appends and restarts keep them.
         for p in files:
+            key = str(p)
             try:
                 st = p.stat()
-            except OSError:
-                continue
-            key = str(p)
-            old = _codex_ev_cache.get(key)
-            if (not force and old is not None and old[0] == st.st_size
-                    and old[1] == int(st.st_mtime)):
-                rows[key] = old
+            except OSError as e:
+                _codex_read_failures[key] = "%s: %s" % (type(e).__name__, e)
+                failures[key] = _codex_read_failures[key]
                 continue
             rows[key] = (st.st_size, int(st.st_mtime), _parse_codex_events(p))
-        _codex_ev_cache = rows
-        _codex_ev_sig = sig
+            if key in _codex_read_failures:
+                failures[key] = _codex_read_failures[key]
+        if failures:
+            # A01: an unread source must not masquerade as an empty source.
+            msg = "codex read failed for %d file(s): %s" % (
+                len(failures),
+                "; ".join(failures[k] for k in sorted(failures)[:3]))
+            _codex_last_error = msg
+            if CODEX_SYNTH.is_file():
+                return str(CODEX_SYNTH), msg
+            raise RuntimeError(msg)
+        tmp = CODEX_SYNTH.with_name(CODEX_SYNTH.name + ".tmp.%d.%d.%d" % (
+            os.getpid(), threading.get_ident(), _synth_next_seq()))
+        _synth_tmp_active.add(tmp.name)
         try:
-            with open(CODEX_SYNTH, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
                 for key in sorted(rows):
                     for e in rows[key][2]:
                         f.write(json.dumps({"at": e["at"], "model": e["model"],
-                            "provider": e["provider"], "status": 200,
+                            "provider": e["provider"], "status": None,
+                            "outcome": "unknown",
                             "inputTokens": e["ti"], "cachedInputTokens": e["cache"],
                             "outputTokens": e["to"], "totalTokens": e["total"],
                             "reasoningTokens": e.get("reasoning", 0),
                             "cacheWriteInputTokens": e.get("cache_write", 0),
                             "durationMs": None}) + "\n")
-        except OSError:
-            pass
-    return str(CODEX_SYNTH)
+                f.flush()
+            with _SYNTH_LOCK:
+                superseded = False
+                if not force:
+                    if _codex_ev_sig == sig:
+                        superseded = CODEX_SYNTH.is_file()
+                    elif _synth_sig_of(files) != sig and CODEX_SYNTH.is_file():
+                        superseded = True
+                if superseded:
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+                    _codex_last_error = None
+                    return str(CODEX_SYNTH), None
+                os.replace(str(tmp), str(CODEX_SYNTH))
+                _codex_ev_cache = rows
+                _codex_ev_sig = sig
+                _codex_last_ok = str(CODEX_SYNTH)
+                _codex_last_oversize = sum(
+                    int(_codex_ev_state.get(k, {}).get("oversize") or 0)
+                    for k in rows)
+                _codex_last_error = None
+                _write_codex_index(rows)
+                return str(CODEX_SYNTH), None
+        except OSError as e:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            msg = "codex synth publish failed: %s: %s" % (type(e).__name__, e)
+            _codex_last_error = msg
+            if CODEX_SYNTH.is_file():
+                return str(CODEX_SYNTH), msg
+            raise RuntimeError(msg) from e
+        finally:
+            _synth_tmp_active.discard(tmp.name)
+    finally:
+        if not force:
+            with _CODEX_BUILD_LOCK:
+                _codex_build_in_progress = False
+                _CODEX_BUILD_LOCK.notify_all()
 
 def router_events_path(handler_events):
     try:
@@ -824,7 +1560,8 @@ def router_events_path(handler_events):
                 return str(rp), False
     except OSError:
         pass
-    return ensure_codex_synth(), True
+    path, _err = ensure_codex_synth()
+    return path, True
 
 def query_stats(con):
     totals = dict(
@@ -1155,7 +1892,7 @@ def query_stats(con):
         if agents else "",
         f"Top subsystem: {subsys_rows[0][0]}, {subsys_rows[0][1]:,.0f} tokens across {subsys_rows[0][2]} sessions."
         if subsys_rows else "",
-        f"Priciest commit: “{(commit_rows[0][1] or '')[:60]}”, {commit_rows[0][7]:,.0f} tokens in the prior 24h."
+        f"Most usage before a commit: “{(commit_rows[0][1] or '')[:60]}”, {commit_rows[0][7]:,.0f} tokens in the 24h window (not commit cost)."
         if commit_rows and commit_rows[0][7] else "",
         f"Longest session: “{longest['title']}”, {fmt_dur_min(longest['mins'])}."
         if longest else "",
@@ -1192,6 +1929,7 @@ def query_stats(con):
         "subsystems": subsys_rows,
         "file_subsys": file_subsys,
         "commits": commit_rows,
+        "commit_windows": {"method": "time_window", "window_hours": COMMIT_WINDOW_HOURS, "scope": "project_time_window", "overlap_possible": True, "additive": False, "note": "Project-matched time window; windows overlap; rows must not be summed; not commit cost."},
         "session_files": session_files,
         "commit_sessions": commit_sessions,
         "days": day_entries,
@@ -1355,51 +2093,455 @@ def _router_event_day_hour(at):
         return None, None
 
 
-def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
-    """Read usage-events.jsonl tail; return list of normalized event dicts.
+def _router_token(value, present):
+    """Sanitize one router token counter -> (float_value, valid).
 
-    Each event: {at, date, hour, model, short, provider, status, ok,
-    ti, cache, to, total, reasoning, cache_write, ms, free, what_if}. Missing token fields on
-    error rows (401/429/500) become 0 and are counted as errors, never
-    estimated, actuals only.
+    Only real JSON numbers are measurements. A missing (or explicit null)
+    field is absent, not invalid. Present-but-invalid values -- bools,
+    NaN/Infinity, negatives, strings, objects/lists -- sanitize to 0.0 and
+    are reported via the invalid_records problem counter instead of
+    poisoning the aggregates or the JSON payload. Router-path only; the
+    local OpenCode num() helper is intentionally untouched.
+    """
+    if not present or value is None:
+        return 0.0, True
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0, False
+    if not math.isfinite(value) or value < 0:
+        return 0.0, False
+    return float(value), True
+
+
+def _router_outcome(status_value, status_present, outcome_value=None):
+    """Classify a router record into success/error/unknown -> (status, outcome).
+
+    Router-path only. Strict: only a real JSON int (never bool) in 200-299
+    observed from the router is success, 400-599 is error. Missing, null,
+    0, bools, floats, strings, lists/dicts, informational (1xx) and
+    redirects (3xx) without a final result are unknown. An explicit
+    ``outcome`` field of success/error/unknown wins when present (the
+    codex synth writer emits status None + outcome unknown). Status is an
+    int or None; never the string "unknown" and never a coerced 0 that
+    would read as success. Callers must branch on outcome, never on
+    ``not ok`` alone, because a third state exists.
+    """
+    if isinstance(outcome_value, str) and outcome_value in ("success", "error", "unknown"):
+        if isinstance(status_value, bool):
+            st = None
+        elif isinstance(status_value, int):
+            st = status_value if status_value != 0 else None
+        else:
+            st = None
+        # Unknown must never carry a fake 200; success/error keep real codes.
+        if outcome_value == "unknown" and st == 200:
+            # Only trust an explicit unknown with a null/missing status as
+            # honest; a bare 200 without provenance is handled by the
+            # synth-context override in the caller, not here.
+            pass
+        return st, outcome_value
+    if isinstance(status_value, bool):
+        return None, "unknown"
+    if not status_present or status_value is None:
+        return None, "unknown"
+    if isinstance(status_value, int):
+        v = status_value
+        if 200 <= v <= 299:
+            return v, "success"
+        if 400 <= v <= 599:
+            return v, "error"
+        if v == 0:
+            return None, "unknown"
+        return v, "unknown"
+    return None, "unknown"
+
+
+class _Unterminated(str):
+    """A source line that reached EOF without a trailing newline."""
+
+
+class _OverlongLine(object):
+    """Marker for a source line above MAX_ROUTER_RECORD_BYTES."""
+
+
+_OVERLONG = _OverlongLine()
+
+
+def _router_count_lines(path, fh=None):
+    """Exact physical line count for the usage file, cached and incremental.
+
+    Returns (lines, cached). Cold reads stream the file in bounded chunks
+    (never ``readlines``); a warm read with an unchanged fingerprint reuses
+    the count; an append counts only the newly written byte range; a shrink
+    or an identity change (rotation) falls back to a cold recount.
     """
     p = Path(path)
+    key = str(p)
     try:
-        with open(p, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+        # A06: identity always comes from the bound handle when one is given.
+        st = os.fstat(fh.fileno()) if fh is not None else p.stat()
     except OSError:
         raise RuntimeError(f"Router usage file not found: {path}")
-    if limit and len(lines) > limit:
-        lines = lines[-limit:]
+    size, mtime = st.st_size, st.st_mtime_ns
+    ent = _ROUTER_COUNT_CACHE.get(key)
+    if ent and ent["size"] == size and ent["mtime_ns"] == mtime:
+        return ent["lines"], True
+    block = _ROUTER_READ_BLOCK
+    cached = False
+    newlines = 0
+    last = b""
+    f = fh
+    try:
+        if f is None:
+            f = open(str(p), "rb")
+        try:
+            if ent and getattr(st, "st_ino", 0) == ent.get("ino") and size > ent["size"]:
+                added = size - ent["size"]
+                f.seek(ent["size"])
+                while added > 0:
+                    chunk = f.read(block if block < added else added)
+                    if not chunk:
+                        break
+                    added -= len(chunk)
+                    newlines += chunk.count(b"\n")
+                    last = chunk[-1:]
+                newlines += ent["newlines"]
+                cached = True
+            else:
+                f.seek(0)
+                while True:
+                    chunk = f.readline(block)
+                    if not chunk:
+                        break
+                    newlines += chunk.count(b"\n")
+                    last = chunk[-1:]
+        finally:
+            if fh is None and f is not None:
+                f.close()
+    except OSError:
+        raise RuntimeError(f"Router usage file not found: {path}")
+    lines = newlines + (1 if size > 0 and last != b"\n" else 0)
+    _ROUTER_COUNT_CACHE[key] = {
+        "size": size, "mtime_ns": mtime, "ino": getattr(st, "st_ino", 0),
+        "newlines": newlines, "lines": lines,
+    }
+    return lines, cached
+
+
+def _router_read_tail(path, limit, cap, fh=None):
+    """Last ``limit`` physical source lines of the usage file, as text.
+
+    Reads backwards in bounded byte blocks (never ``readlines``): only the
+    requested window is ever held - at most ``limit`` complete lines of at
+    most ``cap`` bytes each - and the read cost is the tail region, not the
+    file. A line above ``cap`` bytes yields the _OVERLONG marker; while
+    backtracking such a line its head is discarded in block-sized pieces
+    without accumulating. The final line without a newline is marked via
+    _Unterminated (unless oversize). meta records partial_head (always
+    False: the window starts on a line boundary) and ends_with_newline.
+    """
+    p = Path(path)
+    meta = {"partial_head": False, "ends_with_newline": True}
+    try:
+        # A06: the bound handle defines the generation being read.
+        size = (os.fstat(fh.fileno()) if fh is not None else p.stat()).st_size
+    except OSError:
+        raise RuntimeError(f"Router usage file not found: {path}")
+    if not size:
+        return [], meta
+    block = _ROUTER_READ_BLOCK
+    kept = []           # newest first while scanning, reversed before return
+    cur = b""           # bytes of the item currently being assembled
+    overlong = False    # discarding the head of an oversize line
+    first = True        # the file's own last line is still to be completed
+    skip_phantom = False  # set once the trailing newline is known
+
+    def _complete(line):
+        if len(line) > cap:
+            kept.append(_OVERLONG)
+        else:
+            kept.append(line.decode("utf-8", "replace"))
+
+    f = fh
+    try:
+        if f is None:
+            f = open(str(p), "rb")
+        try:
+            f.seek(size - 1)
+            ends = f.read(1) == b"\n"
+            meta["ends_with_newline"] = ends
+            skip_phantom = ends
+            pos = size
+            while pos > 0 and len(kept) < limit:
+                step = block if pos >= block else pos
+                pos -= step
+                f.seek(pos)
+                chunk = f.read(step)
+                end = len(chunk)
+                while end > 0 and len(kept) < limit:
+                    nl = chunk.rfind(b"\n", 0, end)
+                    if nl < 0:
+                        if not overlong:
+                            cur = chunk[:end] + cur
+                            if len(cur) > cap:
+                                overlong = True
+                                cur = b""
+                        break
+                    seg = chunk[nl + 1:end]
+                    if overlong:
+                        overlong = False
+                        if not (skip_phantom and not seg and not cur):
+                            kept.append(_OVERLONG)
+                    elif skip_phantom and not seg and not cur:
+                        pass  # empty span after the trailing newline
+                    else:
+                        if first:
+                            first = False
+                            if not ends:
+                                if len(seg + cur) > cap:
+                                    kept.append(_OVERLONG)
+                                else:
+                                    kept.append(_Unterminated(
+                                        (seg + cur).decode("utf-8", "replace")))
+                            else:
+                                _complete(seg + cur)
+                        else:
+                            _complete(seg + cur)
+                    skip_phantom = False
+                    cur = b""
+                    end = nl
+            if pos == 0 and len(kept) < limit:
+                if overlong:
+                    kept.append(_OVERLONG)
+                elif cur:
+                    if first and not ends:
+                        if len(cur) > cap:
+                            kept.append(_OVERLONG)
+                        else:
+                            kept.append(_Unterminated(
+                                cur.decode("utf-8", "replace")))
+                    else:
+                        _complete(cur)
+        finally:
+            if fh is None and f is not None:
+                f.close()
+    except OSError:
+        raise RuntimeError(f"Router usage file not found: {path}")
+    kept.reverse()
+    return kept, meta
+
+
+def _router_stream_lines(path, cap, fh=None):
+    """Lazily yield every physical source line of the usage file as text.
+
+    Memory stays bounded: blocks are read at a fixed size and lines are
+    assembled before decoding; a line above ``cap`` bytes yields _OVERLONG
+    once and the remainder of that line is discarded. The final line, when
+    EOF is reached without a newline, yields _Unterminated text. Returns
+    (generator, meta); meta['last_terminated'] mirrors the newline state.
+    """
+    p = Path(path)
+    meta = {"last_terminated": True, "partial_head": False}
+    if fh is not None:
+        f = fh
+    else:
+        try:
+            f = open(str(p), "rb")
+        except OSError:
+            raise RuntimeError(f"Router usage file not found: {path}")
+
+    def gen():
+        buf = b""
+        overlong = False
+        block = _ROUTER_READ_BLOCK
+        try:
+            while True:
+                chunk = f.readline(block)
+                if not chunk:
+                    break
+                buf += chunk
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        if overlong:
+                            buf = b""
+                            break
+                        if len(buf) > cap:
+                            overlong = True
+                            yield _OVERLONG
+                            buf = b""
+                        break
+                    if overlong:
+                        overlong = False
+                        buf = buf[nl + 1:]
+                        continue
+                    line = buf[:nl]
+                    buf = buf[nl + 1:]
+                    if len(line) > cap:
+                        yield _OVERLONG
+                    else:
+                        yield line.decode("utf-8", errors="replace")
+            if buf:
+                meta["last_terminated"] = False
+                if not overlong:
+                    if len(buf) > cap:
+                        yield _OVERLONG
+                    else:
+                        yield _Unterminated(buf.decode("utf-8", errors="replace"))
+        finally:
+            f.close()
+
+    return gen(), meta
+
+
+def parse_router_events(path, limit=MAX_ROUTER_EVENTS, synth_context=False):
+    """Read usage-events.jsonl tail; return (events, problems).
+
+    Each event: {at, date, hour, model, short, provider, status, outcome,
+    ok, ti, cache, to, total, reasoning, cache_write, ms, free, what_if,
+    total_reported, usage_partial, usage_known}. Status is an int or None;
+    outcome is success/error/unknown. ``ok`` is kept as outcome==success
+    for compatibility but must not be used as ``not ok`` == error because
+    a third state exists. usage_known separates measurement availability
+    from outcome: a correct token read in an unknown event still counts
+    toward usage; known usage in an error event is not erased. Missing
+    token fields become 0 and are never estimated, actuals only.
+
+    Total contract (router path): total = inputTokens + outputTokens.
+    Cached input is a subset of input, reasoning a subset of output --
+    never additive. A declared totalTokens conflicting with complete
+    components is normalized to ti + to and counted in
+    problems["total_conflicts"]; total_reported keeps the source value.
+    A record with only a declared total keeps that sum in every aggregate
+    with usage_partial=True (components are never invented). problems also
+    carries invalid_records (records with a present-but-invalid token
+    field, sanitized to 0 without aborting the read).
+
+    When synth_context is True (codex-synth generation), records without
+    an explicit success/error outcome are forced to unknown even if they
+    carry a legacy status 200, so a stale pre-migration index can never
+    read as confirmed successes.
+
+    Reading is bounded (F6b): a numeric ``limit`` scans only that many
+    physical source lines read from the end of the file in byte blocks
+    (never ``readlines`` of the whole file); ``limit=None`` streams the
+    whole file for synthesis. ``problems`` carries read metadata beside the
+    token problem counters: ``candidate_lines`` (source lines considered in
+    the scanned window), ``valid_records`` (parsed events),
+    ``oversize_records`` (lines above MAX_ROUTER_RECORD_BYTES, skipped but
+    counted), ``pending_tail_line`` (an unterminated trailing fragment that
+    is not valid JSON yet), ``partial_head``, ``window_mode``
+    ('full'|'physical_tail'), ``lines_total`` and ``count_cached``.
+    """
+    p = Path(path)
+    problems = {
+        "invalid_records": 0,
+        "total_conflicts": 0,
+        "candidate_lines": 0,
+        "valid_records": 0,
+        "oversize_records": 0,
+        "pending_tail_line": False,
+        "partial_head": False,
+        "window_mode": "full",
+        "lines_total": 0,
+        "count_cached": False,
+    }
     events = []
+    if limit:
+        try:
+            fh = open(str(p), "rb")
+        except OSError:
+            raise RuntimeError(f"Router usage file not found: {path}")
+        try:
+            # A06: count and tail read share one handle, so line metadata and
+            # scanned content always describe the same file generation even
+            # when the name is atomically replaced mid-call.
+            lines_total, count_cached = _router_count_lines(p, fh)
+            problems["lines_total"] = lines_total
+            problems["count_cached"] = count_cached
+            lines, meta = _router_read_tail(
+                p, limit, MAX_ROUTER_RECORD_BYTES, fh)
+        finally:
+            fh.close()
+        problems["partial_head"] = meta["partial_head"]
+        problems["window_mode"] = (
+            "full" if len(lines) >= lines_total else "physical_tail")
+    else:
+        try:
+            fh = open(str(p), "rb")
+        except OSError:
+            raise RuntimeError(f"Router usage file not found: {path}")
+        try:
+            # A06: count and full scan share one handle, so line metadata and
+            # scanned content always describe the same file generation even
+            # when the name is atomically replaced mid-call.
+            lines_total, count_cached = _router_count_lines(p, fh)
+            problems["lines_total"] = lines_total
+            problems["count_cached"] = count_cached
+            fh.seek(0)
+            lines, meta = _router_stream_lines(p, MAX_ROUTER_RECORD_BYTES, fh)
+        except BaseException:
+            fh.close()
+            raise
     for line in lines:
+        if line is _OVERLONG:
+            problems["oversize_records"] += 1
+            problems["candidate_lines"] += 1
+            continue
+        unterminated = isinstance(line, _Unterminated)
+        problems["candidate_lines"] += 1
         line = line.strip()
         if not line:
             continue
         try:
             e = json.loads(line)
         except ValueError:
+            if unterminated:
+                problems["pending_tail_line"] = True
             continue
         if not isinstance(e, dict):
             continue
         model = e.get("model") or "-"
         short = router_short(model)
-        try:
-            status = int(e.get("status", 0))
-        except (TypeError, ValueError):
-            status = 0
-        ok = status in (0, 200) or 200 <= status < 300
-        ti = num(e.get("inputTokens"))
-        cache = num(e.get("cachedInputTokens"))
-        to = num(e.get("outputTokens"))
-        total = num(e.get("totalTokens"))
-        reasoning = num(e.get("reasoningTokens"))
-        cache_write = num(e.get("cacheWriteInputTokens"))
-        if not total:
+        raw_status = e.get("status")
+        status_present = "status" in e
+        raw_outcome = e.get("outcome")
+        status, outcome = _router_outcome(raw_status, status_present, raw_outcome)
+        if synth_context and raw_outcome not in ("success", "error"):
+            # Synth has no confirmed HTTP outcomes; never trust a legacy
+            # baked-in 200 from a pre-migration index.
+            status, outcome = None, "unknown"
+        ok = outcome == "success"
+        ti, ti_ok = _router_token(e.get("inputTokens"), "inputTokens" in e)
+        cache, cache_ok = _router_token(e.get("cachedInputTokens"), "cachedInputTokens" in e)
+        to, to_ok = _router_token(e.get("outputTokens"), "outputTokens" in e)
+        total_declared, total_ok = _router_token(e.get("totalTokens"), "totalTokens" in e)
+        reasoning, reasoning_ok = _router_token(e.get("reasoningTokens"), "reasoningTokens" in e)
+        cache_write, cw_ok = _router_token(e.get("cacheWriteInputTokens"), "cacheWriteInputTokens" in e)
+        if not (ti_ok and cache_ok and to_ok and total_ok and reasoning_ok and cw_ok):
+            problems["invalid_records"] += 1
+        has_ti = "inputTokens" in e and e.get("inputTokens") is not None
+        has_to = "outputTokens" in e and e.get("outputTokens") is not None
+        has_total = "totalTokens" in e and e.get("totalTokens") is not None
+        usage_partial = False
+        usage_known = False
+        if ti_ok and to_ok and has_ti and has_to:
             total = ti + to
+            usage_known = True
+            if total_ok and has_total and total_declared != total:
+                problems["total_conflicts"] += 1
+        elif total_ok and has_total:
+            total = total_declared
+            usage_known = True
+            usage_partial = True
+        else:
+            total = 0.0
+            usage_known = False
+            usage_partial = True
         try:
             ms = float(e.get("durationMs") or 0)
         except (TypeError, ValueError):
+            ms = 0.0
+        if not math.isfinite(ms) or ms < 0:
             ms = 0.0
         date, hour = _router_event_day_hour(e.get("at"))
         events.append(
@@ -1411,6 +2553,7 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
                 "short": short,
                 "provider": str(e.get("provider") or "-"),
                 "status": status,
+                "outcome": outcome,
                 "ok": ok,
                 "ti": ti,
                 "cache": cache,
@@ -1421,9 +2564,13 @@ def parse_router_events(path, limit=MAX_ROUTER_EVENTS):
                 "ms": ms,
                 "free": router_is_free(model),
                 "what_if": what_if_cost(short, ti, to),
+                "total_reported": total_declared if total_ok and has_total else None,
+                "usage_partial": usage_partial,
+                "usage_known": usage_known,
             }
         )
-    return events
+    problems["valid_records"] = len(events)
+    return events, problems
 
 
 def _router_time_key(at):
@@ -1467,59 +2614,94 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     events carry no project info, so attribution is timestamp-only, request
     tokens in the 24h window before each commit.
     """
-    try:
-        with open(events_path, "r", encoding="utf-8", errors="replace") as f:
-            total_lines = sum(1 for _ in f)
-    except OSError:
-        raise RuntimeError(f"Router usage file not found: {events_path}")
     if full_scan:
-        truncated = False
-        scanned_events = parse_router_events(events_path, None)
+        scanned_events, problems = parse_router_events(events_path, None, synth_context=True)
     else:
-        truncated = total_lines > MAX_ROUTER_EVENTS
-        scanned_events = parse_router_events(events_path, MAX_ROUTER_EVENTS)
-    # Successful responses that carried no token fields (local/unmetered
-    # models, image calls) are excluded from every count and average -
+        scanned_events, problems = parse_router_events(events_path, MAX_ROUTER_EVENTS, synth_context=False)
+    total_lines = problems["lines_total"]
+    truncated = (not full_scan) and problems["window_mode"] == "physical_tail"
+    # Events with no usage measurement (usage_known False: explicit zero
+    # counts as measured) are excluded from every count and average -
     # never estimated, and reported separately as `unmetered`.
-    unmetered = sum(1 for e in scanned_events if e["ok"] and not e["total"])
-    events = [e for e in scanned_events if not e["ok"] or e["total"]]
-    ok_events = [e for e in events if e["ok"]]
-    err_events = [e for e in events if not e["ok"]]
-    err429 = sum(1 for e in events if e["status"] == 429)
-    err500 = sum(1 for e in events if e["status"] >= 500)
-
-    ti = sum(e["ti"] for e in ok_events)
-    cache = sum(e["cache"] for e in ok_events)
-    to = sum(e["to"] for e in ok_events)
-    tr = sum(e.get("reasoning", 0) for e in ok_events)
-    cw = sum(e.get("cache_write", 0) for e in ok_events)
-    what_if = round(sum(e["what_if"] for e in ok_events), 4)
-    free_unpriced = sum(1 for e in ok_events if e["free"] and not e["what_if"])
-    # Latency over successful requests only: fast 429/401 rejects would
-    # otherwise drag the average down and misrepresent model speed.
-    ms_vals = [e["ms"] for e in ok_events if e["ms"] > 0]
-    avg_ms = round(sum(ms_vals) / len(ms_vals), 1) if ms_vals else 0
+    # F4: three outcomes. usage_known (a real token read) is independent
+    # of outcome, so unknown/error events with tokens still count.
+    # A05: one pass over the scanned events; no per-subset copies beyond the
+    # scanned list itself (counters and running sums instead of full lists).
+    events = scanned_events
+    ok_count = err_count = measured_count = unmetered = 0
+    err429 = err500 = 0
+    ti = cache = to = toks_total = 0.0
+    tr = cw = 0.0
+    what_if = 0.0
+    free_unpriced = 0
+    ms_sum = ms_count = 0
+    ok_times = []
+    biggest_req = None
+    for e in events:
+        outcome = e["outcome"]
+        if outcome == "success":
+            ok_count += 1
+            at_ms = _router_time_key(e.get("at"))
+            if at_ms > 0:
+                ok_times.append((at_ms * 1000, e["total"]))
+            if biggest_req is None or e["total"] > biggest_req["total"]:
+                biggest_req = e
+        elif outcome == "error":
+            err_count += 1
+        if e["status"] == 429:
+            err429 += 1
+        if type(e["status"]) is int and e["status"] >= 500:
+            err500 += 1
+        if e.get("usage_known"):
+            measured_count += 1
+            ti += e["ti"]
+            cache += e["cache"]
+            to += e["to"]
+            # Headline usage is the normalized per-event total (ti + to for
+            # complete records, the reported sum for total-only records), so
+            # every aggregate shares one definition.
+            toks_total += e["total"]
+            tr += e.get("reasoning", 0)
+            cw += e.get("cache_write", 0)
+            what_if += e["what_if"]
+            if e["free"] and not e["what_if"]:
+                free_unpriced += 1
+            # Latency over measured requests only: fast 429/401 rejects would
+            # otherwise drag the average down and misrepresent model speed.
+            if e["ms"] > 0:
+                ms_sum += e["ms"]
+                ms_count += 1
+        else:
+            unmetered += 1
+    what_if = round(what_if, 4)
+    avg_ms = round(ms_sum / ms_count, 1) if ms_count else None
+    ok_times.sort()
 
     by_model = {}
     for e in events:
         m = by_model.setdefault(
             e["model"],
             {"provider": e["provider"], "reqs": 0, "ok": 0, "err": 0,
+             "unknown": 0, "measured": 0,
              "ti": 0.0, "to": 0.0, "cache": 0.0, "total": 0.0,
              "reasoning": 0.0,
              "what_if": 0.0, "ms": 0.0, "free": e["free"]},
         )
         m["reqs"] += 1
-        if e["ok"]:
+        if e["outcome"] == "success":
             m["ok"] += 1
+        elif e["outcome"] == "error":
+            m["err"] += 1
+        else:
+            m["unknown"] += 1
+        if e.get("usage_known"):
+            m["measured"] += 1
             m["ti"] += e["ti"]
             m["to"] += e["to"]
             m["cache"] += e["cache"]
             m["total"] += e["total"]
             m["reasoning"] += e.get("reasoning", 0)
             m["what_if"] += e["what_if"]
-        else:
-            m["err"] += 1
         m["ms"] += e["ms"]
 
     model_rows = []
@@ -1527,16 +2709,18 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         tot = m["total"]
         model_rows.append(
             [name, m["reqs"], tot, m["ti"], m["to"], m["cache"], m["ok"], m["err"],
-             round(tot / m["ok"], 0) if m["ok"] else 0,
+             round(tot / m["measured"], 0) if m["measured"] else 0,
              router_cache_rate(m["ti"], m["cache"]), m["provider"],
-             m["free"], round(m["what_if"], 4), round(m["reasoning"], 1)]
+             m["free"], round(m["what_if"], 4), round(m["reasoning"], 1),
+             m["unknown"]]
         )
     model_rows.sort(key=lambda r: -r[2])
 
     by_provider = defaultdict(lambda: {"reqs": 0, "toks": 0.0})
-    for e in ok_events:
+    for e in events:
         by_provider[e["provider"]]["reqs"] += 1
-        by_provider[e["provider"]]["toks"] += e["total"]
+        if e.get("usage_known"):
+            by_provider[e["provider"]]["toks"] += e["total"]
 
     day_buckets = {}
     hour_reqs = defaultdict(int)
@@ -1544,45 +2728,55 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     for e in events:
         if e["hour"] is not None:
             hour_reqs[e["hour"]] += 1
-            if e["ok"]:
+            if e.get("usage_known"):
                 hour_tokens[e["hour"]] += e["total"]
         if not e["date"]:
             continue
         b = day_buckets.setdefault(
-            e["date"], {"reqs": 0, "ok": 0, "err": 0, "err429": 0, "err500": 0, "ti": 0.0, "to": 0.0,
-                        "cache": 0.0, "tr": 0.0, "what_if": 0.0}
+            e["date"], {"reqs": 0, "ok": 0, "err": 0, "unknown": 0, "err429": 0, "err500": 0, "ti": 0.0, "to": 0.0,
+                        "cache": 0.0, "tr": 0.0, "total": 0.0, "what_if": 0.0}
         )
         b["reqs"] += 1
         if e["status"] == 429:
             b["err429"] += 1
-        if e["status"] >= 500:
+        if type(e["status"]) is int and e["status"] >= 500:
             b["err500"] += 1
-        if e["ok"]:
+        if e["outcome"] == "success":
             b["ok"] += 1
+        elif e["outcome"] == "error":
+            b["err"] += 1
+        else:
+            b["unknown"] += 1
+        if e.get("usage_known"):
             b["ti"] += e["ti"]
             b["to"] += e["to"]
             b["cache"] += e["cache"]
             b["tr"] += e.get("reasoning", 0)
+            b["total"] += e["total"]
             b["what_if"] += e["what_if"]
-        else:
-            b["err"] += 1
 
     day_entries = []
     for d in sorted(day_buckets):
         b = day_buckets[d]
-        # Router inputTokens already includes cachedInputTokens.
-        tot = b["ti"] + b["to"]
+        # Router inputTokens already includes cachedInputTokens, and output
+        # already includes reasoning: the day total is the normalized
+        # per-event total (ti + to, or the reported sum for total-only
+        # records), never ti + to + tr.
+        tot = b["total"]
         day_entries.append(
             {"date": d, "msgs": b["reqs"], "sessions": b["ok"], "reqs": b["reqs"],
-             "ok": b["ok"], "err": b["err"], "err429": b["err429"], "err500": b["err500"],
+             "ok": b["ok"], "err": b["err"], "unknown": b["unknown"], "err429": b["err429"], "err500": b["err500"],
              "ti": round(b["ti"], 1),
              "to": round(b["to"], 1), "tr": round(b["tr"], 1), "cache": round(b["cache"], 1),
              "cost": round(b["what_if"], 4), "what_if": round(b["what_if"], 4),
              "total": round(tot, 1)}
         )
     activity = pad_activity(day_entries)
+    day_total_by_date = {de["date"]: de["total"] for de in day_entries}
     for slot in activity:
-        slot["total"] = round(slot["ti"] + slot["to"] + slot["tr"], 1)
+        # Heatmap cells reuse the authoritative day total (which includes
+        # reported-only sums); empty window days fall back to ti + to = 0.
+        slot["total"] = round(day_total_by_date.get(slot["date"], slot["ti"] + slot["to"]), 1)
         slot.setdefault("reqs", slot.get("msgs", 0))
 
     recent = sorted(events, key=lambda e: (_router_time_key(e.get("at")), str(e.get("at") or "")),
@@ -1591,10 +2785,6 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     # Tokens per commit from router request tokens (timestamp-only join: the
     # usage-events stream has no project/file info). Same commit list and
     # 24h window as the local tab so both sides stay comparable.
-    ok_times = sorted(
-        (_router_time_key(e.get("at")) * 1000, e["total"])
-        for e in ok_events if _router_time_key(e.get("at")) > 0
-    )
     window_ms = COMMIT_WINDOW_HOURS * 3600 * 1000
     r_commit_rows = []
     for c in collect_repo_commits(worktrees or []):
@@ -1613,26 +2803,34 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     r_commit_rows.sort(key=lambda r: -r[7])
     r_commit_rows = r_commit_rows[:MAX_COMMIT_ROWS]
 
-    avg_per_session = round((ti + to) / len(ok_events), 0) if ok_events else 0
+    avg_per_session = (round(toks_total / measured_count, 0)
+                       if measured_count else 0)
+    known = ok_count + err_count
     totals = {
         "requests": len(events),
-        "ok": len(ok_events),
-        "errors": len(err_events),
+        "ok": ok_count,
+        "errors": err_count,
+        "unknown": len(events) - known,
+        "known_outcomes": known,
+        "success_rate": round(ok_count / known, 4) if known else None,
+        "coverage": {"known": known, "total": len(events)},
         "err429": err429,
         "err500": err500,
         "unmetered": unmetered,
+        "invalid_records": problems["invalid_records"],
+        "total_conflicts": problems["total_conflicts"],
         "tokens_input": ti,
         "tokens_output": to,
         "tokens_reasoning": tr,
         "tokens_cache_read": cache,
         "tokens_cache_write": cw,
-        "tokens_total": ti + to,
+        "tokens_total": toks_total,
         "cache_rate": router_cache_rate(ti, cache),
         "models": len(by_model),
         "providers": len(by_provider),
         "what_if_cost": what_if,
         "avg_ms": avg_ms,
-        "sessions": len(ok_events),
+        "sessions": ok_count,
         "messages": len(events),
         "cost": 0,
         "avg_duration_min": 0,
@@ -1642,11 +2840,10 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
 
     biggest_day = max(day_entries, key=lambda d: d["total"]) if day_entries else None
     top_model = model_rows[0] if model_rows else None
-    biggest_req = max(ok_events, key=lambda e: e["total"]) if ok_events else None
     peak_hour = max(range(24), key=lambda h: hour_tokens.get(h, 0)) if any(hour_tokens.values()) else None
-    req_word = "model calls" if full_scan else "requests"
+    req_word = "Usage events" if full_scan else "requests"
     insights = [
-        f"Codex made {len(events):,} {req_word} across {len(by_model)} models, {len(ok_events):,} ok, {len(err_events):,} errors.",
+        f"Codex made {len(events):,} {req_word} across {len(by_model)} models, {ok_count:,} ok, {err_count:,} errors.",
         (f"Top model: {router_short(top_model[0])}, {top_model[2]:,.0f} tokens over {top_model[1]:,} requests."
          if top_model else ""),
         (f"Busiest day: {biggest_day['date']}, {biggest_day['total']:,.0f} tokens, {biggest_day['reqs']} requests."
@@ -1656,8 +2853,8 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         insights.append(f"{err429} requests hit 429 rate limits, usually free-model capacity, not token size.")
     if unmetered:
         insights.append(
-            f"{unmetered:,} successful requests reported no token counts "
-            f"(local / unmetered models), excluded from all counts and averages."
+            f"{unmetered:,} requests reported no usage measurement "
+            f"(unmetered), excluded from all counts and averages."
         )
     if free_unpriced:
         insights.append(
@@ -1686,6 +2883,7 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         "days": day_entries,
         "hours": [hour_reqs.get(h, 0) for h in range(24)],
         "commits": r_commit_rows,
+        "commit_windows": {"method": "time_window", "window_hours": COMMIT_WINDOW_HOURS, "scope": "global", "overlap_possible": True, "additive": False, "note": "Global time window; may include other projects. Windows overlap. Rows must not be summed."},
         "activity": activity,
         "requests": recent,
         "rate_limits": limits,
@@ -1707,6 +2905,10 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         "scanned": len(scanned_events),
         "total_lines": total_lines,
         "truncated": truncated,
+        "window_mode": problems["window_mode"],
+        "candidate_lines": problems["candidate_lines"],
+        "pending_tail_line": problems["pending_tail_line"],
+        "oversize_records": problems["oversize_records"],
     }
     return stats
 
@@ -1717,8 +2919,12 @@ def blank_router_stats(error=None):
     stats = {
         "source": "router",
         "source_label": "Codex data",
-        "totals": {"requests": 0, "ok": 0, "errors": 0, "err429": 0, "err500": 0,
+        "totals": {"requests": 0, "ok": 0, "errors": 0, "unknown": 0,
+                   "known_outcomes": 0, "success_rate": None,
+                   "coverage": {"known": 0, "total": 0},
+                   "err429": 0, "err500": 0,
                    "unmetered": 0,
+                   "invalid_records": 0, "total_conflicts": 0,
                    "tokens_input": 0, "tokens_output": 0, "tokens_reasoning": 0,
                    "tokens_cache_read": 0, "tokens_cache_write": 0, "tokens_total": 0,
                    "cache_rate": 0.0, "models": 0, "providers": 0, "what_if_cost": 0,
@@ -1730,6 +2936,7 @@ def blank_router_stats(error=None):
         "days": [],
         "hours": [0] * 24,
         "commits": [],
+        "commit_windows": {"method": "time_window", "window_hours": COMMIT_WINDOW_HOURS, "scope": "global", "overlap_possible": True, "additive": False, "note": "Global time window; may include other projects. Windows overlap. Rows must not be summed."},
         "activity": zero_days_window(),
         "requests": [],
         "rate_limits": {},
@@ -1747,6 +2954,10 @@ def blank_router_stats(error=None):
         "scanned": 0,
         "total_lines": 0,
         "truncated": False,
+        "window_mode": "full",
+        "candidate_lines": 0,
+        "pending_tail_line": False,
+        "oversize_records": 0,
     }
     if error:
         stats["error"] = error
@@ -1942,7 +3153,7 @@ h2.sec .hint{font-family:var(--mono);font-size:11px;color:var(--subtle);font-wei
 .fchip:hover .fx{color:var(--bad)}
 .fclear{background:none;border:none;color:var(--bad);font-family:var(--sans);font-size:12px;font-weight:600;cursor:pointer;padding:3px 6px}
 .fclear:hover{text-decoration:underline}
-.tiles{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px}.tile{flex:1 1 160px;min-width:150px;max-width:230px;background:var(--chip);border:1px solid var(--line);border-radius:12px;padding:14px;cursor:pointer;transition:border-color .15s,transform .15s}.tile:hover{border-color:var(--accent);transform:translateY(-2px)}.tile.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}.tile .tn{font-weight:800;font-size:15px}.tile .tc{font-size:26px;font-weight:800;color:var(--accent);margin:4px 0}.tile .td{font-size:11.5px;color:var(--muted)}.tile-detail{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin-bottom:12px}.tile-detail .wrow{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px dashed var(--line)}.tile-detail .wrow:last-child{border-bottom:none}tr.clickable{cursor:pointer}tr.clickable:hover td{background:rgba(127,127,127,.09)}.run-detail td{background:var(--panel);font-size:12px;color:var(--muted)}.kv{display:inline-block;margin:2px 14px 2px 0}.kv b{color:var(--text)}.dot{display:inline-block;width:11px;height:11px;border-radius:50%;margin:2px 2px 4px}.dot.running{background:#4ade80;box-shadow:0 0 8px #4ade80;animation:pulse 1.6s infinite}.dot.idle{background:#d8ad44}.dot.finished{background:#6b7280;opacity:.55}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}.tbl-scroll{overflow:auto;max-height:min(62vh,640px)}
+.tiles{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px}.tile{flex:1 1 160px;min-width:150px;max-width:230px;background:var(--chip);border:1px solid var(--line);border-radius:12px;padding:14px;cursor:pointer;transition:border-color .15s,transform .15s}.tile:hover{border-color:var(--accent);transform:translateY(-2px)}.tile.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}.tile .tn{font-weight:800;font-size:15px}.tile .tc{font-size:26px;font-weight:800;color:var(--accent);margin:4px 0}.tile .td{font-size:11.5px;color:var(--muted)}.tile-detail{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin-bottom:12px}.tile-detail .wrow{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px dashed var(--line)}.tile-detail .wrow:last-child{border-bottom:none}tr.clickable{cursor:pointer}tr.clickable:hover td{background:rgba(127,127,127,.09)}.run-detail td{background:var(--panel);font-size:12px;color:var(--muted)}.kv{display:inline-block;margin:2px 14px 2px 0}.kv b{color:var(--text)}.dot{display:inline-block;width:11px;height:11px;border-radius:50%;margin:2px 2px 4px}.dot.recent{background:#7aa2f7}.dot.quiet{background:#8a8f98}.dot.stale{background:#6b7280;opacity:.6}.dot.unknown{background:transparent;border:1.5px dashed #6b7280}.tbl-scroll{overflow:auto;max-height:min(62vh,640px)}
 .tbl{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
 .tbl thead th{position:sticky;top:0;z-index:5;background:var(--panel);text-align:left;font-size:10.5px;font-weight:700;
   text-transform:uppercase;letter-spacing:.08em;color:var(--subtle);padding:10px 12px;
@@ -2139,15 +3350,18 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="brand"><img class="brand-logo" src="/logo.png" alt="">OpenCode<small>· usage</small></div>
     <div class="spacer"></div>
     <span id="status"></span>
+    <span id="src-status" style="font-size:11px;opacity:.75;margin-left:10px;max-width:46ch;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></span>
     <button class="tbtn" id="theme">◐&nbsp; Light</button>
     <span class="export-wrap"><button class="tbtn" id="export">⤓ Export</button>
       <div class="expmenu" id="expmenu">
         <button data-x="json">JSON <small>full stats payload</small></button>
         <button data-x="csv">CSV <small>per-day usage table</small></button>
+        <button data-x="csvc">CSV <small>commit windows · not additive</small></button>
       </div></span>
     <button class="tbtn" id="refresh">⟳ Refresh</button>
   </div>
 </div>
+<div class="wrap" id="auth-lock" hidden style="margin-top:18px"><div class="card"><b>Authorization required.</b> Open the address generated by the launcher (it carries <span class="mono">#token=…</span> in the fragment). Then reload this tab from the new link.</div></div>
 
 <div class="wrap">
   <div class="source-tabs" role="tablist" aria-label="Data source">
@@ -2197,12 +3411,13 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       <div id="file-chart" class="crows"></div>
     </div>
     <div class="card chart-card">
-      <div class="ctitle">Tokens per commit <small id="commit-sub">prior 24h sessions · click to filter</small></div>
+      <div class="ctitle">Usage in the 24h before each commit <small id="commit-sub">project-matched window · not additive · click to filter</small></div>
       <div class="presets" style="margin:0 0 10px" role="group" aria-label="Commit order">
         <button class="pbtn active" data-cs="toks">By tokens</button>
         <button class="pbtn" data-cs="recent">Recent</button>
       </div>
       <div id="commit-chart" class="crows"></div>
+      <div class="hint" id="commit-note">Project-matched time window; windows overlap; rows must not be summed; not commit cost.</div>
     </div>
   </div>
 
@@ -2244,14 +3459,14 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     </div>
   </div>
 
-  <h2 class="sec" id="sec-subagents">Subagents <span class="hint" id="sub-hint">child sessions · parent → run</span></h2>
+  <h2 class="sec" id="sec-subagents">Subagents <span class="hint" id="sub-hint">child &amp; related sessions · Based on session updates; not execution status</span></h2>
   <div class="card">
     <div class="chips" id="subagents-chips" style="margin-bottom:10px"></div>
     <div class="chips" id="subagents-all" style="margin-bottom:10px"></div>
     <div class="tbl-scroll">
       <table class="tbl" id="subtbl">
         <thead><tr>
-          <th>Status</th><th>Subagent run</th><th>Agent</th><th>Parent session</th><th>Started</th>
+          <th>Activity</th><th>Child session</th><th>Agent</th><th>Parent session</th><th>Started</th>
           <th class="num">Total</th><th class="num">Msgs</th>
         </tr></thead>
         <tbody></tbody>
@@ -2329,12 +3544,13 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       <div id="r-file-chart" class="crows"></div>
     </div>
     <div class="card chart-card">
-      <div class="ctitle">Tokens per commit <small id="r-commit-sub">prior 24h requests · time-matched</small></div>
+      <div class="ctitle">Usage in the 24h before each commit <small id="r-commit-sub">global window · not additive · time-matched</small></div>
       <div class="presets" style="margin:0 0 10px" role="group" aria-label="Commit order">
         <button class="pbtn active" data-rcs="toks">By tokens</button>
         <button class="pbtn" data-rcs="recent">Recent</button>
       </div>
       <div id="r-commit-chart" class="crows"></div>
+      <div class="hint" id="r-commit-note">Global time window; may include other projects. Windows overlap. Rows must not be summed.</div>
     </div>
   </div>
 
@@ -2351,7 +3567,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       <input class="search" id="r-search" placeholder="Filter by model or provider…" aria-label="Filter codex requests">
       <select class="filter" id="r-provider-f"><option value="">All providers</option></select>
       <select class="filter" id="r-model-f"><option value="">All models</option></select>
-      <select class="filter" id="r-status-f"><option value="">All statuses</option><option value="ok">OK only</option><option value="err">Errors only</option><option value="429">429 only</option></select>
+      <select class="filter" id="r-status-f"><option value="">All statuses</option><option value="ok">OK only</option><option value="err">Errors only</option><option value="unknown">Unknown only</option><option value="429">429 only</option></select>
       <span class="badge" id="r-req-count"></span>
     </div>
     <div id="r-fbar" class="fbar" style="display:none"></div>
@@ -2418,6 +3634,51 @@ let currentRRows=[];
 const RFSTATE={day:null,model:null,provider:null,status:''};
 const WID=sessionStorage.getItem('ocd-wid')||('w'+Math.random().toString(36).slice(2));
 sessionStorage.setItem('ocd-wid',WID);
+/* F2 access token: fragment-only (#token=...), memory + sessionStorage. */
+let AUTH_TOKEN=null;let AUTH_FAILED=false;
+try{
+  var _hm=String(location.hash||'');
+  var _mt=_hm.match(/token=([^&]+)/);
+  if(_mt&&_mt[1]){AUTH_TOKEN=decodeURIComponent(_mt[1]);
+    try{sessionStorage.setItem('ocd-token',AUTH_TOKEN);}catch(_){}
+    try{history.replaceState(null,'',location.pathname+location.search);}catch(_){}}
+  if(!AUTH_TOKEN){try{AUTH_TOKEN=sessionStorage.getItem('ocd-token')||null;}catch(_){AUTH_TOKEN=null;}}
+}catch(_){AUTH_TOKEN=null;}
+function authHeaders(extra){var h={'X-Window-Id':WID};if(AUTH_TOKEN)h['Authorization']='Bearer '+AUTH_TOKEN;if(extra)for(var k in extra)h[k]=extra[k];return h;}
+function authFetch(url,opts){opts=opts||{};if(String(url).indexOf('/api/')!==0)return fetch(url,opts);
+  opts.headers=authHeaders(opts.headers||{});return fetch(url,opts);}
+/* F6d: shared JSON fetch. Auth comes from authFetch (token only for
+   local /api/ URLs, never arbitrary hosts). The AbortController deadline
+   covers receiving headers AND reading the whole body AND parsing it:
+   the timer is cleared only in finally, after the parse. HTTP 200 with
+   {error:...} / {ok:false} or invalid JSON is an explicit section error. */
+async function fetchJson(url,opts){
+  opts=opts||{};
+  var ms=(window.__ocdTimeouts&&window.__ocdTimeouts.fetchMs)||10000;
+  var started=Date.now();
+  var ac=('AbortController' in window)?new AbortController():null;
+  var fopts={};for(var k in opts)fopts[k]=opts[k];
+  if(ac)fopts.signal=ac.signal;
+  if(opts.signal&&ac){try{opts.signal.addEventListener('abort',function(){try{ac.abort();}catch(_){}});}catch(_){}}
+  var timer=null;
+  var deadline=new Promise(function(_,rej){timer=setTimeout(function(){rej(new Error('timeout after '+ms+' ms'));try{if(ac)ac.abort();}catch(_){}},ms);});
+  try{
+    var resp=await Promise.race([authFetch(url,fopts),deadline]);
+    var text=await Promise.race([resp.text(),deadline]);
+    if(Date.now()-started>ms)throw new Error('timeout after '+ms+' ms');
+    if(resp.status===401)throw Object.assign(new Error('unauthorized'),{status:401});
+    if(!resp.ok)throw Object.assign(new Error('HTTP '+resp.status),{status:resp.status});
+    var data=null;
+    if(text){try{data=JSON.parse(text);}catch(_){throw new Error('invalid JSON (status '+resp.status+')');}}
+    if(data&&data.error)throw new Error('source error: '+data.error);
+    if(data&&data.ok===false)throw new Error('source reported ok:false');
+    return data;
+  }finally{clearTimeout(timer);}
+}
+function showAuthLock(on){var el=document.getElementById('auth-lock');if(el)el.hidden=!on;
+  var st=document.getElementById('status');if(on&&st)st.textContent='Authorization required — reopen via the launcher link';}
+function noteAuthFailure(){if(AUTH_FAILED)return;AUTH_FAILED=true;showAuthLock(true);}
+if(!AUTH_TOKEN){showAuthLock(true);}
 const FSTATE={day:null,model:null,agent:null,file:null,sub:null,commit:null};
 const tip=$('tip');
 function tipShow(html,e){tip.innerHTML=html;tip.style.display='block';tipPos(e);}
@@ -2582,7 +3843,7 @@ function renderCommitChart(){
   const el=$('commit-chart');if(!el)return;
   const rows=commitRows();
   const sub=$('commit-sub');
-  if(sub)sub.textContent='prior 24h sessions · click to filter';
+  if(sub)sub.textContent='project-matched window · not additive · click to filter';
   if(!rows.length){el.innerHTML='<div class="empty">No git commits found in tracked worktrees.</div>';return;}
   const t=T();
   const max=Math.max(...rows.map(r=>r[7]||0),1);
@@ -2592,7 +3853,7 @@ function renderCommitChart(){
     const tip='<b>'+ESC(msg)+'</b><span class=\'trow\'><span>SHA</span><b>'+ESC(sha.slice(0,12))+'</b></span>'+
       '<span class=\'trow\'><span>Date · project</span><b>'+date+' · '+ESC(proj)+'</b></span>'+
       '<span class=\'trow\'><span>Changed</span><b>'+nf+' files · +'+F(add)+' / -'+F(del)+'</b></span>'+
-      '<span class=\'trow\'><span>Tokens (prior 24h)</span><b>'+FN(toks)+' · '+ns+' sessions</b></span>';
+      '<span class=\'trow\'><span>Usage in the 24h before commit</span><b>'+FN(toks)+' · '+ns+' sessions</b></span>';
     return '<div class="model-row clickable'+(FSTATE.commit===sha?' active':'')+'" data-f="commit|'+sha+'" data-tip="'+tip+'">'+
       '<div><div class="mn">'+ESC(msg.length>44?msg.slice(0,44)+'…':msg)+'</div>'+
       '<div class="ms">'+sha.slice(0,7)+' · '+date+' · '+ESC(proj)+' · +'+F(add)+'/-'+F(del)+'</div></div>'+
@@ -2775,11 +4036,13 @@ function renderCodex(){
   }).join('');
 }
 
+const SUB_ACT={recent:'Recent activity',quiet:'No recent activity',stale:'Older activity',unknown:'Unknown'};
+
 function renderSubagents(){
   const tb=$('subtbl').querySelector('tbody');
   if(!SA||SA.error){tb.innerHTML='<tr><td colspan="7"><div class="empty">'+ESC((SA&&SA.error)||'No subagent data.')+'</div></td></tr>';return;}
-  const sc=SA.status_counts||{};
-  $('sub-hint').textContent=(sc.running||0)+' running NOW · '+(sc.idle||0)+' idle · '+(sc.finished||0)+' finished · '+(SA.child_total||0)+' runs total';
+  const ac=SA.activity_counts||{};
+  $('sub-hint').textContent=(ac.recent||0)+' '+SUB_ACT.recent+' · '+(ac.quiet||0)+' '+SUB_ACT.quiet+' · '+(ac.stale||0)+' '+SUB_ACT.stale+' · '+(ac.unknown||0)+' '+SUB_ACT.unknown+' · '+(SA.listed_count||0)+' of '+(SA.total_child_sessions||0)+' child sessions'+(SA.truncated?' (truncated)':'')+' · Based on session updates; not execution status';
   $('subagents-chips').innerHTML=(SA.child_agents||[]).map(a=>'<span class="chip"><i style="width:9px;height:9px;border-radius:3px;background:var(--accent);display:inline-block"></i>'+
     ESC(a.agent)+' · '+a.n+' · '+FN(a.toks)+'</span>').join('')||'<span class="empty">No subagents yet.</span>';
   $('subagents-all').innerHTML='<span class="empty">all sessions by type:</span> '+(SA.all_agents||[]).map(a=>'<span class="chip">'+
@@ -2789,10 +4052,9 @@ function renderSubagents(){
     const diff=Math.round((n-s)/86400000);
     const hh=String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
     return diff===0?'Today '+hh:diff===1?'Yesterday '+hh:(d.getMonth()+1)+'/'+d.getDate()+' '+hh;};
-  const ageLbl=a=>{a=+a||0;if(a<60)return a+' s ago';if(a<3600)return Math.floor(a/60)+' min ago';if(a<86400)return Math.floor(a/3600)+' h ago';return Math.floor(a/86400)+' d ago';};
-  const stLbl={running:'Running',idle:'Idle',finished:'Finished'};
+  const ageLbl=a=>{if(a==null)return 'timestamp unavailable';a=+a||0;if(a<60)return a+' s ago';if(a<3600)return Math.floor(a/60)+' min ago';if(a<86400)return Math.floor(a/3600)+' h ago';return Math.floor(a/86400)+' d ago';};
   tb.innerHTML=(SA.child_runs||[]).map((s,i)=>'<tr class="clickable" data-run="'+i+'">'
-    +'<td><span class="dot '+s.status+'"></span><div style="font-size:11px;color:var(--muted)">'+stLbl[s.status]+'<br>'+ageLbl(s.age_s)+'</div></td>'
+    +'<td><span class="dot '+(s.activity_state||'unknown')+'"></span><div style="font-size:11px;color:var(--muted)">'+SUB_ACT[s.activity_state||'unknown']+'<br>'+ageLbl(s.age_s)+'</div></td>'
     +'<td><div class="t">'+ESC(s.title)+'</div>'+
     '<div class="badges"><span class="badge">'+ESC((s.directory||'').split(/[\\/]/).pop())+'</span></div></td>'
     +'<td><div class="badges mix"><span class="badge agent">'+ESC(s.agent)+'</span><span class="badge model">'+ESC(modelShort(s.model))+'</span></div></td>'
@@ -2809,8 +4071,8 @@ function toggleRun(tr){
   document.querySelectorAll('#subtbl tr.run-detail').forEach(x=>x.remove());
   const s=SA.child_runs[+tr.getAttribute('data-run')];
   const d=document.createElement('tr');d.className='run-detail';
-  d.innerHTML='<td colspan="7"><span class="kv">Status: <b>'+ESC(s.status||'-')+'</b></span>'
-    +'<span class="kv">Last activity: <b>'+F(s.age_s)+' s ago</b></span>'
+  d.innerHTML='<td colspan="7"><span class="kv">Activity: <b>'+ESC(SUB_ACT[s.activity_state||'unknown'])+'</b></span>'
+    +'<span class="kv">Last activity: <b>'+(s.age_s==null?'unknown':F(s.age_s)+' s ago')+'</b></span>'
     +'<span class="kv">Session: <b class="mono">'+ESC(s.id)+'</b></span>'
     +'<span class="kv">Agent: <b>'+ESC(s.agent)+'</b></span>'
     +'<span class="kv">Model: <b>'+ESC(s.model||'-')+'</b></span>'
@@ -2978,7 +4240,7 @@ function renderFilterBar(){
 }
 /* ---- Codex tab (all models, from usage-events.jsonl) ---- */
 function rModelShort(m){return (m||'-').split('/').pop();}
-function rDayTokenTotal(d){return (d.ti||0)+(d.to||0)+(d.tr||0);}
+function rDayTokenTotal(d){return (d.ti||0)+(d.to||0);}
 function rCutDate(){
   if(RRANGE==='all')return'';
   const d=new Date(Date.now()-RRANGE*86400000);
@@ -2987,8 +4249,8 @@ function rCutDate(){
 function rInPeriod(day){const c=rCutDate();return !c||day.date>=c;}
 function rPeriodDays(){return (R&&R.days?R.days:[]).filter(rInPeriod);}
 function rSumDays(list){
-  const t={reqs:0,ok:0,err:0,err429:0,err500:0,ti:0,to:0,tr:0,cache:0,total:0,what_if:0};
-  list.forEach(d=>{t.reqs+=d.reqs||0;t.ok+=d.ok||0;t.err+=d.err||0;t.err429+=d.err429||0;t.err500+=d.err500||0;t.ti+=d.ti||0;t.to+=d.to||0;t.tr+=d.tr||0;t.cache+=d.cache||0;t.total+=rDayTokenTotal(d);t.what_if+=d.what_if||0;});
+  const t={reqs:0,ok:0,err:0,unknown:0,err429:0,err500:0,ti:0,to:0,tr:0,cache:0,total:0,what_if:0};
+  list.forEach(d=>{t.reqs+=d.reqs||0;t.ok+=d.ok||0;t.err+=d.err||0;t.unknown+=d.unknown||0;t.err429+=d.err429||0;t.err500+=d.err500||0;t.ti+=d.ti||0;t.to+=d.to||0;t.tr+=d.tr||0;t.cache+=d.cache||0;t.total+=rDayTokenTotal(d);t.what_if+=d.what_if||0;});
   return t;
 }
 function rDayTip(d){
@@ -3090,7 +4352,7 @@ function renderRouterCommitChart(){
   const el=$('r-commit-chart');if(!el)return;
   const rows=rCommitRows();
   const sub=$('r-commit-sub');
-  if(sub)sub.textContent='prior 24h requests · time-matched';
+  if(sub)sub.textContent='global window · not additive · time-matched';
   if(!rows.length){el.innerHTML='<div class="empty">No git commits found in tracked worktrees.</div>';return;}
   const t=T();
   const max=Math.max(...rows.map(r=>r[7]||0),1);
@@ -3100,7 +4362,8 @@ function renderRouterCommitChart(){
     const tip='<b>'+ESC(msg)+'</b><span class=\'trow\'><span>SHA</span><b>'+ESC(sha.slice(0,12))+'</b></span>'+
       '<span class=\'trow\'><span>Date · project</span><b>'+date+' · '+ESC(proj)+'</b></span>'+
       '<span class=\'trow\'><span>Changed</span><b>'+nf+' files · +'+F(add)+' / -'+F(del)+'</b></span>'+
-      '<span class=\'trow\'><span>Tokens (prior 24h)</span><b>'+FN(toks)+' · '+nq+' requests</b></span>';
+      '<span class=\'trow\'><span>Usage in the 24h before commit</span><b>'+FN(toks)+' · '+nq+' requests</b></span>'+
+      '<span class=\'trow\'><span>Scope</span><b>global window · windows overlap · not additive</b></span>';
     return '<div class="model-row" data-tip="'+tip+'">'+
       '<div><div class="mn">'+ESC(msg.length>44?msg.slice(0,44)+'…':msg)+'</div>'+
       '<div class="ms">'+sha.slice(0,7)+' · '+date+' · '+ESC(proj)+' · +'+F(add)+'/-'+F(del)+'</div></div>'+
@@ -3127,6 +4390,7 @@ function renderRouterStatus(pc){
     ['Errors',v('err'),(v('err')?'var(--bad)':'var(--subtle)'),'err'],
     ['429 rate-limited',v('err429'),(v('err429')?'var(--bad)':'var(--subtle)'),'429'],
     ['5xx upstream',v('err500'),'var(--bad)','err'],
+    ['Unknown outcome',v('unknown'),'var(--subtle)','unknown'],
   ];
   $('r-status').innerHTML=items.map(([l,v,cc,k])=>'<span class="chip'+(RFSTATE.status===k?' active':'')+'" data-rs="'+k+'" data-tip="<b>'+l+'</b><span class=\'trow\'><span>Requests</span><b>'+F(v)+'</b></span>">'+
     '<i style="width:9px;height:9px;border-radius:3px;background:'+cc+';display:inline-block"></i>'+l+' · '+F(v)+'</span>').join('');
@@ -3306,8 +4570,9 @@ function routerRequestRows(){
       const ms0=Date.parse(r.at||'');
       if(!ms0||new Date(ms0).toLocaleDateString('en-CA')!==RFSTATE.day)return false;
     }
-    if(st==='ok'&&!r.ok)return false;
-    if(st==='err'&&r.ok)return false;
+    if(st==='ok'&&r.outcome!=='success')return false;
+    if(st==='err'&&r.outcome!=='error')return false;
+    if(st==='unknown'&&r.outcome!=='unknown')return false;
     if(st==='429'&&r.status!==429)return false;
     if(cut){
       const ms=Date.parse(r.at||'');
@@ -3324,13 +4589,13 @@ function renderRouterRequests(){
   const rt=(R&&R.totals)||{};
   $('r-req-hint').textContent=(rf?'filtered by '+rf+' criteria · ':'')+'newest '+F(rows.length)+' of '+F(rt.requests||0)+' counted'+
     (R&&R.truncated?' (file capped at recent '+F(R.scanned||0)+')':'')+
-    ' · '+F(rt.unmetered||0)+' unmetered excluded · errors show 0 tokens (actuals only)';
+    ' · '+F(rt.unmetered||0)+' unmetered excluded · errors show 0 tokens (actuals only) · '+F(rt.unknown||0)+' outcome unavailable';
   const tb=$('r-tbl').querySelector('tbody');
   tb.innerHTML=rows.map(r=>{
     const ok=r.ok;
     return '<tr><td class="mono" style="font-size:11.5px;color:var(--muted)">'+ESC((r.at||'').replace('T',' ').slice(0,19))+'</td>'+
     '<td><div class="t" style="font-size:12.5px">'+ESC(rModelShort(r.model))+'</div><div class="badges"><span class="badge">'+ESC(r.provider)+'</span></div></td>'+
-    '<td><span class="'+(ok?'status-ok':'status-err')+' mono" style="font-size:12px">'+r.status+'</span></td>'+
+    +(r.outcome==='unknown'?'<td><span class="mono" style="font-size:12px;color:var(--subtle)">Outcome unavailable</span></td>':'<td><span class="'+(ok?'status-ok':'status-err')+' mono" style="font-size:12px">'+r.status+'</span></td>')+
     '<td class="num">'+FN(r.ti||0)+'</td><td class="num">'+FN(r.to||0)+'</td><td class="num">'+FN(r.cache||0)+'</td>'+
     '<td class="num" style="font-weight:700">'+FN(r.total||0)+'</td><td class="num" style="color:var(--subtle)">'+F(r.ms||0)+'</td></tr>';}).join('')
     ||'<tr><td colspan="8"><div class="empty">No requests match.</div></td></tr>';
@@ -3372,12 +4637,11 @@ function openSession(s){
   +'<div id="modal-prompts"><div class="empty">Loading prompts…</div></div></div>';
   $('overlay').classList.add('open');
   const x=$('modal').querySelector('.modal-x');if(x)x.focus();
-  fetch('/api/session/'+encodeURIComponent(s.id)).then(r=>r.json()).then(pj=>{
+  fetchJson('/api/session/'+encodeURIComponent(s.id)).then(pj=>{
     const el=$('modal-prompts');if(!el)return;
-    if(pj&&pj.error){el.innerHTML='<div class="empty">'+ESC(pj.error)+'</div>';return;}
     const list=(pj&&pj.prompts)||[];
     el.innerHTML=list.length?list.slice().reverse().map(p=>'<div class="prompt"><span class="mono" style="font-size:10.5px;color:var(--subtle)">'+DT(p.t)+'</span><br>'+ESC(p.p)+'</div>').join(''):'<div class="empty">No prompts recorded.</div>';
-  }).catch(()=>{const el=$('modal-prompts');if(el)el.innerHTML='<div class="empty">Could not load prompts.</div>';});
+  }).catch(e=>{if(e&&e.status===401)noteAuthFailure();const el=$('modal-prompts');if(el)el.innerHTML='<div class="empty">'+(e&&e.status===401?'Authorization required — reopen via the launcher link':ESC('Could not load prompts: '+((e&&e.message)||'error')+' (reopen the session to retry).'))+'</div>';});
 }
 /* interactions */
 let lastFocus=null;
@@ -3479,10 +4743,18 @@ function exportData(kind){
   if(kind==='json'){
     const b=new Blob([JSON.stringify(isR?R:S,null,2)],{type:'application/json'});
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=isR?'codex-tokens.json':'opencode-tokens.json';a.click();
+  }else if(kind==='csvc'){
+    const rows=(isR?(R.commits||[]):(S.commits||[]));
+    const meta=((isR?R:S).commit_windows)||{};
+    const head=['sha','subject','date','project','files','add','del','window_tokens','window_events','method','scope','overlap_possible','additive','window_hours','note'];
+    const q=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"';
+    const lines=[head.join(',')].concat(rows.map(r=>r.slice(0,9).join(',')+','+[meta.method||'',meta.scope||'',meta.overlap_possible===undefined?'':meta.overlap_possible,meta.additive===undefined?'':meta.additive,meta.window_hours==null?'':meta.window_hours,meta.note||''].map(q).join(',')));
+    const b=new Blob([lines.join('\n')],{type:'text/csv'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=isR?'codex-tokens-commits.csv':'opencode-tokens-commits.csv';a.click();
   }else if(isR){
     const rows=rPeriodDays();
-    const head=['date','requests','ok','errors','tokens_in','tokens_out','tokens_cache','tokens_total','what_if_cost'];
-    const lines=[head.join(',')].concat(rows.map(d=>[d.date,d.reqs,d.ok,d.err,Math.round(d.ti),Math.round(d.to),Math.round(d.cache),Math.round(rDayTokenTotal(d)),(d.what_if||0)].join(',')));
+    const head=['date','requests','ok','errors','unknown','tokens_in','tokens_out','tokens_cache','tokens_total','what_if_cost'];
+    const lines=[head.join(',')].concat(rows.map(d=>[d.date,d.reqs,d.ok,d.err,(d.unknown||0),Math.round(d.ti),Math.round(d.to),Math.round(d.cache),Math.round(rDayTokenTotal(d)),(d.what_if||0)].join(',')));
     const b=new Blob([lines.join('\n')],{type:'text/csv'});
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='codex-tokens-days.csv';a.click();
   }else{
@@ -3496,7 +4768,10 @@ function exportData(kind){
 $('export').onclick=e=>{e.stopPropagation();$('expmenu').classList.toggle('open');};
 document.querySelectorAll('#expmenu button').forEach(b=>b.onclick=()=>{exportData(b.dataset.x);$('expmenu').classList.remove('open');});
 /* stop the hidden server when this window closes or quits (Cmd+Q) */
-function stopServer(){try{navigator.sendBeacon&&navigator.sendBeacon('/api/close?wid='+WID);}catch(e){try{fetch('/api/close?wid='+WID,{method:'POST',keepalive:true});}catch(_){}}}
+/* F2: authenticated fetch with keepalive; sendBeacon cannot carry the
+   Authorization header, so it must not be used. The existing idle
+   timeout/monitor remains the fallback if unload is not delivered. */
+function stopServer(){if(!AUTH_TOKEN)return;try{authFetch('/api/close?wid='+encodeURIComponent(WID),{method:'POST',keepalive:true});}catch(_){}}
 window.addEventListener('beforeunload',stopServer);
 window.addEventListener('pagehide',stopServer);
 /* modals */
@@ -3514,52 +4789,110 @@ document.addEventListener('keydown',e=>{
     else if(!e.shiftKey&&document.activeElement===els[els.length-1]){e.preventDefault();els[0].focus();}
   }
 });
-/* boot */
-let loading=false;
+/* boot (F6d): independent per-section refresh, deadline and honest status */
+let loading=false,pendingRefresh=false;
+const SEC=window.__ocdState={sections:{},cycle:{}};
+const SECTIONS=[
+ {key:'stats',url:'/api/stats',validate:d=>d&&typeof d==='object'&&!d.error&&('totals' in d||'days' in d||'day_total' in d),render:d=>{S=d;renderAll();}},
+ {key:'router',url:'/api/router',validate:d=>d&&typeof d==='object'&&!d.error&&('totals' in d||'days' in d||'day_total' in d),render:d=>{R=d;renderRouter();}},
+ {key:'agents',url:'/api/agents',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.child_runs),render:d=>{SA=d;renderSubagents();renderConfig();}},
+ {key:'graph',url:'/api/graph',validate:d=>d&&typeof d==='object'&&!d.error&&d.nodes&&Array.isArray(d.roots),render:d=>{G=d;renderGraph();}},
+ {key:'sessions',url:'/api/sessions',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.rows),render:d=>{SB=d;renderSSTable();}},
+ {key:'projects',url:'/api/projects',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.rows),render:d=>{PJ=d;renderProjects();}},
+ {key:'signals',url:'/api/signals',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.signals),render:d=>{SG=d;renderSignals();}},
+ {key:'codex',url:'/api/codex',validate:d=>d&&d.ok===true&&Array.isArray(d.sessions),render:d=>{CX=d;renderCodex();}}
+];
+function secUnavailable(key,msg){
+  var tb=(key==='sessions')?document.querySelector('#sstbl tbody'):((key==='projects')?document.querySelector('#projtbl tbody'):null);
+  if(tb)tb.innerHTML='<tr><td colspan="5">unavailable: '+ESC(msg)+'</td></tr>';
+  if(key==='graph'){var g=document.getElementById('graph');if(g)g.textContent='unavailable: '+msg;}
+  if(key==='signals'){var s=document.getElementById('sig-chips');if(s)s.textContent='unavailable: '+msg;}
+  if(key==='codex'){var c=document.querySelector('#cx-tbl tbody');if(c)c.innerHTML='<tr><td colspan="6">unavailable: '+ESC(msg)+'</td></tr>';}
+}
+function secStrip(){
+  var sts=SEC.sections,parts=[];
+  SECTIONS.forEach(function(s){var st=sts[s.key];if(!st)return;var t=s.key+': '+st.state;
+    if(st.error)t+=' ('+st.error+')';
+    if((st.state==='stale'||st.state==='error')&&st.lastSuccess)t+=' last ok '+new Date(st.lastSuccess).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+    parts.push(t);});
+  var el=document.getElementById('src-status');if(el){el.textContent=parts.join(' · ');el.title=parts.join('; ');}
+}
 async function load(){
-  if(loading)return;loading=true;$('refresh').disabled=true;
+  if(loading){pendingRefresh=true;return;}
+  if(AUTH_FAILED)return;
+  if(!AUTH_TOKEN){showAuthLock(true);return;}
+  loading=true;pendingRefresh=false;$('refresh').disabled=true;
+  SEC.cycle={started:Date.now(),ok:0,failed:0,total:SECTIONS.length};
+  var results=await Promise.allSettled(SECTIONS.map(runSection));
+  var ok=0;for(var i=0;i<results.length;i++){if(results[i].status==='fulfilled'&&results[i].value)ok++;}
+  SEC.cycle.finished=Date.now();SEC.cycle.ok=ok;SEC.cycle.failed=SECTIONS.length-ok;
+  if(ok===SECTIONS.length&&!AUTH_FAILED){$('status').textContent='Updated '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
+  else{var bad=[];SECTIONS.forEach(function(s){var st=SEC.sections[s.key];if(st&&st.state!=='success')bad.push(s.key);});
+    $('status').textContent='Partial update: '+ok+'/'+SECTIONS.length+' sources'+(bad.length?(' (failed: '+bad.join(', ')+')'):'');}
+  secStrip();
+  loading=false;$('refresh').disabled=false;
+  if(pendingRefresh&&!AUTH_FAILED){pendingRefresh=false;load();}
+}
+async function runSection(s){
+  var st=SEC.sections[s.key];
+  if(!st){st=SEC.sections[s.key]={state:'idle',gen:0,inFlight:false,lastSuccess:0,error:null,data:null,ac:null};}
+  if(st.inFlight)return true;
+  st.inFlight=true;st.gen++;var gen=st.gen;
+  st.state=st.lastSuccess?'stale':'pending';
+  var ac=('AbortController' in window)?new AbortController():null;st.ac=ac;
   try{
-    const [r1,r2,r3,r4,r5,r6,r7,r8]=await Promise.all([
-      fetch('/api/stats?_='+Date.now(),{headers:{'X-Window-Id':WID}}),
-      fetch('/api/router?_='+Date.now(),{headers:{'X-Window-Id':WID}}),
-      fetch('/api/agents?_='+Date.now(),{headers:{'X-Window-Id':WID}}),
-      fetch('/api/graph?_='+Date.now(),{headers:{'X-Window-Id':WID}}),
-      fetch('/api/sessions?_='+Date.now(),{headers:{'X-Window-Id':WID}}),
-      fetch('/api/projects?_='+Date.now(),{headers:{'X-Window-Id':WID}}),
-      fetch('/api/signals?_='+Date.now(),{headers:{'X-Window-Id':WID}}),
-      fetch('/api/codex?_='+Date.now(),{headers:{'X-Window-Id':WID}}),
-    ]);
-    if(!r1.ok)throw new Error('HTTP '+r1.status);
-    S=await r1.json();renderAll();
-    try{if(r3.ok){SA=await r3.json();renderSubagents();renderConfig();}}catch(_){}
-    try{if(r4.ok){G=await r4.json();renderGraph();}}catch(_){}
-    try{if(r5.ok){SB=await r5.json();renderSSTable();}}catch(_){}
-    try{if(r6.ok){PJ=await r6.json();renderProjects();}}catch(_){}
-    try{if(r7.ok){SG=await r7.json();renderSignals();}}catch(_){}
-    try{if(r8.ok){CX=await r8.json();renderCodex();}}catch(_){}
-    try{if(r2.ok){R=await r2.json();if(TAB==='router')renderRouter();else renderRouter();}}catch(_){}
-    $('status').textContent='Updated '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-  }catch(e){$('status').textContent='Failed: '+e.message;}
-  finally{loading=false;$('refresh').disabled=false;}
+    var d=await fetchJson(s.url+((s.url.indexOf('?')<0)?'?':'&')+'_='+Date.now(),ac?{signal:ac.signal}:{});
+    if(!s.validate(d))throw new Error('unexpected payload shape');
+    if(gen!==st.gen)return true;
+    /* A01/A05: a retained snapshot with a failed refresh is stale (never a
+       plain success, and it must not advance lastSuccess); an explicitly
+       skipped raw record is partial coverage of the source. Both stay
+       visible in the data and in the source strip. */
+    var staleMsg=null,partialMsg=null;
+    if(d&&d.synth_stale){staleMsg='stale snapshot: '+(d.synth_error||'source refresh failed');}
+    if(d&&d.synth_oversize_records>0){partialMsg='partial source coverage: '+d.synth_oversize_records+' oversize record(s) skipped';}
+    if(staleMsg){
+      st.data=d;st.state='stale';st.error=staleMsg;
+      s.render(d);
+      console.warn('ocd source '+s.key+' stale: '+staleMsg);
+      return false;
+    }
+    st.data=d;st.state='success';st.lastSuccess=Date.now();
+    st.error=null;if(partialMsg)st.error=partialMsg;
+    s.render(d);
+    if(partialMsg){console.warn('ocd source '+s.key+' partial: '+partialMsg);return false;}
+    return true;
+  }catch(e){
+    if(e&&e.status===401){noteAuthFailure();return false;}
+    if(gen!==st.gen)return true;
+    st.error=(e&&e.message)?e.message:String(e);
+    if(st.lastSuccess){st.state='stale';}else{st.state='error';}
+    if(!st.lastSuccess)secUnavailable(s.key,st.error);
+    console.warn('ocd source '+s.key+' failed: '+st.error);
+    return false;
+  }finally{st.inFlight=false;st.ac=null;}
 }
 var G=null,SB=null,PJ=null,SG=null;
 function agoMs(v){if(v==null)return '?';var ms=(v>1e12)?v:(v*1000);var s=Math.max(0,Math.floor((Date.now()-ms)/1000));if(s<60)return s+' s ago';var m=Math.floor(s/60);if(m<60)return m+' min ago';var h=Math.floor(m/60);if(h<48)return h+' h ago';return Math.floor(h/24)+' d ago';}
 function fmtT(v){if(v==null)return '?';var ms=(v>1e12)?v:(v*1000);try{return new Date(ms).toLocaleString([],{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}catch(_){return String(v);}}
 function renderGraph(){var el=document.getElementById('graph');if(!el)return;if(!G||G.error){el.textContent=(G&&G.error)?('ERR '+G.error):'no data';return;}var H='',count=0;function walk(id,depth){if(count>300||depth>5)return;var n=G.nodes[id];if(!n)return;count++;H+='<div data-sid="'+n.id+'" style="padding-left:'+(depth*18)+'px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><b>'+ESC(n.agent)+'</b> <span style="opacity:.65">'+ESC(n.title)+' · '+agoMs(n.updated)+'</span></div>';var kids=G.kids[id]||[];for(var i=0;i<kids.length;i++)walk(kids[i],depth+1);}for(var i=0;i<G.roots.length&&count<=300;i++)walk(G.roots[i],0);el.innerHTML='<div style="opacity:.65;margin-bottom:6px">'+G.roots.length+' roots, nodes: '+Object.keys(G.nodes).length+'</div>'+H;}
 function renderSSTable(){var tb=document.querySelector('#sstbl tbody');if(!tb)return;if(!SB||SB.error){tb.innerHTML='<tr><td colspan="5">ERR</td></tr>';return;}var H='';for(var i=0;i<SB.rows.length;i++){var r=SB.rows[i];H+='<tr data-sid="'+r.id+'" style="cursor:pointer"><td>'+ESC(r.title)+'</td><td>'+ESC(r.agent||'')+'</td><td>'+ESC(r.model||'')+'</td><td>'+ESC(r.directory||'')+'</td><td>'+fmtT(r.time_created)+'</td></tr>';}if(!H)H='<tr><td colspan="5">no results</td></tr>';tb.innerHTML=H;}
-async function fetchSessions(){var p='q='+encodeURIComponent(document.getElementById('ss-q').value)+'&agent='+encodeURIComponent(document.getElementById('ss-agent').value)+'&model='+encodeURIComponent(document.getElementById('ss-model').value);try{var r=await fetch('/api/sessions?'+p+'&_='+Date.now(),{headers:{'X-Window-Id':WID}});if(r.ok){SB=await r.json();renderSSTable();}}catch(_){}}
+var _ssGen=0;
+async function fetchSessions(){var p='q='+encodeURIComponent($('ss-q').value)+'&agent='+encodeURIComponent($('ss-agent').value)+'&model='+encodeURIComponent($('ss-model').value);var g=++_ssGen;try{var d=await fetchJson('/api/sessions?'+p);if(g!==_ssGen)return;SB=d;renderSSTable();}catch(e){if(e&&e.status===401){noteAuthFailure();return;}if(g!==_ssGen)return;console.warn('ocd sessions search failed: '+((e&&e.message)||e));}}
 function renderProjects(){var tb=document.querySelector('#projtbl tbody');if(!tb)return;if(!PJ||PJ.error){tb.innerHTML='<tr><td colspan="5">ERR</td></tr>';return;}var H='';for(var i=0;i<PJ.rows.length;i++){var r=PJ.rows[i];var nm=r.name||r.directory||r.worktree||r.id;H+='<tr><td>'+ESC(nm)+'</td><td>'+ESC(r.directory||r.worktree||'')+'</td><td>'+ESC(r.vcs||'')+'</td><td class="num">'+(r.sessions||0)+'</td><td>'+fmtT(r.last)+'</td></tr>';}if(!H)H='<tr><td colspan="5">no projects</td></tr>';tb.innerHTML=H;}
 function renderSignals(){var el=document.getElementById('sig-chips');if(!el)return;if(!SG||SG.error){el.textContent='ERR';return;}var H='';for(var i=0;i<SG.signals.length;i++){var s=SG.signals[i];var c=(s.level==='warn')?'#a6761d':((s.level==='err')?'#c00':'#16a34a');H+='<span style="display:inline-block;padding:2px 10px;border:1px solid '+c+';border-radius:12px;margin:2px;color:'+c+'">'+ESC(s.text)+'</span>';}if(!H)H='<span>all clear</span>';el.innerHTML=H;}
-async function inspect(sid){var box=document.getElementById('insp');if(!box)return;box.hidden=false;box.textContent='loading '+sid+' ...';try{var r=await fetch('/api/inspect?id='+encodeURIComponent(sid)+'&_='+Date.now(),{headers:{'X-Window-Id':WID}});var d=await r.json();if(!d||!d.found){box.textContent='not found '+sid;return;}var H='<b>'+ESC(d.title||sid)+'</b> <span style="opacity:.65">'+ESC(d.agent||'')+' / '+ESC(d.model||'')+' / '+ESC(d.directory||'')+'</span>';for(var i=0;i<d.messages.length;i++){var m=d.messages[i];H+='<div style="margin-top:8px"><b>'+ESC(m.role)+'</b> <span style="opacity:.65">'+ESC(m.agent||'')+' '+ESC(m.model||'')+' · '+m.parts.length+' parts</span>';if(m.summary)H+='<div>'+ESC(m.summary)+'</div>';for(var j=0;j<m.parts.length;j++){var p=m.parts[j];H+='<div style="margin-left:12px;opacity:.85">['+ESC(p.type)+'] '+p.size+' B'+(p.preview?(', '+ESC(String(p.preview).slice(0,300))):'')+'</div>';}H+='</div>';}box.innerHTML=H;box.scrollIntoView();}catch(e){box.textContent='ERR '+e.message;}}
+var _inspGen=0;
+const _inspState={sid:null,cursor:null,hasMore:false,pending:null};
+async function inspect(sid){var box=document.getElementById('insp');if(!box)return;box.hidden=false;var g=++_inspGen;if(_inspState.sid!==sid){_inspState.sid=sid;_inspState.cursor=null;_inspState.hasMore=false;_inspState.pending=null;}box.textContent='loading '+sid+' ...';try{var u='/api/inspect?id='+encodeURIComponent(sid)+'&_='+Date.now();if(_inspState.pending)u+='&cursor='+encodeURIComponent(_inspState.pending);var d=await fetchJson(u);if(g!==_inspGen)return;if(!d||!d.found){box.textContent='not found '+sid+' (click the row to retry)';return;}var H='<b>'+ESC(d.title||sid)+'</b> <span style="opacity:.65">'+ESC(d.agent||'')+' / '+ESC(d.model||'')+' / '+ESC(d.directory||'')+'</span>';for(var i=0;i<d.messages.length;i++){var m=d.messages[i];H+='<div style="margin-top:8px"><b>'+ESC(m.role)+'</b> <span style="opacity:.65">'+ESC(m.agent||'')+' '+ESC(m.model||'')+' · '+m.parts.length+' parts'+(m.parts_omitted?(' (+'+m.parts_omitted+' omitted)'):'')+'</span>';if(m.summary)H+='<div>'+ESC(m.summary)+'</div>';for(var j=0;j<m.parts.length;j++){var p=m.parts[j];H+='<div style="margin-left:12px;opacity:.85">['+ESC(p.type)+'] '+p.size+' B'+(p.preview?(', '+ESC(String(p.preview).slice(0,300))+(p.truncated?' …[truncated]':'')+(p.raw_fragment?' [raw fragment]':'')):'')+'</div>';}H+='</div>';}H+='<div style="margin-top:10px;opacity:.75;font-size:11px">'+d.count+' messages shown'+((d.parts_truncated)?' · some parts truncated':'')+((d.response_truncated)?' · response shortened':'')+'</div>';if(d.has_more){H+='<div style="margin-top:6px"><button id="insp-more" class="tbtn">Load next</button></div>';}box.innerHTML=H;if(d.has_more){_inspState.cursor=d.cursor;_inspState.hasMore=true;var b=document.getElementById('insp-more');if(b)b.onclick=function(){_inspState.pending=_inspState.cursor;inspect(_inspState.sid);};}else{_inspState.hasMore=false;}box.scrollIntoView();}catch(e){if(e&&e.status===401){noteAuthFailure();box.textContent='Authorization required — reopen via the launcher link';return;}if(g!==_inspGen)return;box.textContent='ERR '+e.message+' (click the row to retry)';}}
 if(!window.__p1wire){window.__p1wire=1;document.addEventListener('click',function(e){var t=(e.target&&e.target.closest)?e.target.closest('[data-sid]'):null;if(t)inspect(t.getAttribute('data-sid'));});['ss-q','ss-agent','ss-model'].forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener('input',function(){if(window.__p1t)clearTimeout(window.__p1t);window.__p1t=setTimeout(fetchSessions,350);});});}
-$('refresh').onclick=load;
+$('refresh').onclick=()=>{if(AUTH_FAILED)return;load();};
 $('search').addEventListener('input',renderSessions);
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)load();});
-setInterval(()=>{if(!document.hidden)load();},30000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!AUTH_FAILED)load();});
+setInterval(()=>{if(!document.hidden&&!AUTH_FAILED)load();},((window.__ocdTimeouts&&window.__ocdTimeouts.refreshMs)||30000));
 try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'){setTab('router');}}catch(_){}
-if(S){renderAll();$('status').textContent='Updated just now';}
+if(S){renderAll();}
 if(R){renderRouter();}
-load();
+if(AUTH_TOKEN){load();}else{showAuthLock(true);}
 </script>
 </body>
 </html>"""
@@ -3596,15 +4929,121 @@ class Handler(BaseHTTPRequestHandler):
             CLOSE_TIMER.start()
 
     def _check_origin(self):
-        """Reject cross-origin / DNS-rebinding POSTs (CSRF + key-exfil guard)."""
-        origin = self.headers.get("Origin")
-        if not origin:
-            return True  # local tooling without an Origin header
-        try:
-            origin_host = urlparse(origin).netloc
-        except ValueError:
+        """Strict Origin check against the real server address (F2).
+
+        Missing Origin is allowed (local script client) but never counts
+        as authentication. Present Origin must equal the exact allowed
+        origin including scheme and port. "null", foreign origins and
+        multiple values are rejected. Kept for backward-compatible call
+        sites; new code prefers _check_origin_strict().
+        """
+        return self._check_origin_strict()
+
+    def _check_origin_strict(self):
+        vals = _header_all(self, "Origin")
+        if not vals:
+            return True
+        if len(vals) != 1:
             return False
-        return bool(origin_host) and origin_host == (self.headers.get("Host") or "")
+        raw = vals[0]
+        if raw is None:
+            return True
+        raw = raw.strip()
+        if not raw or "," in raw:
+            return False
+        return raw == _expected_origin(self.server)
+
+    def _check_host(self):
+        """Validate Host against the real bound address. Returns None when
+        OK, 400 for missing/multiple, 403 for a disallowed value."""
+        vals = _header_all(self, "Host")
+        expanded = []
+        for v in vals:
+            if v is None:
+                continue
+            if "," in v:
+                return 400
+            expanded.append(v)
+        if len(expanded) != 1:
+            return 400
+        raw = expanded[0]
+        if raw is None or not raw.strip():
+            return 400
+        if raw.strip() != _expected_host(self.server):
+            return 403
+        return None
+
+    def _check_auth(self):
+        """All private /api/* routes need Authorization: Bearer <token>."""
+        vals = _header_all(self, "Authorization")
+        if len(vals) != 1:
+            return False
+        raw = vals[0]
+        if raw is None:
+            return False
+        raw = raw.strip()
+        if not raw.startswith("Bearer "):
+            return False
+        cand = raw[7:].strip()
+        if not cand or "," in cand or " " in cand or "\t" in cand:
+            return False
+        if not _TOKEN_RE.fullmatch(cand):
+            return False
+        try:
+            expected = self.server.auth_token
+        except AttributeError:
+            expected = getattr(Handler.server, "auth_token", None)
+        if not expected or not isinstance(expected, str):
+            return False
+        try:
+            return secrets.compare_digest(cand, expected)
+        except Exception:
+            return False
+
+    def _deny(self, code):
+        if code == 400:
+            self._send(400, "text/plain", b"bad request")
+        elif code == 401:
+            self._send(401, "application/json", b'{"error":"unauthorized"}')
+        elif code == 403:
+            self._send(403, "application/json", b'{"error":"forbidden"}')
+        elif code == 405:
+            self._send(405, "text/plain", b"method not allowed")
+        else:
+            self._send(code, "text/plain", b"error")
+
+    def _guard(self, path):
+        """Shared F2 guard: Host (400/403), Origin (403), auth for /api/*.
+
+        Returns None when the request may proceed, else the denial code
+        that was already sent. Never touches state, disk, or timers.
+        """
+        bad = self._check_host()
+        if bad is not None:
+            self._deny(bad)
+            return bad
+        if not self._check_origin_strict():
+            self._deny(403)
+            return 403
+        if _is_private_path(path):
+            if not self._check_auth():
+                self._deny(401)
+                return 401
+        return None
+
+    def _unsupported_method(self):
+        try:
+            path = urlparse(self.path).path
+        except Exception:
+            path = "/"
+        if self._guard(path) is not None:
+            return
+        self._deny(405)
+
+    def __getattr__(self, name):
+        if name.startswith("do_"):
+            return object.__getattribute__(self, "_unsupported_method")
+        raise AttributeError(name)
 
     def _touch(self, wid=None):
         with LOCK:
@@ -3630,6 +5069,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        # F2: Host/Origin/auth run before any read, synth, window
+        # registration, _touch, or close handling.
+        if self._guard(path) is not None:
+            return
         wid = (query.get("wid") or [""])[0] or self.headers.get("X-Window-Id", "")
         if path.startswith(("/api/", "/")):
             self._cancel_close()
@@ -3642,29 +5085,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, "text/plain", b"no logo")
             return
         elif path in ("/", "/index.html"):
-            try:
-                payload = json_html(cached_local_stats(self.db_path))
-            except Exception as e:
-                payload = json_html(blank_stats(
-                    "local", "Local OpenCode data", error=str(e),
-                    insight="Could not read the local database.",
-                ))
-            try:
-                _rep, _rsyn = router_events_path(self.router_events)
-                try:
-                    _rlim = self.router_limits if Path(self.router_limits).is_file() else None
-                except (TypeError, OSError):
-                    _rlim = None
-                _rstats = cached_router_stats(
-                    _rep, _rlim,
-                    db_worktrees(self.db_path), _rsyn)
-                if _rsyn and isinstance(_rstats, dict):
-                    _rstats["source"] = "codex-synth"
-                    _rstats["source_label"] = "Codex sessions (synthesized)"
-                router_payload = json_html(_rstats)
-            except Exception as e:
-                router_payload = json_html(blank_router_stats(error=str(e)))
-            body = PAGE.replace("__DATA__", payload).replace("__ROUTER__", router_payload).encode("utf-8")
+            # F2: public shell carries no private data and no token.
+            # Initial payloads are null; the browser fetches real data
+            # through the authenticated API. No DB/synth read happens here.
+            body = PAGE.replace("__DATA__", "null").replace("__ROUTER__", "null").encode("utf-8")
             self._send(200, "text/html; charset=utf-8", body)
         elif path.startswith("/api/session/"):
             session_id = path[len("/api/session/"):]
@@ -3699,6 +5123,12 @@ class Handler(BaseHTTPRequestHandler):
                 if _rsyn and isinstance(stats, dict):
                     stats["source"] = "codex-synth"
                     stats["source_label"] = "Codex sessions (synthesized)"
+                    if _codex_last_error:
+                        # Audit A01: the refresh failed; the payload is the
+                        # last good snapshot and says so explicitly.
+                        stats["synth_error"] = _codex_last_error
+                        stats["synth_stale"] = True
+                    stats["synth_oversize_records"] = _codex_last_oversize
             except Exception as e:
                 stats = blank_router_stats(error=str(e))
             body = json.dumps(stats).encode("utf-8")
@@ -3718,7 +5148,10 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     con.close()
             except Exception as e:
-                stats = {"error": str(e), "child_runs": [], "child_agents": [], "child_total": 0, "all_agents": [], "config": []}
+                stats = {"error": str(e), "child_runs": [], "child_agents": [], "child_total": 0,
+                         "listed_count": 0, "total_child_sessions": 0, "limit": 100, "truncated": False,
+                         "activity_counts": {"recent": 0, "quiet": 0, "stale": 0, "unknown": 0},
+                         "all_agents": [], "config": []}
             body = json.dumps(stats).encode("utf-8")
             self._send(200, "application/json", body)
         elif path.startswith("/api/graph"):
@@ -3734,10 +5167,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", body)
         elif path.startswith("/api/inspect"):
             try:
-                sid = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
+                pq = parse_qs(urlparse(self.path).query)
+                sid = (pq.get("id") or [""])[0]
+                cursor = (pq.get("cursor") or [None])[0]
+                limit = (pq.get("limit") or [None])[0]
                 con = connect(self.db_path)
                 try:
-                    stats = query_inspect(con, sid)
+                    stats = query_inspect(con, sid, cursor=cursor, limit=limit)
                 finally:
                     con.close()
             except Exception as e:
@@ -3788,17 +5224,22 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
-        if not self._check_origin():
-            self._send(403, "text/plain", b"forbidden")
+        # F2: same guard as GET — Host, Origin, then auth for /api/* —
+        # before any window or close handling.
+        if self._guard(path) is not None:
             return
         if path == "/api/close":
             wid = (query.get("wid") or [""])[0]
-            self._send(200, "text/plain", b"bye")
+            if not wid:
+                wid = self.headers.get("X-Window-Id", "")
+            # F2-T09: pop before responding so any client that receives the
+            # 200 is guaranteed the window is already gone (no send/pop race).
             with LOCK:
                 if wid:
                     WINDOWS.pop(wid, None)
                 now = time.time()
                 others = any(now - last < 90 for w, last in WINDOWS.items())
+            self._send(200, "text/plain", b"bye")
             if not others:
                 self._arm_close()
         else:
@@ -3809,8 +5250,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
         self.send_header("X-Made-By", "zX")
         self.end_headers()
+        if self.command == "HEAD":
+            return
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
@@ -3877,11 +5323,24 @@ def main():
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     Handler.server = server
-    url = f"http://127.0.0.1:{args.port}"
+    try:
+        server.auth_token = _new_token()
+    except Exception:
+        pass
+    try:
+        Handler.auth_token = server.auth_token
+    except Exception:
+        pass
+    _host, _real_port = server.server_address[:2]
+    url = f"http://127.0.0.1:{_real_port}"
+    url_with_token = f"{url}/#token={server.auth_token}"
     print(f"Dashboard live at {url}  (Ctrl+C to stop)")
+    # F2: the operator opens the fragment address once; the fragment is
+    # never sent over HTTP and never uses a query-string token.
+    print(f"Open this address to authorize this browser session: {url_with_token}")
     if args.open:
         try:
-            webbrowser.open(url)
+            webbrowser.open(url_with_token)
         except Exception as e:
             print(f"warning: could not open browser: {e}", file=sys.stderr)
 

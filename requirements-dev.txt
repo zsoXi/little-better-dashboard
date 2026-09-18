@@ -1,0 +1,6 @@
+# Dev-only requirements (browser tests). Never needed to run the dashboard:
+# the runtime is standard-library only.
+#
+# Exact version verified locally with the browser runner
+# (tools/run_browser_tests.py, msedge channel, Windows).
+playwright==1.62.0  # dev-only, browser tests only; never a runtime dependency.

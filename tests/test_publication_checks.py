@@ -1,0 +1,338 @@
+"""Publication hygiene checks (spec §20 PUB-T01..T07, local verification).
+
+These are real, bounded checks against the working tree: README claims,
+launcher bits, secrets/user-data hygiene, screenshot, runtime isolation and
+remote-operation hygiene. They never touch the network, never launch a
+browser window and never modify tracked files.
+"""
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+def _read(path):
+    return Path(path).read_text(encoding="utf-8", errors="replace")
+
+
+def _git(*args, timeout=60):
+    return subprocess.run(["git", "-C", str(REPO_ROOT)] + list(args),
+                          capture_output=True, text=True, timeout=timeout,
+                          encoding="utf-8", errors="replace")
+
+
+class TestPublicationChecks(unittest.TestCase):
+    def test_pub_t01_readme_matches_tested_behavior(self):
+        readme = _read(REPO_ROOT / "README.md").lower()
+        for claim in (
+                "127.0.0.1",            # local bind
+                "token",                # per-instance token / fragment
+                "#token=",              # fragment flow
+                "unknown",              # unknown outcomes
+                "recency",              # recency labels
+                "non-additive",         # commit windows warning
+                "checkpoint",           # derived cache mention
+                ".cache",               # cache location
+                "tunnel",               # no tunnel support
+                "tail",                 # bounded tail mention
+                "safe to delete",       # checkpoint can be deleted
+        ):
+            self.assertIn(claim, readme, "README must mention %r" % claim)
+        self.assertNotIn("guaranteed", readme)
+        self.assertNotIn("tested on macos", readme)
+        self.assertNotIn("tested on linux", readme)
+
+    def test_pub_t02_shell_launcher_is_executable(self):
+        r = _git("ls-files", "-s", "start-dashboard.sh")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        line = r.stdout.strip().splitlines()[0]
+        mode = line.split()[0]
+        self.assertEqual(mode, "100755",
+                         "start-dashboard.sh must be recorded executable")
+        content = _read(REPO_ROOT / "start-dashboard.sh")
+        self.assertTrue(content.startswith("#!/bin/sh"))
+        self.assertIn('cd "$(dirname "$0")"', content)
+
+    @unittest.skipUnless(os.name == "nt",
+                         "start-dashboard.bat is a Windows scenario")
+    def test_pub_t03_bat_special_paths_and_arg_forwarding(self):
+        bat = _read(REPO_ROOT / "start-dashboard.bat")
+        self.assertIn('cd /d "%~dp0"', bat)
+        self.assertIn("%*", bat)
+        sdir = Path(tempfile.mkdtemp(prefix="pub-t03-")) / "dir with space !(x) ünïcode"
+        self.addCleanup(shutil.rmtree, str(sdir.parent), True)
+        sdir.mkdir(parents=True)
+        shutil.copyfile(REPO_ROOT / "start-dashboard.bat", sdir / "start-dashboard.bat")
+        shutil.copyfile(REPO_ROOT / "opencode_dashboard.py", sdir / "opencode_dashboard.py")
+        env = dict(os.environ)
+        env["HOME"] = str(sdir / "home")
+        env["USERPROFILE"] = env["HOME"]
+        env["LOCALAPPDATA"] = env["HOME"]
+        os.makedirs(env["HOME"], exist_ok=True)
+        cp = subprocess.run(
+            ["cmd", "/c", "start-dashboard.bat", "--help"],
+            cwd=str(sdir), capture_output=True, text=True, timeout=60, env=env)
+        out = (cp.stdout or "") + (cp.stderr or "")
+        self.assertEqual(cp.returncode, 0, out[-800:])
+        self.assertIn("usage:", out.lower())
+
+    @unittest.skipIf(os.name == "nt",
+                     "POSIX counterpart of the BAT launcher scenario")
+    def test_pub_t03b_shell_launcher_special_paths_and_arg_forwarding(self):
+        sh = _read(REPO_ROOT / "start-dashboard.sh")
+        self.assertTrue(sh.startswith("#!/bin/sh"))
+        self.assertIn('cd "$(dirname "$0")"', sh)
+        self.assertIn("exec python3 opencode_dashboard.py", sh)
+        sdir = Path(tempfile.mkdtemp(prefix="pub-t03b-")) / "dir with space !(x) ünïcode"
+        self.addCleanup(shutil.rmtree, str(sdir.parent), True)
+        sdir.mkdir(parents=True)
+        shutil.copyfile(REPO_ROOT / "start-dashboard.sh",
+                        sdir / "start-dashboard.sh")
+        shutil.copyfile(REPO_ROOT / "opencode_dashboard.py",
+                        sdir / "opencode_dashboard.py")
+        # A stand-in python3 on PATH proves argument forwarding and the
+        # working directory without starting a real server.
+        bindir = sdir / "fakebin"
+        bindir.mkdir()
+        fake = bindir / "python3"
+        fake.write_text('#!/bin/sh\nprintf "usage: fake %s\\n" "$*"\n')
+        fake.chmod(0o755)
+        env = dict(os.environ)
+        env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+        env["HOME"] = str(sdir / "home")
+        env["USERPROFILE"] = env["HOME"]
+        env["LOCALAPPDATA"] = env["HOME"]
+        os.makedirs(env["HOME"], exist_ok=True)
+        cp = subprocess.run(
+            ["/bin/sh", str(sdir / "start-dashboard.sh"), "--open", "x y"],
+            cwd=str(sdir), capture_output=True, text=True, timeout=60, env=env)
+        out = (cp.stdout or "") + (cp.stderr or "")
+        self.assertEqual(cp.returncode, 0, out[-800:])
+        self.assertIn("usage:", out.lower())
+        self.assertIn("--open", out)
+        self.assertIn("x y", out)
+
+    def test_pub_t04_no_secrets_or_user_data(self):
+        r = _git("status", "--porcelain")
+        d1 = _git("diff")
+        d2 = _git("diff", "--cached")
+        blob = r.stdout + d1.stdout + d2.stdout
+        patterns = [
+            (r"github_pat_[A-Za-z0-9_]{20,}", "github token"),
+            (r"\bsk-[A-Za-z0-9]{20,}\b", "openai-style key"),
+            (r"\bAKIA[0-9A-Z]{16}\b", "aws key"),
+            (r"Bearer\s+[A-Za-z0-9_\-]{32,}", "bearer literal"),
+            (r"TYPESAFE_API_KEY\s*=\s*\S+", "typesafe key assignment"),
+        ]
+        for pat, what in patterns:
+            self.assertIsNone(re.search(pat, blob),
+                              "possible %s leaked into the diff" % what)
+        tracked = _git("ls-files").stdout.lower().splitlines()
+        for name in tracked:
+            self.assertFalse(name.endswith(".sqlite3") or name.endswith(".db"),
+                             "database file tracked: %s" % name)
+        art = REPO_ROOT / "artifacts"
+        if art.is_dir():
+            for log in art.glob("*.log"):
+                text = _read(log)
+                self.assertIsNone(
+                    re.search(r"Bearer\s+[A-Za-z0-9_\-]{32,}(?!\s*['\"]?\s*\+)", text),
+                    "literal bearer token found in %s" % log.name)
+
+    def test_pub_t05_screenshot_current(self):
+        shot = REPO_ROOT / "screenshot.png"
+        self.assertTrue(shot.is_file(), "screenshot.png must exist")
+        self.assertGreater(shot.stat().st_size, 10_000,
+                           "screenshot.png looks empty/stale")
+        digest = hashlib.sha256(shot.read_bytes()).hexdigest()
+        self.assertEqual(
+            digest,
+            "44114063b03f4cfdaa11da10d5db913b279c5cad1796bf8018d011209d71406b",
+            "screenshot.png must be the committed capture of the synthetic "
+            "fixture (regenerate: tools/run_browser_tests.py F8-B01 writes "
+            "artifacts/F6d-browser-shots/F8-B01-01-tabs-120-reasoning.png "
+            "from the synthetic fixture; copy it over screenshot.png and "
+            "update this pin)")
+        readme = _read(REPO_ROOT / "README.md")
+        self.assertIn("screenshot.png", readme)
+
+    def test_pub_t06_runtime_stays_dependency_free(self):
+        src = _read(REPO_ROOT / "opencode_dashboard.py")
+        self.assertNotIn("import playwright", src)
+        self.assertNotIn("from playwright", src)
+        req = _read(REPO_ROOT / "requirements-dev.txt")
+        self.assertIn("playwright==", req)
+        self.assertIn("# dev-only", req)
+
+    def test_pub_t07_no_unauthorized_remote_operations(self):
+        r = _git("reflog", "--date=iso")
+        text = (r.stdout or "").lower()
+        self.assertNotIn("push", text, "no push may appear in the reflog")
+        self.assertNotIn("force", text)
+        st = _git("status", "--porcelain")
+        self.assertNotIn("?? ..", st.stdout)
+
+    def test_pub_t02b_gitbash_launcher_run(self):
+        """Real direct launcher run in the available shell (Git Bash/Win)."""
+        import http.client
+        import threading
+        import time as _time
+        bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+        if not bash.is_file():
+            self.skipTest("Git Bash not available for the launcher run")
+        tmp = Path(tempfile.mkdtemp(prefix="pub-t02b-")) / "git bash !(x) ünïcode"
+        self.addCleanup(shutil.rmtree, str(tmp.parent), True)
+        tmp.mkdir(parents=True)
+        shutil.copyfile(REPO_ROOT / "start-dashboard.sh", tmp / "start-dashboard.sh")
+        shutil.copyfile(REPO_ROOT / "opencode_dashboard.py", tmp / "opencode_dashboard.py")
+        home = tmp / "home"
+        home.mkdir()
+        userbase = tmp / "userbase"
+        userbase.mkdir()
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["USERPROFILE"] = str(home)
+        env["LOCALAPPDATA"] = str(home)
+        env["PYTHONUSERBASE"] = str(userbase)
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        unix_dir = str(tmp).replace("\\", "/")
+        pre = subprocess.run([str(bash), "-lc", "python3 --version"],
+                             capture_output=True, text=True, timeout=60,
+                             env=env)
+        if pre.returncode != 0:
+            self.skipTest("Git Bash has no python3: %r"
+                          % ((pre.stderr or pre.stdout) or "")[:200])
+        # The browser suppression must sit in the child interpreter's per
+        # version user site directory (userbase/PythonXY/site-packages);
+        # placed directly under PYTHONUSERBASE it is never imported and the
+        # launcher (start-dashboard.sh --open) would pop a real browser tab.
+        mver = re.search(r"Python\s+(\d)\.(\d+)",
+                         (pre.stdout or "") + (pre.stderr or ""))
+        if not mver:
+            self.skipTest("cannot parse the Git Bash python3 version")
+        site_dir = (userbase
+                    / ("Python%s%s" % (mver.group(1), mver.group(2)))
+                    / "site-packages")
+        site_dir.mkdir(parents=True, exist_ok=True)
+        (site_dir / "usercustomize.py").write_text(
+            "try:\n"
+            "    import webbrowser\n"
+            "    webbrowser.open = lambda *a, **k: True\n"
+            "    webbrowser.open_new = lambda *a, **k: True\n"
+            "    webbrowser.open_new_tab = lambda *a, **k: True\n"
+            "except Exception:\n"
+            "    pass\n", encoding="utf-8")
+        command = "cd \"%s\" && ./start-dashboard.sh --quiet --port 0" % unix_dir
+        proc = subprocess.Popen(
+            [str(bash), "-lc", command], stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+            errors="replace", env=env, cwd=str(tmp))
+        lines = []
+        port = None
+        token = None
+        import queue
+        q = queue.Queue()
+
+        def _reader():
+            try:
+                for raw in proc.stdout:
+                    q.put(raw.rstrip("\n"))
+            except Exception:
+                pass
+            q.put(None)
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+        try:
+            deadline = _time.time() + 40
+            while _time.time() < deadline:
+                try:
+                    line = q.get(timeout=1.0)
+                except queue.Empty:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                if line is None:
+                    break
+                lines.append(line)
+                m = re.search(r"127\.0\.0\.1:(\d+)", line)
+                if m:
+                    port = int(m.group(1))
+                mt = re.search(r"#token=([A-Za-z0-9_\-]+)", line)
+                if mt:
+                    token = mt.group(1)
+                if port and token:
+                    break
+            self.assertIsNotNone(port, "launcher must print the real URL: %r"
+                                 % lines[-5:])
+            self.assertIsNotNone(token, "launcher must print a token link")
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("GET", "/")
+            r = conn.getresponse()
+            public_status = r.status
+            r.read()
+            conn.close()
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("GET", "/api/stats", headers={
+                "Authorization": "Bearer " + token, "X-Window-Id": "gbtab"})
+            r = conn.getresponse()
+            auth_status = r.status
+            body = r.read()
+            conn.close()
+            self.assertTrue(body)
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("GET", "/api/stats", headers={"X-Window-Id": "gbtab"})
+            r = conn.getresponse()
+            anon_status = r.status
+            r.read()
+            conn.close()
+            self.assertEqual(public_status, 200)
+            self.assertEqual(auth_status, 200)
+            self.assertEqual(anon_status, 401)
+            log = REPO_ROOT / "artifacts" / "PUB-T02-gitbash.windows.log"
+            log.parent.mkdir(exist_ok=True)
+            log.write_text(
+                "environment=GitBash-Windows (not Linux, not macOS)\n"
+                "bash=%s\n"
+                "command=%s\n"
+                "instrumentation=PYTHONUSERBASE usercustomize silences "
+                "webbrowser.open only; PYTHONUNBUFFERED=1 and "
+                "PYTHONIOENCODING=utf-8 only make the real launcher flush its "
+                "stdout to the capturing pipe; real launcher, real runtime, "
+                "real HTTP\n"
+                "port=%d\n"
+                "GET / -> %d\n"
+                "GET /api/stats (Bearer, redacted) -> %d\n"
+                "GET /api/stats (no token) -> %d\n"
+                "launcher-run=gitbash-executed\n"
+                % (bash, command, port, public_status, auth_status,
+                   anon_status), encoding="utf-8")
+        finally:
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("POST", "/api/close?wid=gbtab", headers={
+                    "Authorization": "Bearer " + (token or ""),
+                    "X-Window-Id": "gbtab"})
+                conn.getresponse().read()
+                conn.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=15)
+            except Exception:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                               capture_output=True, timeout=30)
+
+
+if __name__ == "__main__":
+    unittest.main()

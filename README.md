@@ -8,22 +8,31 @@ A single-file, zero-dependency usage dashboard for [OpenCode](https://github.com
 
 ## What it shows
 
-**OpenCode tab** covers sessions, turns, tokens and cost, with tokens per day, tokens by model, an activity heatmap and streaks, a session browser that includes search and a click-to-open message inspector, plus projects, warning signals, subagent runs with **live status** (running, idle or finished, auto-refreshed), agent configuration tiles, and a team graph of parent and child sessions.
+**OpenCode tab** covers sessions, turns, tokens and cost, with tokens per day, tokens by model, an activity heatmap and streaks, a session browser that includes search and a click-to-open message inspector, plus projects, warning signals, child and related sessions with **session activity** (recent, no recent activity, older or unknown — based on session updates, not execution status; auto-refreshed), agent configuration tiles, and a team graph of parent and child sessions.
 
 **Codex tab** gives the same treatment to your local Codex sessions, with request, token and model stats synthesized from your rollout files alongside a browsable session table.
 
-Everything is read from files already on your machine. Nothing is uploaded anywhere, since the server binds to `127.0.0.1` only.
+Everything is read from files already on your machine. The server binds to `127.0.0.1` only and additionally requires a per-instance bearer token plus strict Host/Origin checks; the bind alone is not claimed to prevent all exfiltration.
 
-Privacy: The dashboard may read and display message content from your local OpenCode and Codex sessions for session inspection. This content stays on your machine and is only served through the local 127.0.0.1 dashboard. Nothing is uploaded or sent to external services.
+Privacy: The dashboard may read and display message content from your local OpenCode and Codex sessions for session inspection. This content stays on your machine and is only served to a browser session presenting the instance token over the local 127.0.0.1 dashboard. Nothing is uploaded or sent to external services. Private content is visible to anyone holding the instance link, and tunnels or public exposure are not supported.
+
+## Data handling and limits
+
+- Unknown outcomes stay unknown: a request whose result could not be determined is never silently counted as success or error, and its tokens are never dropped or folded into another bucket.
+- Recency labels (recent, no recent activity, older, unknown) come from session update recency - a session-history signal, not agent execution status.
+- The Codex request list is a bounded **tail** of the newest events with an explicit scanned-vs-total indicator; the synthesized history that feeds the Codex charts keeps the full history (no silent cut-off).
+- "Usage in the 24h before each commit" windows are global and **non-additive**: windows may overlap and may include other projects, so commit rows must not be summed.
+- The Codex synthesis **cache** index lives in `.cache/codex_index.json` (a derived **checkpoint** tied to the published generation): it is **safe to delete** at any time and is never a source of truth; a failed checkpoint write never fails a publish.
+- The server binds to 127.0.0.1 only, requires the per-instance token from the `#token=` fragment, and does not support **tunnels** or public exposure.
 
 ## Quick start (one click)
 
-Requirements: **Python 3** (3.10 or newer works, and it is tested on 3.14) and OpenCode run at least once, so that its database exists.
+Requirements: **Python 3** (3.10 or newer; tested locally on **Windows with Python 3.14.3** - other platforms are not verified yet and CI is pending) and OpenCode run at least once, so that its database exists.
 
 - **Windows:** double-click `start-dashboard.bat`
 - **macOS / Linux:** run `./start-dashboard.sh` (or `bash start-dashboard.sh`)
 
-The dashboard opens in your browser at `http://127.0.0.1:8765`.
+The dashboard opens in your browser at `http://127.0.0.1:8765/#token=…` (per-instance token in the URL fragment; the fragment is never sent over HTTP and no `?token=` query string is used).
 
 Prefer the terminal?
 
@@ -63,7 +72,8 @@ It makes no network calls, collects no telemetry and needs no accounts.
 
 - The first start can take up to a minute on large databases while SQLite warms up.
 - Agent tiles group workers under their leads by filename convention (`tl-1`, `tl-1-w1`, and so on).
-- Subagent running and idle state is derived from session recency (active within 2 minutes, idle within 15 minutes).
+- Child-session activity comes from session update recency (recent up to 2 minutes, no recent activity up to 15 minutes, older beyond; unknown when the timestamp is missing or uninterpretable). It is not agent execution status, and a parent_id link is a session relation, not proof of delegation.
+- "Usage in the 24h before each commit" covers a 24-hour window that is inclusive on both ends. On the Codex tab that window is global and may include other projects; windows overlap, so commit rows must not be summed.
 
 ## Project layout
 

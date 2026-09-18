@@ -2,3 +2,6 @@ __pycache__/
 *.py[cod]
 *.log
 codex_router_events.jsonl
+artifacts/
+checkpoints/
+.cache/

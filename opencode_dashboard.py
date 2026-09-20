@@ -3574,6 +3574,9 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="presets" id="presets" role="group" aria-label="Time range">
       <span class="pl">Period</span>
       <button class="pbtn active" data-r="all">All time</button>
+      <button class="pbtn" data-r="24h">Last 24h</button>
+      <button class="pbtn" data-r="today">Today</button>
+      <button class="pbtn" data-r="yesterday">Yesterday</button>
       <button class="pbtn" data-r="7">7 days</button>
       <button class="pbtn" data-r="30">30 days</button>
       <button class="pbtn" data-r="90">90 days</button>
@@ -3707,6 +3710,9 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="presets" id="r-presets" role="group" aria-label="Codex time range">
       <span class="pl">Period</span>
       <button class="pbtn active" data-rr="all">All time</button>
+      <button class="pbtn" data-rr="24h">Last 24h</button>
+      <button class="pbtn" data-rr="today">Today</button>
+      <button class="pbtn" data-rr="yesterday">Yesterday</button>
       <button class="pbtn" data-rr="7">7 days</button>
       <button class="pbtn" data-rr="30">30 days</button>
       <button class="pbtn" data-rr="90">90 days</button>
@@ -4014,10 +4020,9 @@ function shortPath(p){const seg=(p||'').split('/').filter(Boolean);return seg.le
 function fileRows(){
   // All-time backend aggregates, or a period recompute from recent sessions.
   if(RANGE==='all'&&!FSTATE.day)return {rows:(FS==='file'?(S.files||[]):(S.subsystems||[])),approx:false};
-  const cut=RANGE==='all'?0:Date.now()-RANGE*86400000;
   const agg={};
   (S.sessions||[]).forEach(s=>{
-    if(s.time_created<cut)return;
+    if(!inRangeMs(s.time_created))return;
     if(FSTATE.day&&DS(s.time_created)!==FSTATE.day)return;
     const files=((S.session_files||{})[s.id])||[];
     if(!files.length)return;
@@ -4056,13 +4061,9 @@ function renderFileChart(){
   }).join('')+(rows.length>6?'<button class="more-btn" data-exp="fs">'+(FS_EXP?'Show less':'Show all '+rows.length)+' '+(FS_EXP?'▴':'▾')+'</button>':'');
 }
 function commitRows(){
-  const cut=RANGE==='all'?0:Date.now()-RANGE*86400000;
   let rows=(S.commits||[]).filter(c=>{
     if(FSTATE.day&&c[2]!==FSTATE.day)return false;
-    if(cut){
-      const ms=Date.parse(c[2]+'T00:00:00');
-      if(ms&&ms<cut-86400000)return false;
-    }
+    if(!inRangeDay(c[2]))return false;
     return true;
   });
   rows=rows.slice();
@@ -4093,19 +4094,43 @@ function renderCommitChart(){
   }).join('')+(rows.length>6?'<button class="more-btn" data-exp="cs">'+(CS_EXP?'Show less':'Show all '+rows.length)+' '+(CS_EXP?'▴':'▾')+'</button>':'');
 }
 /* period helpers */
+function rangeCutMs(){
+  if(RANGE==='all')return 0;
+  if(RANGE==='24h')return Date.now()-86400000;
+  const d=new Date();d.setHours(0,0,0,0);
+  if(RANGE==='today')return d.getTime();
+  if(RANGE==='yesterday')return d.getTime()-86400000;
+  return Date.now()-Number(RANGE)*86400000;
+}
+function rangeEndMs(){
+  if(RANGE==='yesterday'){const d=new Date();d.setHours(0,0,0,0);return d.getTime();}
+  return null;
+}
 function cutDate(){
   if(RANGE==='all')return'';
-  const d=new Date(Date.now()-RANGE*86400000);
+  if(RANGE==='today'||RANGE==='yesterday'||RANGE==='24h'){
+    let t=Date.now();
+    if(RANGE==='yesterday'){const d=new Date(t);d.setHours(0,0,0,0);t=d.getTime()-86400000;}
+    else if(RANGE==='24h')t-=86400000;
+    return new Date(t).toLocaleDateString('en-CA');
+  }
+  const d=new Date(Date.now()-Number(RANGE)*86400000);
   return d.toLocaleDateString('en-CA');
 }
-function inPeriod(day){const c=cutDate();return !c||day.date>=c;}
+function inPeriod(day){const c=cutDate();if(!c)return true;if(RANGE==='yesterday')return day.date===c;return day.date>=c;}
 function periodDays(){return S.days.filter(inPeriod);}
+function inRangeMs(ms){const c=rangeCutMs(),e=rangeEndMs();if(!ms)return true;if(c&&ms<c)return false;if(e&&ms>=e)return false;return true;}
+function inRangeDay(ds){const c=cutDate();if(!c)return true;if(RANGE==='yesterday')return ds===c;if(RANGE==='today'||RANGE==='24h')return ds>=c;const ms=Date.parse(ds+'T00:00:00');const cut=rangeCutMs();return !(ms&&ms<cut-86400000);}
+function rangeLabel(r){if(r==='all')return'ALL TIME';if(r==='24h')return'LAST 24 HOURS';if(r==='today')return'TODAY';if(r==='yesterday')return'YESTERDAY';const n=Number(r);if(n>=365)return'1 YEAR';if(n/30>=1)return Math.round(n/30)+' MO';return n+' DAYS';}
 function periodPrev(){
+  if(RANGE==='today'){const y=new Date(Date.now()-86400000).toLocaleDateString('en-CA');return S.days.filter(d=>d.date===y);}
+  if(RANGE==='yesterday'){const y=new Date(Date.now()-2*86400000).toLocaleDateString('en-CA');return S.days.filter(d=>d.date===y);}
+  const n=RANGE==='24h'?2:Number(RANGE);
   const c=cutDate();if(!c)return[];
-  const end=new Date();end.setDate(end.getDate()-RANGE);
-  const start=new Date(end);start.setDate(start.getDate()-RANGE);
-  const s=start.toLocaleDateString('en-CA'),e=end.toLocaleDateString('en-CA');
-  return S.days.filter(d=>d.date>=s&&d.date<e);
+  const end=new Date(c+'T00:00:00');
+  const start=new Date(end.getTime()-n*86400000);
+  const s=start.toLocaleDateString('en-CA');
+  return S.days.filter(d=>d.date>=s&&d.date<c);
 }
 function sumDays(list){
   const t={sessions:0,msgs:0,ti:0,to:0,tr:0,cache:0,total:0};
@@ -4121,7 +4146,7 @@ function renderAll(){
   renderHero();renderSummary();renderKpis();renderRecords();renderInsights();renderCharts();renderModels();renderProjAgents();renderAct();renderFilterBar();renderSessions();
 }
 function renderHero(){
-  const periodLbl=RANGE==='all'?'ALL TIME':(RANGE/30>=1?RANGE/30+' MO':RANGE+' DAYS');
+  const periodLbl=rangeLabel(RANGE);
   $('range').textContent='LOCAL · RECORDED '+S.range.toUpperCase()+' · LAST '+periodLbl+' · REFRESHES AUTOMATICALLY';
   $('headline').innerHTML=BOLD(ESC(S.insights[0]||'No activity yet.'));
   const last=[...S.sessions].sort((a,b)=>b.time_created-a.time_created)[0];
@@ -4429,9 +4454,8 @@ function renderAct(){
 /* sessions */
 function sessionRows(){
   const q=($('search').value||'').toLowerCase();
-  const cut=RANGE==='all'?0:Date.now()-RANGE*86400000;
   return S.sessions.filter(s=>{
-    if(s.time_created<cut)return false;
+    if(!inRangeMs(s.time_created))return false;
     if(FSTATE.agent&&s.agent!==FSTATE.agent)return false;
     if(FSTATE.model){const mk=(s.provider?s.provider+'/':'')+(s.model||'');if(mk!==FSTATE.model)return false;}
     if(FSTATE.day&&DS(s.time_created)!==FSTATE.day)return false;
@@ -4502,12 +4526,22 @@ function renderFilterBar(){
 /* ---- Codex tab (all models, from usage-events.jsonl) ---- */
 function rModelShort(m){return (m||'-').split('/').pop();}
 function rDayTokenTotal(d){return (d.ti||0)+(d.to||0);}
+function rRangeCutMs(){if(RRANGE==='all')return 0;if(RRANGE==='24h')return Date.now()-86400000;const d=new Date();d.setHours(0,0,0,0);if(RRANGE==='today')return d.getTime();if(RRANGE==='yesterday')return d.getTime()-86400000;return Date.now()-Number(RRANGE)*86400000;}
+function rRangeEndMs(){if(RRANGE==='yesterday'){const d=new Date();d.setHours(0,0,0,0);return d.getTime();}return null;}
 function rCutDate(){
   if(RRANGE==='all')return'';
-  const d=new Date(Date.now()-RRANGE*86400000);
+  if(RRANGE==='today'||RRANGE==='yesterday'||RRANGE==='24h'){
+    let t=Date.now();
+    if(RRANGE==='yesterday'){const d=new Date(t);d.setHours(0,0,0,0);t=d.getTime()-86400000;}
+    else if(RRANGE==='24h')t-=86400000;
+    return new Date(t).toLocaleDateString('en-CA');
+  }
+  const d=new Date(Date.now()-Number(RRANGE)*86400000);
   return d.toLocaleDateString('en-CA');
 }
-function rInPeriod(day){const c=rCutDate();return !c||day.date>=c;}
+function rInPeriod(day){const c=rCutDate();if(!c)return true;if(RRANGE==='yesterday')return day.date===c;return day.date>=c;}
+function rInRangeMs(ms){const c=rRangeCutMs(),e=rRangeEndMs();if(!ms)return true;if(c&&ms<c)return false;if(e&&ms>=e)return false;return true;}
+function rInRangeDay(ds){const c=rCutDate();if(!c)return true;if(RRANGE==='yesterday')return ds===c;if(RRANGE==='today'||RRANGE==='24h')return ds>=c;const ms=Date.parse(ds+'T00:00:00');const cut=rRangeCutMs();return !(ms&&ms<cut-86400000);}
 function rPeriodDays(){return (R&&R.days?R.days:[]).filter(rInPeriod);}
 function rSumDays(list){
   const t={reqs:0,ok:0,err:0,unknown:0,err429:0,err500:0,ti:0,to:0,tr:0,cache:0,total:0,what_if:0};
@@ -4595,13 +4629,9 @@ function renderRouterFileChart(){
   }).join('')+(rows.length>6?'<button class="more-btn" data-exp="rfs">'+(RFS_EXP?'Show less':'Show all '+rows.length)+' '+(RFS_EXP?'▴':'▾')+'</button>':'');
 }
 function rCommitRows(){
-  const cut=RRANGE==='all'?0:Date.now()-RRANGE*86400000;
   let rows=((R&&R.commits)||[]).filter(c=>{
     if(RFSTATE.day&&c[2]!==RFSTATE.day)return false;
-    if(cut){
-      const ms=Date.parse(c[2]+'T00:00:00');
-      if(ms&&ms<cut-86400000)return false;
-    }
+    if(!rInRangeDay(c[2]))return false;
     return true;
   });
   rows=rows.slice();
@@ -4719,7 +4749,7 @@ function renderRouterFilterBar(){
 function renderRouter(){
   if(!R)return;
   const t=R.totals||{};
-  const periodLbl=RRANGE==='all'?'ALL TIME':(RRANGE/30>=1?RRANGE/30+' MO':RRANGE+' DAYS');
+  const periodLbl=rangeLabel(RRANGE);
   $('r-range').textContent='CODEX · '+(R.range||'').toUpperCase()+' · LAST '+periodLbl+' · REFRESHES AUTOMATICALLY';
   const cur=RRANGE==='all'?null:rSumDays(rPeriodDays());
   const totTokens=cur?cur.total:(t.tokens_total||0);
@@ -4823,7 +4853,6 @@ function renderRouter(){
 function routerRequestRows(){
   const q=(($('r-search')||{}).value||'').toLowerCase();
   const st=($('r-status-f')||{}).value||'';
-  const cut=RRANGE==='all'?0:Date.now()-RRANGE*86400000;
   return (R.requests||[]).filter(r=>{
     if(RFSTATE.model&&r.model!==RFSTATE.model)return false;
     if(RFSTATE.provider&&r.provider!==RFSTATE.provider)return false;
@@ -4835,10 +4864,7 @@ function routerRequestRows(){
     if(st==='err'&&r.outcome!=='error')return false;
     if(st==='unknown'&&r.outcome!=='unknown')return false;
     if(st==='429'&&r.status!==429)return false;
-    if(cut){
-      const ms=Date.parse(r.at||'');
-      if(ms&&ms<cut)return false;
-    }
+    if(!rInRangeMs(Date.parse(r.at||'')))return false;
     if(q&&!(r.model||'').toLowerCase().includes(q)&&!(r.provider||'').toLowerCase().includes(q))return false;
     return true;});
 }

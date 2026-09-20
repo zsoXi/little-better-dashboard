@@ -1,6 +1,6 @@
 # Little Better Dashboard
 
-A single-file, zero-dependency usage dashboard for [OpenCode](https://github.com/sst/opencode) with a Codex view built in. Download it, double-click the launcher, and your own stats appear in the browser.
+A single-file, zero-dependency usage dashboard for [OpenCode](https://github.com/sst/opencode) with Codex and Jev views built in. Download it, double-click the launcher, and your own stats appear in the browser.
 
 ![Dashboard screenshot](screenshot.png)
 
@@ -12,15 +12,18 @@ A single-file, zero-dependency usage dashboard for [OpenCode](https://github.com
 
 **Codex tab** gives the same treatment to your local Codex sessions, with request, token and model stats synthesized from your rollout files alongside a browsable session table.
 
+**Jev tab** reads the local Jev audit logs (JevDesk and JevDeskEasy installs): proposal counts by verdict, input and output tokens, average latency, sessions, and a table of the newest judgments with the audit source for each. Sessions created in mock mode are excluded from the totals and reported separately.
+
 Everything is read from files already on your machine. The server binds to `127.0.0.1` only and additionally requires a per-instance bearer token plus strict Host/Origin checks; the bind alone is not claimed to prevent all exfiltration.
 
-Privacy: The dashboard may read and display message content from your local OpenCode and Codex sessions for session inspection. This content stays on your machine and is only served to a browser session presenting the instance token over the local 127.0.0.1 dashboard. Nothing is uploaded or sent to external services. Private content is visible to anyone holding the instance link, and tunnels or public exposure are not supported.
+Privacy: The dashboard may read and display message content from your local OpenCode and Codex sessions for session inspection, and reads local Jev audit logs (session ids, verdicts, token counts) for the Jev tab. This content stays on your machine and is only served to a browser session presenting the instance token over the local 127.0.0.1 dashboard. Nothing is uploaded or sent to external services. Private content is visible to anyone holding the instance link, and tunnels or public exposure are not supported.
 
 ## Data handling and limits
 
 - Unknown outcomes stay unknown: a request whose result could not be determined is never silently counted as success or error, and its tokens are never dropped or folded into another bucket.
 - Recency labels (recent, no recent activity, older, unknown) come from session update recency - a session-history signal, not agent execution status.
 - The Codex request list is a bounded **tail** of the newest events with an explicit scanned-vs-total indicator; the synthesized history that feeds the Codex charts keeps the full history (no silent cut-off).
+- The Jev tab is a usage view over local hash-chained audit logs, not an audit tool: it does not verify the hash chain, excludes `mock: true` sessions from totals, and reads a bounded tail of each log.
 - "Usage in the 24h before each commit" windows are global and **non-additive**: windows may overlap and may include other projects, so commit rows must not be summed.
 - The Codex synthesis **cache** index lives in `.cache/codex_index.json` (a derived **checkpoint** tied to the published generation): it is **safe to delete** at any time and is never a source of truth; a failed checkpoint write never fails a publish.
 - The server binds to 127.0.0.1 only, requires the per-instance token from the `#token=` fragment, and does not support **tunnels** or public exposure.
@@ -54,6 +57,7 @@ python opencode_dashboard.py [db] [--port PORT] [--agents-dir DIR] [--open] [--q
 | `--open` | off | Open the dashboard in a browser on start |
 | `--quiet` | off | Suppress per-request logging |
 | `--router-events / --router-limits` | unset | Use a real Codex Router ledger instead of the synthesized one |
+| `--jev-logs FILE` | local JevDesk installs | Jev `audit.jsonl` to read (repeatable) |
 | `--idle-timeout SECONDS` | off | Shut down after N seconds with no requests |
 
 If the database is missing, you get a plain message asking you to run OpenCode at least once so it can be created.
@@ -64,6 +68,7 @@ If the database is missing, you get a plain message asking you to run OpenCode a
 |---|---|
 | OpenCode `opencode.db` (SQLite, read-only) | Everything on the OpenCode tab |
 | `~/.codex/sessions/**/*.jsonl` (local rollout files) | Codex tab. On the first run a small `codex_router_events.jsonl` index is built next to the script. It regenerates automatically and is safe to delete |
+| `%LOCALAPPDATA%\JevDeskEasy\runtime\audit.jsonl` and `%LOCALAPPDATA%\JevDesk\audit.jsonl` (read-only) | Jev tab. One JSON line per session, proposal or stop event; missing files are reported as not found |
 | `.opencode/agent/*.md` and `~/.config/opencode/agent/*.md` in the current project | Agent configuration tiles |
 
 It makes no network calls, collects no telemetry and needs no accounts.

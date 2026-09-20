@@ -9,7 +9,7 @@ Policy:
     running dashboard page (synthetic sources only) in a real browser.
 
 Cases implemented (spec ch.15, mandated real-browser runs):
-  F6d-T01  7 sections answer, 8th never sends headers
+  F6d-T01  fast sections answer, codex never sends headers
   F6d-T02  headers 200 instantly, body never ends
   F6d-T04  error after earlier success (stale kept, last_success intact)
   F6d-T06  older response A arrives after newer B; UI stays with B
@@ -133,7 +133,27 @@ def _write_fixture(root, mode="canary", xss=False):
                "totalTokens": 120, "durationMs": 5}
         events_path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
         events = str(events_path)
-    return {"db": str(db_path), "events": events,
+    jev_path = root / "jev-audit.jsonl"
+    jev_recs = [
+        {"time": 1758096000.0, "event": "session_created",
+         "session_id": "jev-c1", "backend": "browser", "mock": False},
+        {"time": 1758096001.0, "event": "proposal",
+         "session_id": "jev-c1", "proposal_id": "p1", "verdict": "ESCALATE",
+         "model": "jev-1.13.0",
+         "usage": {"input_tokens": 100, "output_tokens": 10},
+         "elapsed_ms": 1500.0},
+        {"time": 1758096002.0, "event": "proposal",
+         "session_id": "jev-c1", "proposal_id": "p2", "verdict": "NO_MATCH",
+         "model": "jev-1.13.0",
+         "usage": {"input_tokens": 101, "output_tokens": 11},
+         "elapsed_ms": 2500.0},
+        {"time": 1758096003.0, "event": "session_created",
+         "session_id": "jev-mock", "backend": "browser", "mock": True},
+    ]
+    with open(jev_path, "w", encoding="utf-8", newline="") as f:
+        for rec in jev_recs:
+            f.write(json.dumps(rec) + "\n")
+    return {"db": str(db_path), "events": events, "jev": str(jev_path),
             "codex_dir": codex_dir, "root": root}
 
 
@@ -467,7 +487,7 @@ def _assert(cond, msg):
 
 
 def case_t01(ctx):
-    """7 sections answer; the 8th (/api/codex) never sends headers."""
+    """Fast sections answer; codex (/api/codex) never sends headers."""
     FAULT.arm("/api/codex", "hang_headers", hang_seconds=4.0)
     ctx.new_page()
     ctx.goto()
@@ -488,7 +508,7 @@ def case_t01(ctx):
     _assert("timeout after" in (secs["codex"]["error"] or ""),
             "codex error should mention the timeout, got %r" % secs["codex"]["error"])
     status = ctx.status()
-    _assert("Partial update: 7/8" in status,
+    _assert("Partial update: 8/9" in status,
             "status should be a partial update, got %r" % status)
     _assert("codex" in status, "status should name the failing source, got %r" % status)
     ctx.evidence["status"] = status
@@ -511,7 +531,7 @@ def case_t02(ctx):
     for key in SEVEN_FAST:
         _assert(secs[key]["state"] == "success",
                 "section %s should still succeed, got %r" % (key, secs[key]))
-    _assert("Partial update: 7/8" in ctx.status(),
+    _assert("Partial update: 8/9" in ctx.status(),
             "status should be partial, got %r" % ctx.status())
     ctx.evidence["codex_error"] = secs["codex"]["error"]
     return ctx.shot("body-hang-timeout")
@@ -523,7 +543,7 @@ def case_t04(ctx):
     ctx.goto()
     ctx.cycle_finished()
     secs = ctx.sections()
-    _assert(all(secs[k]["state"] == "success" for k in SEVEN_FAST + ("codex",)),
+    _assert(all(secs[k]["state"] == "success" for k in SEVEN_FAST + ("codex", "jev")),
             "first cycle should be fully green")
     first_status = ctx.status()
     _assert(first_status.startswith("Updated"),
@@ -549,7 +569,7 @@ def case_t04(ctx):
     _assert(rows_after == rows_before,
             "previous rows must be kept, before=%d after=%d" % (rows_before, rows_after))
     status = ctx.status()
-    _assert("Partial update: 7/8" in status and "stats" in status,
+    _assert("Partial update: 8/9" in status and "stats" in status,
             "status should be partial and name stats, got %r" % status)
     _assert(not status.startswith("Updated"),
             "no Updated for a partial cycle, got %r" % status)
@@ -607,7 +627,7 @@ def case_t09(ctx):
     ctx.goto()
     ctx.cycle_finished()
     secs = ctx.sections()
-    _assert(all(secs[k]["state"] == "success" for k in SEVEN_FAST + ("codex",)),
+    _assert(all(secs[k]["state"] == "success" for k in SEVEN_FAST + ("codex", "jev")),
             "first cycle should be fully green")
 
     # -- inspect ---------------------------------------------------------
@@ -885,7 +905,7 @@ def case_b08(ctx):
 
 
 CASES = [
-    ("F6d-T01", "7 sections render while the 8th never sends headers", case_t01),
+    ("F6d-T01", "fast sections render while codex never sends headers", case_t01),
     ("F6d-T02", "200 headers, body never ends -> deadline still fires", case_t02),
     ("F6d-T04", "error after success keeps data + last_success + stale", case_t04),
     ("F6d-T06", "late older response A never overwrites newer B", case_t06),
@@ -947,6 +967,7 @@ def _run_case(case_id, desc, fn, d, artifacts_dir, shots_dir, browser, log):
         d.Handler.db_path = fixture["db"]
         d.Handler.router_events = fixture["events"]
         d.Handler.router_limits = None
+        d.Handler.jev_logs = [fixture["jev"]]
         d.Handler.quiet = True
         try:
             d.CODEX_DIR = fixture["codex_dir"]

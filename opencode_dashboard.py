@@ -21,6 +21,10 @@ _HOME = Path.home()  # cross-platform: %USERPROFILE% on Windows, $HOME elsewhere
 DB_PATH = _HOME / ".local/share/opencode/opencode.db"
 ROUTER_EVENTS_DEFAULT = _HOME / ".codex/codex-router/usage-events.jsonl"
 ROUTER_LIMITS_DEFAULT = _HOME / ".codex/codex-router/rate-limits.json"
+JEV_LOG_DEFAULTS = [
+    _HOME / "AppData/Local/JevDeskEasy/runtime/audit.jsonl",
+    _HOME / "AppData/Local/JevDesk/audit.jsonl",
+]
 
 # All cross-thread shared state is guarded by LOCK.
 LOCK = threading.Lock()
@@ -31,6 +35,8 @@ MAX_ROUTER_ROWS = 400  # recent requests kept in the /api/router payload
 MAX_ROUTER_RECORD_BYTES = 8 * 1024 * 1024  # F6b: per-record read cap
 _ROUTER_READ_BLOCK = 65536  # F6b: byte block size for tail reads/counts
 _ROUTER_COUNT_CACHE = {}  # F6b: str(path) -> line count + fingerprint
+JEV_READ_CAP = 2 * 1024 * 1024  # bounded tail read per Jev audit log
+JEV_MAX_EVENTS = 5000  # most-recent Jev audit events kept per source
 SYNTH_SCHEMA = 3  # bump to force codex-synth rebuild when the writer changes
 
 # What-if paid pricing per 1M tokens (input, output) for known *-free models.
@@ -238,6 +244,21 @@ def parse_model(raw):
         return json.loads(raw).get("id", raw)
     except (ValueError, AttributeError):
         return str(raw)
+
+
+def parse_provider(raw):
+    if not raw:
+        return ""
+    try:
+        return json.loads(raw).get("providerID", "") or ""
+    except (ValueError, AttributeError):
+        return ""
+
+
+def model_key(raw):
+    prov = parse_provider(raw)
+    model = parse_model(raw)
+    return prov + "/" + model if prov else model
 
 
 def short_dir(path):
@@ -536,7 +557,8 @@ def query_agents(con):
             upd_ms = upd
         runs.append({
             "id": r["id"], "title": r["title"] or "(untitled)",
-            "agent": r["agent"] or "default", "model": r["model"] or "",
+            "agent": r["agent"] or "default", "model": parse_model(r["model"]),
+            "provider": parse_provider(r["model"]),
             "directory": r["directory"] or "",
             "time_created": r["time_created"] or 0,
             "time_updated": upd_ms,
@@ -633,8 +655,8 @@ def query_sessions(con, q="", agent="", model="", limit=SESS_LIMIT):
         where.append("agent = ?")
         args.append(agent)
     if model:
-        where.append("model = ?")
-        args.append(model)
+        where.append("model LIKE ?")
+        args.append("%" + model + "%")
     sql = "SELECT id, title, agent, model, directory, parent_id, time_created, time_updated FROM session"
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -643,6 +665,8 @@ def query_sessions(con, q="", agent="", model="", limit=SESS_LIMIT):
     rows = []
     for r in con.execute(sql, args):
         d = _row_dict(r)
+        d["provider"] = parse_provider(d.get("model"))
+        d["model"] = parse_model(d.get("model"))
         if not d.get("title"):
             d["title"] = "(untitled)"
         rows.append(d)
@@ -751,6 +775,8 @@ def query_inspect(con, sid, cursor=None, limit=None):
             mdict["data_truncated"] = True
         msgs.append(mdict)
     out = _row_dict(s)
+    out["provider"] = parse_provider(out.get("model"))
+    out["model"] = parse_model(out.get("model"))
     out.update({"found": True, "messages": msgs, "has_more": has_more,
                 "cursor": ((str(msgs[-1]["time"]) + "|" + str(msgs[-1]["id"]))
                            if msgs else None),
@@ -1658,7 +1684,7 @@ def query_stats(con):
         FROM session GROUP BY model
         """
     ):
-        m = parse_model(r["model"])
+        m = model_key(r["model"])
         models[m]["n"] += r["n"]
         models[m]["ti"] += r["ti"]
         models[m]["to"] += r["to_"]
@@ -1693,6 +1719,7 @@ def query_stats(con):
                 "title": r["title"],
                 "agent": r["agent"] or "default",
                 "model": parse_model(r["model"]),
+                "provider": parse_provider(r["model"]),
                 "time_created": r["time_created"],
                 "time_updated": r["time_updated"],
                 "duration_min": round(dur, 1),
@@ -1849,7 +1876,8 @@ def query_stats(con):
     ).fetchone()
     biggest_session = (
         {"title": biggest_row["title"], "tokens_total": biggest_row["tot"],
-         "model": parse_model(biggest_row["model"])}
+         "model": parse_model(biggest_row["model"]),
+         "provider": parse_provider(biggest_row["model"])}
         if biggest_row else None
     )
     fastest_row = con.execute(
@@ -1938,7 +1966,7 @@ def query_stats(con):
         "insights": insights,
         "records": {
             "biggest_day": {"date": biggest_day["date"], "total": biggest_day["total"], "sessions": biggest_day["sessions"]} if biggest_day else None,
-            "biggest_session": {"title": biggest_session["title"], "total": biggest_session["tokens_total"], "model": biggest_session["model"]} if biggest_session else None,
+            "biggest_session": {"title": biggest_session["title"], "total": biggest_session["tokens_total"], "model": biggest_session["model"], "provider": biggest_session["provider"]} if biggest_session else None,
             "fastest_burn": {"title": fastest["title"], "burn": fastest["burn"]} if fastest else None,
             "streaks": streaks,
         },
@@ -2986,6 +3014,174 @@ def cached_router_stats(events_path, limits_path=None, worktrees=None, full_scan
     return stats
 
 
+# ---------------------------------------------------------------------------
+# Jev (typesafe System One gate) — local audit logs, read-only.
+def _jev_source_name(path):
+    parent = path.parent
+    top = parent.parent if parent.name.lower() == "runtime" else parent
+    return top.name or str(path)
+
+
+def _jev_local_iso(t):
+    try:
+        return datetime.fromtimestamp(float(t)).strftime("%Y-%m-%dT%H:%M:%S")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _jev_day():
+    return {"proposals": 0, "sessions": 0, "input_tokens": 0,
+            "output_tokens": 0, "elapsed_ms": 0.0}
+
+
+def read_jev_events(path):
+    """Bounded read of one Jev audit log. Returns (events, bad_lines, truncated).
+
+    At most JEV_READ_CAP bytes are read from the tail; when the file is longer
+    the partial first line is dropped. Malformed lines never raise.
+    """
+    events, bad, truncated = [], 0, False
+    size = path.stat().st_size
+    with open(path, "rb") as fh:
+        if size > JEV_READ_CAP:
+            fh.seek(size - JEV_READ_CAP)
+            fh.readline()  # drop the partial first line
+            truncated = True
+        data = fh.read().decode("utf-8", "replace")
+    for line in data.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        if isinstance(rec, dict):
+            events.append(rec)
+        else:
+            bad += 1
+    if len(events) > JEV_MAX_EVENTS:
+        events = events[-JEV_MAX_EVENTS:]
+        truncated = True
+    return events, bad, truncated
+
+
+def query_jev(paths):
+    """Aggregate local Jev audit logs for the Jev tab.
+
+    mock:true events are excluded from aggregates (they are counted as
+    mock_skipped). The audit files are never written to; the hash chain is
+    left for the tools that own it.
+    """
+    paths = [Path(p) for p in (paths or [])]
+    sources, seen = [], set()
+    totals = {"proposals": 0, "sessions": 0, "mock_skipped": 0,
+              "input_tokens": 0, "output_tokens": 0,
+              "elapsed_ms": 0.0, "avg_ms": None,
+              "verdicts": {}, "models": {}}
+    days = {}
+    recent = []
+    for p in paths:
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = {"name": _jev_source_name(p), "path": str(p), "exists": p.is_file(),
+                 "events": 0, "proposals": 0, "sessions": 0, "stops": 0,
+                 "mock_skipped": 0, "bad_lines": 0, "truncated": False, "error": None}
+        if entry["exists"]:
+            try:
+                events, bad, truncated = read_jev_events(p)
+                entry["bad_lines"] = bad
+                entry["truncated"] = truncated
+            except OSError as e:
+                events = []
+                entry["error"] = str(e)[:200]
+        else:
+            events = []
+        for rec in events:
+            kind = rec.get("event")
+            entry["events"] += 1
+            if kind == "session_created":
+                if rec.get("mock"):
+                    entry["mock_skipped"] += 1
+                    totals["mock_skipped"] += 1
+                    continue
+                entry["sessions"] += 1
+                totals["sessions"] += 1
+                day = _jev_local_iso(rec.get("time"))[:10]
+                if day:
+                    days.setdefault(day, _jev_day())["sessions"] += 1
+            elif kind == "stop":
+                entry["stops"] += 1
+            elif kind == "proposal":
+                if rec.get("mock"):
+                    entry["mock_skipped"] += 1
+                    totals["mock_skipped"] += 1
+                    continue
+                usage = rec.get("usage") if isinstance(rec.get("usage"), dict) else {}
+                try:
+                    inp = int(usage.get("input_tokens") or 0)
+                except (TypeError, ValueError):
+                    inp = 0
+                try:
+                    out = int(usage.get("output_tokens") or 0)
+                except (TypeError, ValueError):
+                    out = 0
+                try:
+                    ms = float(rec.get("elapsed_ms") or 0.0)
+                except (TypeError, ValueError):
+                    ms = 0.0
+                verdict = str(rec.get("verdict") or "UNKNOWN")
+                model = str(rec.get("model") or "-")
+                entry["proposals"] += 1
+                totals["proposals"] += 1
+                totals["input_tokens"] += inp
+                totals["output_tokens"] += out
+                totals["elapsed_ms"] += ms
+                totals["verdicts"][verdict] = totals["verdicts"].get(verdict, 0) + 1
+                totals["models"][model] = totals["models"].get(model, 0) + 1
+                at = _jev_local_iso(rec.get("time"))
+                day = at[:10]
+                if day:
+                    d = days.setdefault(day, _jev_day())
+                    d["proposals"] += 1
+                    d["input_tokens"] += inp
+                    d["output_tokens"] += out
+                    d["elapsed_ms"] += ms
+                recent.append((rec.get("time") or 0, {
+                    "at": at, "session_id": str(rec.get("session_id") or ""),
+                    "verdict": verdict, "model": model,
+                    "input_tokens": inp, "output_tokens": out,
+                    "elapsed_ms": round(ms, 2)}))
+        sources.append(entry)
+    recent.sort(key=lambda item: item[0], reverse=True)
+    recent = [r for _t, r in recent[:200]]
+    day_rows = []
+    for day in sorted(days):
+        d = days[day]
+        day_rows.append({
+            "date": day, "proposals": d["proposals"], "sessions": d["sessions"],
+            "input_tokens": d["input_tokens"], "output_tokens": d["output_tokens"],
+            "elapsed_ms": round(d["elapsed_ms"], 2),
+            "avg_ms": round(d["elapsed_ms"] / d["proposals"], 2) if d["proposals"] else None})
+    if totals["proposals"]:
+        totals["avg_ms"] = round(totals["elapsed_ms"] / totals["proposals"], 2)
+    totals["elapsed_ms"] = round(totals["elapsed_ms"], 2)
+    totals["models"] = [{"model": k, "proposals": v} for k, v in
+                        sorted(totals["models"].items(), key=lambda kv: (-kv[1], kv[0]))]
+    totals["verdicts"] = [{"verdict": k, "proposals": v} for k, v in
+                          sorted(totals["verdicts"].items(), key=lambda kv: (-kv[1], kv[0]))]
+    rng = f"{day_rows[0]['date']} → {day_rows[-1]['date']}" if day_rows else "no activity"
+    return {"ok": True, "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+            "range": rng, "sources": sources, "totals": totals,
+            "days": day_rows, "recent": recent}
+
+
 def session_prompts(con, session_id):
     """Prompts for one session, from session_input when available, otherwise
     reconstructed from user text parts (older opencode versions)."""
@@ -3361,12 +3557,13 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <button class="tbtn" id="refresh">⟳ Refresh</button>
   </div>
 </div>
-<div class="wrap" id="auth-lock" hidden style="margin-top:18px"><div class="card"><b>Authorization required.</b> Open the address generated by the launcher (it carries <span class="mono">#token=…</span> in the fragment). Then reload this tab from the new link.</div></div>
+<div class="wrap" id="auth-lock" hidden style="margin-top:18px"><div class="card"><b>Authorization required — this tab has no working token, so the page stays empty.</b> Every launcher start mints a fresh token: old tabs and plain <span class="mono">127.0.0.1:8765</span> bookmarks never work. Open the address printed by the launcher (it carries <span class="mono">#token=…</span> in the fragment), or click the desktop shortcut again and use the tab it opens.</div></div>
 
 <div class="wrap">
   <div class="source-tabs" role="tablist" aria-label="Data source">
     <button class="stab active" id="tab-opencode" role="tab" aria-selected="true" aria-controls="view-opencode">OpenCode<span class="cnt" id="tab-opencode-cnt"></span></button>
     <button class="stab" id="tab-router" role="tab" aria-selected="false" aria-controls="view-router">Codex<span class="cnt" id="tab-router-cnt"></span></button>
+    <button class="stab" id="tab-jev" role="tab" aria-selected="false" aria-controls="view-jev">Jev<span class="cnt" id="tab-jev-cnt"></span></button>
   </div>
   <div id="view-opencode" role="tabpanel" aria-labelledby="tab-opencode">
   <section class="hero">
@@ -3377,6 +3574,9 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="presets" id="presets" role="group" aria-label="Time range">
       <span class="pl">Period</span>
       <button class="pbtn active" data-r="all">All time</button>
+      <button class="pbtn" data-r="24h">Last 24h</button>
+      <button class="pbtn" data-r="today">Today</button>
+      <button class="pbtn" data-r="yesterday">Yesterday</button>
       <button class="pbtn" data-r="7">7 days</button>
       <button class="pbtn" data-r="30">30 days</button>
       <button class="pbtn" data-r="90">90 days</button>
@@ -3510,6 +3710,9 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="presets" id="r-presets" role="group" aria-label="Codex time range">
       <span class="pl">Period</span>
       <button class="pbtn active" data-rr="all">All time</button>
+      <button class="pbtn" data-rr="24h">Last 24h</button>
+      <button class="pbtn" data-rr="today">Today</button>
+      <button class="pbtn" data-rr="yesterday">Yesterday</button>
       <button class="pbtn" data-rr="7">7 days</button>
       <button class="pbtn" data-rr="30">30 days</button>
       <button class="pbtn" data-rr="90">90 days</button>
@@ -3603,6 +3806,39 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="act-legend" id="r-act-legend"></div>
   </div>
   </div><!-- /view-router -->
+  <div id="view-jev" role="tabpanel" aria-labelledby="tab-jev" hidden>
+  <section class="hero" style="padding-top:26px">
+    <div class="eyebrow" id="j-range">JEV</div>
+    <h1 id="j-headline">Loading Jev usage…</h1>
+    <div class="pills" id="j-pills"></div>
+  </section>
+  <section class="summary" id="j-summary"></section>
+
+  <h2 class="sec">Judgments <span class="hint">local audit log · read-only</span></h2>
+  <div class="card"><div class="chips" id="j-verdicts"></div></div>
+
+  <h2 class="sec">Models <span class="hint">per judgment</span></h2>
+  <div class="card" id="j-model-card"><div class="chips" id="j-models"></div></div>
+
+  <h2 class="sec">Judgments per day <span class="hint">local timezone</span></h2>
+  <div class="card">
+    <div class="tbl-scroll"><table class="tbl" id="j-days">
+      <thead><tr><th>Day</th><th class="num">Judgments</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Avg ms</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </div>
+
+  <h2 class="sec">Recent judgments <span class="hint" id="j-hint"></span></h2>
+  <div class="card">
+    <div class="tbl-scroll"><table class="tbl" id="j-tbl">
+      <thead><tr><th>Time</th><th>Session</th><th>Verdict</th><th>Model</th><th class="num">Input</th><th class="num">Output</th><th class="num">ms</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </div>
+
+  <h2 class="sec">Audit sources <span class="hint">hash-chained JSONL, never uploaded</span></h2>
+  <div class="card"><div id="j-sources" style="line-height:1.7"></div></div>
+  </div><!-- /view-jev -->
 </div>
 
 <div class="overlay" id="overlay"><div class="modal" id="modal" role="dialog" aria-modal="true" aria-label="Session details"></div></div>
@@ -3619,6 +3855,7 @@ const F=n=>{const s=Math.round(Number(n)||0).toString();return s.replace(/\B(?=(
 const FN=n=>{n=Number(n)||0;return n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(Math.round(n));};
 const DT=t=>{if(!t)return'-';const d=new Date(t>1e12?t:t*1000);return d.toLocaleDateString('en-CA')+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
 const DS=t=>{if(!t)return'';const d=new Date(t>1e12?t:t*1000);return d.toLocaleDateString('en-CA');};
+const isoLocal=t=>{if(t==null||t==='')return'';const d=new Date(t);if(isNaN(d.getTime()))return String(t).replace('T',' ').slice(0,19);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());};
 const DUR=m=>{if(m==null)return'-';if(m<1)return'<1m';if(m<60)return Math.round(m)+'m';const h=Math.floor(m/60);return h+'h '+Math.round(m%60)+'m';};
 const BURN=b=>{b=Number(b)||0;return b>=1000?(b/1000).toFixed(1)+'K/m':Math.round(b)+'/m';};
 let S=null; if(typeof S0!=='undefined'&&S0){S=S0;}
@@ -3783,10 +4020,9 @@ function shortPath(p){const seg=(p||'').split('/').filter(Boolean);return seg.le
 function fileRows(){
   // All-time backend aggregates, or a period recompute from recent sessions.
   if(RANGE==='all'&&!FSTATE.day)return {rows:(FS==='file'?(S.files||[]):(S.subsystems||[])),approx:false};
-  const cut=RANGE==='all'?0:Date.now()-RANGE*86400000;
   const agg={};
   (S.sessions||[]).forEach(s=>{
-    if(s.time_created<cut)return;
+    if(!inRangeMs(s.time_created))return;
     if(FSTATE.day&&DS(s.time_created)!==FSTATE.day)return;
     const files=((S.session_files||{})[s.id])||[];
     if(!files.length)return;
@@ -3825,13 +4061,9 @@ function renderFileChart(){
   }).join('')+(rows.length>6?'<button class="more-btn" data-exp="fs">'+(FS_EXP?'Show less':'Show all '+rows.length)+' '+(FS_EXP?'▴':'▾')+'</button>':'');
 }
 function commitRows(){
-  const cut=RANGE==='all'?0:Date.now()-RANGE*86400000;
   let rows=(S.commits||[]).filter(c=>{
     if(FSTATE.day&&c[2]!==FSTATE.day)return false;
-    if(cut){
-      const ms=Date.parse(c[2]+'T00:00:00');
-      if(ms&&ms<cut-86400000)return false;
-    }
+    if(!inRangeDay(c[2]))return false;
     return true;
   });
   rows=rows.slice();
@@ -3862,19 +4094,43 @@ function renderCommitChart(){
   }).join('')+(rows.length>6?'<button class="more-btn" data-exp="cs">'+(CS_EXP?'Show less':'Show all '+rows.length)+' '+(CS_EXP?'▴':'▾')+'</button>':'');
 }
 /* period helpers */
+function rangeCutMs(){
+  if(RANGE==='all')return 0;
+  if(RANGE==='24h')return Date.now()-86400000;
+  const d=new Date();d.setHours(0,0,0,0);
+  if(RANGE==='today')return d.getTime();
+  if(RANGE==='yesterday')return d.getTime()-86400000;
+  return Date.now()-Number(RANGE)*86400000;
+}
+function rangeEndMs(){
+  if(RANGE==='yesterday'){const d=new Date();d.setHours(0,0,0,0);return d.getTime();}
+  return null;
+}
 function cutDate(){
   if(RANGE==='all')return'';
-  const d=new Date(Date.now()-RANGE*86400000);
+  if(RANGE==='today'||RANGE==='yesterday'||RANGE==='24h'){
+    let t=Date.now();
+    if(RANGE==='yesterday'){const d=new Date(t);d.setHours(0,0,0,0);t=d.getTime()-86400000;}
+    else if(RANGE==='24h')t-=86400000;
+    return new Date(t).toLocaleDateString('en-CA');
+  }
+  const d=new Date(Date.now()-Number(RANGE)*86400000);
   return d.toLocaleDateString('en-CA');
 }
-function inPeriod(day){const c=cutDate();return !c||day.date>=c;}
+function inPeriod(day){const c=cutDate();if(!c)return true;if(RANGE==='yesterday')return day.date===c;return day.date>=c;}
 function periodDays(){return S.days.filter(inPeriod);}
+function inRangeMs(ms){const c=rangeCutMs(),e=rangeEndMs();if(!ms)return true;if(c&&ms<c)return false;if(e&&ms>=e)return false;return true;}
+function inRangeDay(ds){const c=cutDate();if(!c)return true;if(RANGE==='yesterday')return ds===c;if(RANGE==='today'||RANGE==='24h')return ds>=c;const ms=Date.parse(ds+'T00:00:00');const cut=rangeCutMs();return !(ms&&ms<cut-86400000);}
+function rangeLabel(r){if(r==='all')return'ALL TIME';if(r==='24h')return'LAST 24 HOURS';if(r==='today')return'TODAY';if(r==='yesterday')return'YESTERDAY';const n=Number(r);if(n>=365)return'1 YEAR';if(n/30>=1)return Math.round(n/30)+' MO';return n+' DAYS';}
 function periodPrev(){
+  if(RANGE==='today'){const y=new Date(Date.now()-86400000).toLocaleDateString('en-CA');return S.days.filter(d=>d.date===y);}
+  if(RANGE==='yesterday'){const y=new Date(Date.now()-2*86400000).toLocaleDateString('en-CA');return S.days.filter(d=>d.date===y);}
+  const n=RANGE==='24h'?2:Number(RANGE);
   const c=cutDate();if(!c)return[];
-  const end=new Date();end.setDate(end.getDate()-RANGE);
-  const start=new Date(end);start.setDate(start.getDate()-RANGE);
-  const s=start.toLocaleDateString('en-CA'),e=end.toLocaleDateString('en-CA');
-  return S.days.filter(d=>d.date>=s&&d.date<e);
+  const end=new Date(c+'T00:00:00');
+  const start=new Date(end.getTime()-n*86400000);
+  const s=start.toLocaleDateString('en-CA');
+  return S.days.filter(d=>d.date>=s&&d.date<c);
 }
 function sumDays(list){
   const t={sessions:0,msgs:0,ti:0,to:0,tr:0,cache:0,total:0};
@@ -3890,7 +4146,7 @@ function renderAll(){
   renderHero();renderSummary();renderKpis();renderRecords();renderInsights();renderCharts();renderModels();renderProjAgents();renderAct();renderFilterBar();renderSessions();
 }
 function renderHero(){
-  const periodLbl=RANGE==='all'?'ALL TIME':(RANGE/30>=1?RANGE/30+' MO':RANGE+' DAYS');
+  const periodLbl=rangeLabel(RANGE);
   $('range').textContent='LOCAL · RECORDED '+S.range.toUpperCase()+' · LAST '+periodLbl+' · REFRESHES AUTOMATICALLY';
   $('headline').innerHTML=BOLD(ESC(S.insights[0]||'No activity yet.'));
   const last=[...S.sessions].sort((a,b)=>b.time_created-a.time_created)[0];
@@ -3959,7 +4215,7 @@ function renderRecords(){
   const r=S.records;
   const cards=[];
   if(r.biggest_day)cards.push(['Biggest day',FN(r.biggest_day.total),r.biggest_day.date+' · '+r.biggest_day.sessions+' sessions · '+humanize(r.biggest_day.total)]);
-  if(r.biggest_session)cards.push(['Biggest session',FN(r.biggest_session.total),(r.biggest_session.title||'Untitled').slice(0,48)+' · '+((r.biggest_session.model||'')+'').split('/').pop()]);
+  if(r.biggest_session)cards.push(['Biggest session',FN(r.biggest_session.total),(r.biggest_session.title||'Untitled').slice(0,48)+' · '+((r.biggest_session.provider||'')?r.biggest_session.provider+' · ':'')+((r.biggest_session.model||'')+'').split('/').pop()]);
   if(r.fastest_burn)cards.push(['Fastest burn',BURN(r.fastest_burn.burn),(r.fastest_burn.title||'').slice(0,48)]);
   if(r.streaks)cards.push(['Streaks',r.streaks.current+'d now', 'longest '+r.streaks.longest+'d · '+humanize(S.totals.tokens_total)+' total ≈ '+(Math.round((S.totals.tokens_total||0)/750000*10)/10)+' novels']);
   el.innerHTML=cards.map(([l,v,s])=>'<div class="rec"><div class="rl">'+l+'</div><div class="rv">'+ESC(v)+'</div><div class="rs">'+ESC(s)+'</div></div>').join('')||'<div class="empty">No records yet.</div>';
@@ -3987,17 +4243,18 @@ function renderModels(){
   if(!S.models.length){el.innerHTML='<div class="empty">No models yet.</div>';return;}
   el.innerHTML=S.models.map(m=>{
     const name=m[0],n=m[1],tot=m[2]||0,ti=m[3]||0,to=m[4]||0,tr=m[5]||0,ca=m[6]||0,avg=m[8]||0,hr=m[9]||0;
+    const prov=name.indexOf('/')>=0?name.split('/')[0]:'';
     const out=to+tr;
     const segs=SPLIT?[[ti,t.accent],[to,t.accent2],[tr,t.reason],[ca,t.cache]]:[[ti,t.accent],[out,t.accent2],[ca,t.cache]];
     const bar=segs.map(([v,c])=>'<i style="width:'+(tot?v/tot*100:0)+'%;background:'+c+'"></i>').join('');
-    const tipHtml=('<b>'+ESC(name)+'</b><span class=\'trow\'><span>Sessions</span><b>'+n+'</b></span>'+
+    const tipHtml=('<b>'+ESC(modelShort(name))+'</b>'+(prov?'<span class=\'trow\'><span>Provider</span><b>'+ESC(prov)+'</b></span>':'')+'<span class=\'trow\'><span>Sessions</span><b>'+n+'</b></span>'+
       '<span class=\'trow\'><span>Total tokens</span><b>'+FN(tot)+' ('+(tot/totalAll*100).toFixed(1)+'%)</b></span>'+
       '<span class=\'trow\'><span>Input / Output / Cache</span><b>'+FN(ti)+' / '+FN(out)+' / '+FN(ca)+'</b></span>'+
       (SPLIT?'<span class=\'trow\'><span>Reasoning</span><b>'+FN(tr)+'</b></span>':'')+
       '<span class=\'trow\'><span>Avg / session</span><b>'+FN(avg)+'</b></span>'+
       '<span class=\'trow\'><span>Cache hit</span><b>'+hr+'%</b></span>');
     return '<div class="model-row clickable'+(FSTATE.model===name?' active':'')+'" data-f="model|'+ESC(name)+'" data-tip="'+tipHtml+'">'+
-      '<div><div class="mn">'+ESC(modelShort(name))+'</div><div class="ms">'+n+' sess · '+(tot/totalAll*100).toFixed(1)+'% · avg '+FN(avg)+'</div></div>'+
+      '<div><div class="mn">'+ESC(modelShort(name))+'</div><div class="ms">'+(prov?ESC(prov)+' · ':'')+n+' sess · '+(tot/totalAll*100).toFixed(1)+'% · avg '+FN(avg)+'</div></div>'+
       '<div class="mbar">'+bar+'</div>'+
       '<div class="mv">'+FN(tot)+'</div></div>';
   }).join('');
@@ -4031,9 +4288,38 @@ function renderCodex(){
     return '<tr>'+'<td><b>'+ESC(r.name||'?')+'</b>'+prev+'<div class="sub">'+ESC(r.cwd||'')+'</div></td>'+
       '<td>'+ESC(r.model||r.provider||'?')+'</td>'+'<td class="sub">'+ESC((r.cwd||'').split('\\').pop()||'')+'</td>'+
       '<td class="num">'+(r.n||0)+'</td>'+'<td class="num">'+(r.tok||0).toLocaleString('en-US')+'</td>'+
-      '<td class="sub">'+ESC((r.last||'').slice(0,19).replace('T',' '))+'</td></tr>'+
+      '<td class="sub">'+ESC(isoLocal(r.last))+'</td></tr>'+
       (tools?'<tr class="toolsrow"><td colspan="6">'+tools+'</td></tr>':'');
   }).join('');
+}
+
+let JV=null;
+function renderJev(){
+  const d=JV;
+  const cnt=$('tab-jev-cnt');
+  if(cnt)cnt.textContent=((d&&d.totals&&d.totals.proposals)||'');
+  if(!d||!d.ok)return;
+  const t=d.totals||{},days=d.days||[],recent=d.recent||[];
+  const range=$('j-range');
+  if(range)range.textContent='JEV · '+String(d.range||'no activity').toUpperCase()+' · LOCAL TIME';
+  const head=$('j-headline');
+  if(head)head.innerHTML=BOLD(ESC(t.proposals+' judgments across '+F(t.sessions)+' sessions — '+FN(t.input_tokens)+' input / '+FN(t.output_tokens)+' output tokens'+(t.mock_skipped?(' ('+F(t.mock_skipped)+(t.mock_skipped===1?' mock session skipped':' mock sessions skipped')+')'):'')+'.'));
+  const pills=$('j-pills');
+  if(pills)pills.innerHTML=[['Avg latency',t.avg_ms==null?'-':Math.round(t.avg_ms)+' ms'],['Models',(t.models||[]).length],['Sources',(d.sources||[]).filter(s=>s.exists).length+'/'+(d.sources||[]).length]].map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+ESC(v)+'</b></span>').join('');
+  const sum=$('j-summary');
+  if(sum)sum.innerHTML=[['Judgments',FN(t.proposals),'proposals'],['Input tokens',FN(t.input_tokens),'tokens'],['Output tokens',FN(t.output_tokens),'tokens'],['Avg latency',t.avg_ms==null?'-':Math.round(t.avg_ms)+' ms','per judgment']].map(([l,v,s])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+v+'</div><div class="ss">'+s+'</div></div>').join('');
+  const vc=$('j-verdicts');
+  if(vc)vc.innerHTML=(t.verdicts||[]).map(v=>'<span class="chip">'+ESC(v.verdict)+' ×'+F(v.proposals)+'</span>').join('')||'<span class="chip">no verdicts</span>';
+  const mc=$('j-models');
+  if(mc)mc.innerHTML=(t.models||[]).map(m=>'<span class="chip">'+ESC(m.model)+' ×'+F(m.proposals)+'</span>').join('')||'<span class="chip">no models</span>';
+  const dtb=document.querySelector('#j-days tbody');
+  if(dtb)dtb.innerHTML=days.map(x=>'<tr><td>'+ESC(x.date)+'</td><td class="num">'+F(x.proposals)+'</td><td class="num">'+F(x.sessions)+'</td><td class="num">'+FN(x.input_tokens)+'</td><td class="num">'+FN(x.output_tokens)+'</td><td class="num">'+(x.avg_ms==null?'-':F(Math.round(x.avg_ms)))+'</td></tr>').join('')||'<tr><td colspan="6"><div class="empty">No Jev activity found.</div></td></tr>';
+  const hint=$('j-hint');
+  if(hint)hint.textContent='latest '+recent.length+' of '+F(t.proposals)+' judgments';
+  const tb=document.querySelector('#j-tbl tbody');
+  if(tb)tb.innerHTML=recent.map(r=>'<tr><td class="sub">'+ESC(isoLocal(r.at))+'</td><td class="sub">'+ESC(String(r.session_id||'').slice(0,10))+'</td><td><span class="badge">'+ESC(r.verdict)+'</span></td><td>'+ESC(r.model)+'</td><td class="num">'+FN(r.input_tokens)+'</td><td class="num">'+FN(r.output_tokens)+'</td><td class="num">'+F(r.elapsed_ms||0)+'</td></tr>').join('')||'<tr><td colspan="7"><div class="empty">No judgments recorded.</div></td></tr>';
+  const src=$('j-sources');
+  if(src)src.innerHTML=(d.sources||[]).map(s=>{var line=ESC(s.name)+' — <span class="mono" style="font-size:11.5px">'+ESC(s.path)+'</span> — ';if(!s.exists){line+='not found'+(s.error?(' ('+ESC(s.error)+')'):'');}else{line+=F(s.events)+' events · '+F(s.proposals)+' judgments · '+F(s.sessions)+' sessions';if(s.mock_skipped)line+=' · '+F(s.mock_skipped)+' mock skipped';if(s.bad_lines)line+=' · '+F(s.bad_lines)+' bad lines';if(s.truncated)line+=' · tail-truncated';}return '<div>'+line+'</div>';}).join('')||'<div class="empty">No audit logs configured.</div>';
 }
 
 const SUB_ACT={recent:'Recent activity',quiet:'No recent activity',stale:'Older activity',unknown:'Unknown'};
@@ -4057,7 +4343,7 @@ function renderSubagents(){
     +'<td><span class="dot '+(s.activity_state||'unknown')+'"></span><div style="font-size:11px;color:var(--muted)">'+SUB_ACT[s.activity_state||'unknown']+'<br>'+ageLbl(s.age_s)+'</div></td>'
     +'<td><div class="t">'+ESC(s.title)+'</div>'+
     '<div class="badges"><span class="badge">'+ESC((s.directory||'').split(/[\\/]/).pop())+'</span></div></td>'
-    +'<td><div class="badges mix"><span class="badge agent">'+ESC(s.agent)+'</span><span class="badge model">'+ESC(modelShort(s.model))+'</span></div></td>'
+    +'<td><div class="badges mix"><span class="badge agent">'+ESC(s.agent)+'</span><span class="badge model">'+ESC(modelShort(s.model))+'</span>'+(s.provider?'<span class="badge">'+ESC(s.provider)+'</span>':'')+'</div></td>'
     +'<td><div class="t" style="font-weight:400">'+ESC(s.parent_title)+'</div></td>'
     +'<td class="mono" style="font-size:11.5px;color:var(--muted)">'+dayLbl(s.time_created)+'</td>'
     +'<td class="num" style="font-weight:700">'+FN(s.toks||0)+'</td><td class="num" style="color:var(--subtle)">'+F(s.msgs)+'</td></tr>').join('')
@@ -4075,7 +4361,7 @@ function toggleRun(tr){
     +'<span class="kv">Last activity: <b>'+(s.age_s==null?'unknown':F(s.age_s)+' s ago')+'</b></span>'
     +'<span class="kv">Session: <b class="mono">'+ESC(s.id)+'</b></span>'
     +'<span class="kv">Agent: <b>'+ESC(s.agent)+'</b></span>'
-    +'<span class="kv">Model: <b>'+ESC(s.model||'-')+'</b></span>'
+    +'<span class="kv">Model: <b>'+ESC(s.model||'-')+(s.provider?' · '+ESC(s.provider):'')+'</b></span>'
     +'<span class="kv">Directory: <b>'+ESC(s.directory||'-')+'</b></span>'
     +'<span class="kv">Parent: <b class="mono">'+ESC(s.parent_id||'-')+'</b></span>'
     +'<span class="kv">Messages: <b>'+F(s.msgs)+'</b></span></td>';
@@ -4168,11 +4454,10 @@ function renderAct(){
 /* sessions */
 function sessionRows(){
   const q=($('search').value||'').toLowerCase();
-  const cut=RANGE==='all'?0:Date.now()-RANGE*86400000;
   return S.sessions.filter(s=>{
-    if(s.time_created<cut)return false;
+    if(!inRangeMs(s.time_created))return false;
     if(FSTATE.agent&&s.agent!==FSTATE.agent)return false;
-    if(FSTATE.model&&s.model!==FSTATE.model)return false;
+    if(FSTATE.model){const mk=(s.provider?s.provider+'/':'')+(s.model||'');if(mk!==FSTATE.model)return false;}
     if(FSTATE.day&&DS(s.time_created)!==FSTATE.day)return false;
     if(FSTATE.file&&!(((S.session_files||{})[s.id])||[]).includes(FSTATE.file))return false;
     if(FSTATE.sub){
@@ -4188,7 +4473,7 @@ function renderSessions(){
   const rows=sessionRows();
   const mf=$('model-f');
   const curSel=mf.value;
-  mf.innerHTML='<option value="">All models</option>'+S.models.map(m=>'<option value="'+ESC(m[0])+'">'+ESC(modelShort(m[0]))+'</option>').join('');
+  mf.innerHTML='<option value="">All models</option>'+S.models.map(m=>'<option value="'+ESC(m[0])+'">'+ESC(modelShort(m[0]))+(m[0].indexOf('/')>=0?' ('+ESC(m[0].split('/')[0])+')':'')+'</option>').join('');
   mf.value=FSTATE.model||curSel||'';
   const af=$('agent-f');
   const curA=af.value;
@@ -4214,7 +4499,7 @@ function renderSessions(){
     const isLatest=s.time_created===latestTime;
     return'<tr data-i="'+i+'" tabindex="0" role="link" aria-label="Open session '+ESC(s.title)+'"'+(isLatest?' class="latest"':'')+'><td><div class="t">'+ESC(s.title)+'</div>'+
     '<div class="badges"><span class="badge">'+ESC(s.worktree)+'</span>'+(isLatest?'<span class="badge latest">Latest</span>':'')+'</div></td>'
-    +'<td><div class="badges mix"><span class="badge agent">'+ESC(s.agent)+'</span><span class="badge model">'+ESC(modelShort(s.model))+'</span></div></td>'
+    +'<td><div class="badges mix"><span class="badge agent">'+ESC(s.agent)+'</span><span class="badge model">'+ESC(modelShort(s.model))+'</span>'+(s.provider?'<span class="badge">'+ESC(s.provider)+'</span>':'')+'</div></td>'
     +'<td class="mono" style="font-size:11.5px;color:var(--muted)">'+dayLbl(s.time_created)+'</td>'
     +'<td class="num">'+FN(s.tokens_input||0)+'</td><td class="num">'+FN(out)+'</td><td class="num">'+FN(s.tokens_cache||0)+'</td>'
     +'<td class="num" style="font-weight:700">'+FN(tot)+'</td><td class="num" style="color:var(--subtle)">'+F(s.msgs)+'</td></tr>';}).join('')
@@ -4227,7 +4512,7 @@ function renderFilterBar(){
   bar.style.display='flex';
   const labels={day:'Day',model:'Model',agent:'Agent',file:'File',sub:'Subsystem',commit:'Commit'};
   const disp=(k,v)=>{
-    if(k==='model')return modelShort(v);
+    if(k==='model')return String(v).replace('/',' · ');
     if(k==='file')return shortPath(v);
     if(k==='commit')return String(v).slice(0,7);
     return v;
@@ -4241,12 +4526,22 @@ function renderFilterBar(){
 /* ---- Codex tab (all models, from usage-events.jsonl) ---- */
 function rModelShort(m){return (m||'-').split('/').pop();}
 function rDayTokenTotal(d){return (d.ti||0)+(d.to||0);}
+function rRangeCutMs(){if(RRANGE==='all')return 0;if(RRANGE==='24h')return Date.now()-86400000;const d=new Date();d.setHours(0,0,0,0);if(RRANGE==='today')return d.getTime();if(RRANGE==='yesterday')return d.getTime()-86400000;return Date.now()-Number(RRANGE)*86400000;}
+function rRangeEndMs(){if(RRANGE==='yesterday'){const d=new Date();d.setHours(0,0,0,0);return d.getTime();}return null;}
 function rCutDate(){
   if(RRANGE==='all')return'';
-  const d=new Date(Date.now()-RRANGE*86400000);
+  if(RRANGE==='today'||RRANGE==='yesterday'||RRANGE==='24h'){
+    let t=Date.now();
+    if(RRANGE==='yesterday'){const d=new Date(t);d.setHours(0,0,0,0);t=d.getTime()-86400000;}
+    else if(RRANGE==='24h')t-=86400000;
+    return new Date(t).toLocaleDateString('en-CA');
+  }
+  const d=new Date(Date.now()-Number(RRANGE)*86400000);
   return d.toLocaleDateString('en-CA');
 }
-function rInPeriod(day){const c=rCutDate();return !c||day.date>=c;}
+function rInPeriod(day){const c=rCutDate();if(!c)return true;if(RRANGE==='yesterday')return day.date===c;return day.date>=c;}
+function rInRangeMs(ms){const c=rRangeCutMs(),e=rRangeEndMs();if(!ms)return true;if(c&&ms<c)return false;if(e&&ms>=e)return false;return true;}
+function rInRangeDay(ds){const c=rCutDate();if(!c)return true;if(RRANGE==='yesterday')return ds===c;if(RRANGE==='today'||RRANGE==='24h')return ds>=c;const ms=Date.parse(ds+'T00:00:00');const cut=rRangeCutMs();return !(ms&&ms<cut-86400000);}
 function rPeriodDays(){return (R&&R.days?R.days:[]).filter(rInPeriod);}
 function rSumDays(list){
   const t={reqs:0,ok:0,err:0,unknown:0,err429:0,err500:0,ti:0,to:0,tr:0,cache:0,total:0,what_if:0};
@@ -4334,13 +4629,9 @@ function renderRouterFileChart(){
   }).join('')+(rows.length>6?'<button class="more-btn" data-exp="rfs">'+(RFS_EXP?'Show less':'Show all '+rows.length)+' '+(RFS_EXP?'▴':'▾')+'</button>':'');
 }
 function rCommitRows(){
-  const cut=RRANGE==='all'?0:Date.now()-RRANGE*86400000;
   let rows=((R&&R.commits)||[]).filter(c=>{
     if(RFSTATE.day&&c[2]!==RFSTATE.day)return false;
-    if(cut){
-      const ms=Date.parse(c[2]+'T00:00:00');
-      if(ms&&ms<cut-86400000)return false;
-    }
+    if(!rInRangeDay(c[2]))return false;
     return true;
   });
   rows=rows.slice();
@@ -4378,7 +4669,7 @@ function renderRouterRecords(R,totTokens){
   const cards=[];
   if(r.biggest_day)cards.push(['Biggest day',FN(r.biggest_day.total),r.biggest_day.date+' · '+r.biggest_day.sessions+' requests · '+rHumanize(r.biggest_day.total)]);
   if(r.biggest_model)cards.push(['Biggest model',FN(r.biggest_model.total),rModelShort(r.biggest_model.name)+' · '+F(r.biggest_model.requests)+' requests']);
-  if(r.biggest_request)cards.push(['Biggest request',FN(r.biggest_request.total),rModelShort(r.biggest_request.model)+' · '+String(r.biggest_request.at||'').replace('T',' ').slice(0,19)]);
+  if(r.biggest_request)cards.push(['Biggest request',FN(r.biggest_request.total),rModelShort(r.biggest_request.model)+' · '+isoLocal(r.biggest_request.at)]);
   if(r.streaks)cards.push(['Streaks',r.streaks.current+'d now','longest '+r.streaks.longest+'d · '+rHumanize(totTokens)+' total']);
   el.innerHTML=cards.map(([l,v,s])=>'<div class="rec"><div class="rl">'+l+'</div><div class="rv">'+ESC(v)+'</div><div class="rs">'+ESC(s)+'</div></div>').join('')||'<div class="empty">No records yet.</div>';
 }
@@ -4458,7 +4749,7 @@ function renderRouterFilterBar(){
 function renderRouter(){
   if(!R)return;
   const t=R.totals||{};
-  const periodLbl=RRANGE==='all'?'ALL TIME':(RRANGE/30>=1?RRANGE/30+' MO':RRANGE+' DAYS');
+  const periodLbl=rangeLabel(RRANGE);
   $('r-range').textContent='CODEX · '+(R.range||'').toUpperCase()+' · LAST '+periodLbl+' · REFRESHES AUTOMATICALLY';
   const cur=RRANGE==='all'?null:rSumDays(rPeriodDays());
   const totTokens=cur?cur.total:(t.tokens_total||0);
@@ -4562,7 +4853,6 @@ function renderRouter(){
 function routerRequestRows(){
   const q=(($('r-search')||{}).value||'').toLowerCase();
   const st=($('r-status-f')||{}).value||'';
-  const cut=RRANGE==='all'?0:Date.now()-RRANGE*86400000;
   return (R.requests||[]).filter(r=>{
     if(RFSTATE.model&&r.model!==RFSTATE.model)return false;
     if(RFSTATE.provider&&r.provider!==RFSTATE.provider)return false;
@@ -4574,10 +4864,7 @@ function routerRequestRows(){
     if(st==='err'&&r.outcome!=='error')return false;
     if(st==='unknown'&&r.outcome!=='unknown')return false;
     if(st==='429'&&r.status!==429)return false;
-    if(cut){
-      const ms=Date.parse(r.at||'');
-      if(ms&&ms<cut)return false;
-    }
+    if(!rInRangeMs(Date.parse(r.at||'')))return false;
     if(q&&!(r.model||'').toLowerCase().includes(q)&&!(r.provider||'').toLowerCase().includes(q))return false;
     return true;});
 }
@@ -4593,24 +4880,27 @@ function renderRouterRequests(){
   const tb=$('r-tbl').querySelector('tbody');
   tb.innerHTML=rows.map(r=>{
     const ok=r.ok;
-    return '<tr><td class="mono" style="font-size:11.5px;color:var(--muted)">'+ESC((r.at||'').replace('T',' ').slice(0,19))+'</td>'+
+    return '<tr><td class="mono" style="font-size:11.5px;color:var(--muted)">'+ESC(isoLocal(r.at))+'</td>'+
     '<td><div class="t" style="font-size:12.5px">'+ESC(rModelShort(r.model))+'</div><div class="badges"><span class="badge">'+ESC(r.provider)+'</span></div></td>'+
-    +(r.outcome==='unknown'?'<td><span class="mono" style="font-size:12px;color:var(--subtle)">Outcome unavailable</span></td>':'<td><span class="'+(ok?'status-ok':'status-err')+' mono" style="font-size:12px">'+r.status+'</span></td>')+
+    (r.outcome==='unknown'?'<td><span class="mono" style="font-size:12px;color:var(--subtle)">Outcome unavailable</span></td>':'<td><span class="'+(ok?'status-ok':'status-err')+' mono" style="font-size:12px">'+r.status+'</span></td>')+
     '<td class="num">'+FN(r.ti||0)+'</td><td class="num">'+FN(r.to||0)+'</td><td class="num">'+FN(r.cache||0)+'</td>'+
     '<td class="num" style="font-weight:700">'+FN(r.total||0)+'</td><td class="num" style="color:var(--subtle)">'+F(r.ms||0)+'</td></tr>';}).join('')
     ||'<tr><td colspan="8"><div class="empty">No requests match.</div></td></tr>';
 }
 function setTab(name){
   TAB=name;
-  const oc=name==='opencode';
+  const oc=name==='opencode',rt=name==='router',jv=name==='jev';
   $('tab-opencode').classList.toggle('active',oc);
-  $('tab-router').classList.toggle('active',!oc);
+  $('tab-router').classList.toggle('active',rt);
+  $('tab-jev').classList.toggle('active',jv);
   $('tab-opencode').setAttribute('aria-selected',oc);
-  $('tab-router').setAttribute('aria-selected',!oc);
+  $('tab-router').setAttribute('aria-selected',rt);
+  $('tab-jev').setAttribute('aria-selected',jv);
   $('view-opencode').hidden=!oc;
-  $('view-router').hidden=oc;
+  $('view-router').hidden=!rt;
+  $('view-jev').hidden=!jv;
   try{sessionStorage.setItem('ocd-tab',name);}catch(_){}
-  if(!oc)renderRouter();else renderAll();
+  if(rt)renderRouter();else if(jv)renderJev();else renderAll();
 }
 function sortH(e){const th=e.target.closest('th');if(!th)return;const k=th.dataset.k;if(!k)return;
   if(k===sortK)sortAsc=!sortAsc;else{sortK=k;sortAsc=false;}
@@ -4628,7 +4918,7 @@ function openSession(s){
   lastFocus=document.activeElement;
   $('modal').innerHTML='<button class="modal-x" aria-label="Close">✕</button>'
   +'<h2 style="font-size:18px;font-weight:700;letter-spacing:-.02em">'+ESC(s.title)+'</h2>'
-  +'<div class="mmeta">'+['<span class="badge agent">'+ESC(s.agent)+'</span>','<span class="badge model">'+ESC(s.model)+'</span>',
+  +'<div class="mmeta">'+['<span class="badge agent">'+ESC(s.agent)+'</span>','<span class="badge model">'+ESC(s.model)+'</span>'+(s.provider?'<span class="badge">'+ESC(s.provider)+'</span>':''),
     '<span class="badge">'+DT(s.time_created)+'</span>','<span class="badge">'+DUR(s.duration_min)+'</span>',
     '<span class="badge">'+F(s.msgs)+' msgs</span>','<span class="badge">'+FN(tot)+' tokens</span>','<span class="badge">'+BURN(s.burn)+' burn</span>'].join('')+'</div>'
   +'<div class="card" style="margin-top:16px"><div style="font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--subtle);font-weight:700;margin-bottom:12px">Token breakdown</div>'
@@ -4715,6 +5005,7 @@ $('r-split-btn').onclick=()=>{RSPLIT=!RSPLIT;$('r-split-btn').textContent='Split
 $('r-share-btn').onclick=()=>{RSHARE=!RSHARE;$('r-share-btn').textContent='Share: '+(RSHARE?'on':'off');$('r-share-btn').setAttribute('aria-pressed',RSHARE);renderRouter();};
 $('tab-opencode').onclick=()=>setTab('opencode');
 $('tab-router').onclick=()=>setTab('router');
+$('tab-jev').onclick=()=>setTab('jev');
 $('r-search').addEventListener('input',renderRouterRequests);
 $('r-status-f').addEventListener('change',e=>{RFSTATE.status=e.target.value||'';renderRouter();});
 $('r-provider-f').addEventListener('change',e=>{RFSTATE.provider=e.target.value||null;renderRouter();});
@@ -4740,6 +5031,11 @@ document.querySelectorAll('#tbl th').forEach(th=>{th.onclick=sortH;th.tabIndex=0
 /* export */
 function exportData(kind){
   const isR=TAB==='router'&&R;
+  if(TAB==='jev'&&JV){
+    const b=new Blob([kind==='json'?JSON.stringify(JV,null,2):['date,proposals,sessions,input_tokens,output_tokens,avg_ms'].concat((JV.days||[]).map(d=>[d.date,d.proposals,d.sessions,d.input_tokens,d.output_tokens,d.avg_ms==null?'':d.avg_ms].join(','))).join('\n')],{type:kind==='json'?'application/json':'text/csv'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=kind==='json'?'jev-usage.json':'jev-proposals-days.csv';a.click();
+    return;
+  }
   if(kind==='json'){
     const b=new Blob([JSON.stringify(isR?R:S,null,2)],{type:'application/json'});
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=isR?'codex-tokens.json':'opencode-tokens.json';a.click();
@@ -4800,7 +5096,8 @@ const SECTIONS=[
  {key:'sessions',url:'/api/sessions',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.rows),render:d=>{SB=d;renderSSTable();}},
  {key:'projects',url:'/api/projects',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.rows),render:d=>{PJ=d;renderProjects();}},
  {key:'signals',url:'/api/signals',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.signals),render:d=>{SG=d;renderSignals();}},
- {key:'codex',url:'/api/codex',validate:d=>d&&d.ok===true&&Array.isArray(d.sessions),render:d=>{CX=d;renderCodex();}}
+ {key:'codex',url:'/api/codex',validate:d=>d&&d.ok===true&&Array.isArray(d.sessions),render:d=>{CX=d;renderCodex();}},
+ {key:'jev',url:'/api/jev',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{JV=d;renderJev();}}
 ];
 function secUnavailable(key,msg){
   var tb=(key==='sessions')?document.querySelector('#sstbl tbody'):((key==='projects')?document.querySelector('#projtbl tbody'):null);
@@ -4808,6 +5105,7 @@ function secUnavailable(key,msg){
   if(key==='graph'){var g=document.getElementById('graph');if(g)g.textContent='unavailable: '+msg;}
   if(key==='signals'){var s=document.getElementById('sig-chips');if(s)s.textContent='unavailable: '+msg;}
   if(key==='codex'){var c=document.querySelector('#cx-tbl tbody');if(c)c.innerHTML='<tr><td colspan="6">unavailable: '+ESC(msg)+'</td></tr>';}
+  if(key==='jev'){var j=document.querySelector('#j-tbl tbody');if(j)j.innerHTML='<tr><td colspan="7">unavailable: '+ESC(msg)+'</td></tr>';}
 }
 function secStrip(){
   var sts=SEC.sections,parts=[];
@@ -4876,20 +5174,20 @@ var G=null,SB=null,PJ=null,SG=null;
 function agoMs(v){if(v==null)return '?';var ms=(v>1e12)?v:(v*1000);var s=Math.max(0,Math.floor((Date.now()-ms)/1000));if(s<60)return s+' s ago';var m=Math.floor(s/60);if(m<60)return m+' min ago';var h=Math.floor(m/60);if(h<48)return h+' h ago';return Math.floor(h/24)+' d ago';}
 function fmtT(v){if(v==null)return '?';var ms=(v>1e12)?v:(v*1000);try{return new Date(ms).toLocaleString([],{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}catch(_){return String(v);}}
 function renderGraph(){var el=document.getElementById('graph');if(!el)return;if(!G||G.error){el.textContent=(G&&G.error)?('ERR '+G.error):'no data';return;}var H='',count=0;function walk(id,depth){if(count>300||depth>5)return;var n=G.nodes[id];if(!n)return;count++;H+='<div data-sid="'+n.id+'" style="padding-left:'+(depth*18)+'px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><b>'+ESC(n.agent)+'</b> <span style="opacity:.65">'+ESC(n.title)+' · '+agoMs(n.updated)+'</span></div>';var kids=G.kids[id]||[];for(var i=0;i<kids.length;i++)walk(kids[i],depth+1);}for(var i=0;i<G.roots.length&&count<=300;i++)walk(G.roots[i],0);el.innerHTML='<div style="opacity:.65;margin-bottom:6px">'+G.roots.length+' roots, nodes: '+Object.keys(G.nodes).length+'</div>'+H;}
-function renderSSTable(){var tb=document.querySelector('#sstbl tbody');if(!tb)return;if(!SB||SB.error){tb.innerHTML='<tr><td colspan="5">ERR</td></tr>';return;}var H='';for(var i=0;i<SB.rows.length;i++){var r=SB.rows[i];H+='<tr data-sid="'+r.id+'" style="cursor:pointer"><td>'+ESC(r.title)+'</td><td>'+ESC(r.agent||'')+'</td><td>'+ESC(r.model||'')+'</td><td>'+ESC(r.directory||'')+'</td><td>'+fmtT(r.time_created)+'</td></tr>';}if(!H)H='<tr><td colspan="5">no results</td></tr>';tb.innerHTML=H;}
+function renderSSTable(){var tb=document.querySelector('#sstbl tbody');if(!tb)return;if(!SB||SB.error){tb.innerHTML='<tr><td colspan="5">ERR</td></tr>';return;}var H='';for(var i=0;i<SB.rows.length;i++){var r=SB.rows[i];H+='<tr data-sid="'+r.id+'" style="cursor:pointer"><td>'+ESC(r.title)+'</td><td>'+ESC(r.agent||'')+'</td><td>'+ESC(r.model||'')+(r.provider?' · '+ESC(r.provider):'')+'</td><td>'+ESC(r.directory||'')+'</td><td>'+fmtT(r.time_created)+'</td></tr>';}if(!H)H='<tr><td colspan="5">no results</td></tr>';tb.innerHTML=H;}
 var _ssGen=0;
 async function fetchSessions(){var p='q='+encodeURIComponent($('ss-q').value)+'&agent='+encodeURIComponent($('ss-agent').value)+'&model='+encodeURIComponent($('ss-model').value);var g=++_ssGen;try{var d=await fetchJson('/api/sessions?'+p);if(g!==_ssGen)return;SB=d;renderSSTable();}catch(e){if(e&&e.status===401){noteAuthFailure();return;}if(g!==_ssGen)return;console.warn('ocd sessions search failed: '+((e&&e.message)||e));}}
 function renderProjects(){var tb=document.querySelector('#projtbl tbody');if(!tb)return;if(!PJ||PJ.error){tb.innerHTML='<tr><td colspan="5">ERR</td></tr>';return;}var H='';for(var i=0;i<PJ.rows.length;i++){var r=PJ.rows[i];var nm=r.name||r.directory||r.worktree||r.id;H+='<tr><td>'+ESC(nm)+'</td><td>'+ESC(r.directory||r.worktree||'')+'</td><td>'+ESC(r.vcs||'')+'</td><td class="num">'+(r.sessions||0)+'</td><td>'+fmtT(r.last)+'</td></tr>';}if(!H)H='<tr><td colspan="5">no projects</td></tr>';tb.innerHTML=H;}
 function renderSignals(){var el=document.getElementById('sig-chips');if(!el)return;if(!SG||SG.error){el.textContent='ERR';return;}var H='';for(var i=0;i<SG.signals.length;i++){var s=SG.signals[i];var c=(s.level==='warn')?'#a6761d':((s.level==='err')?'#c00':'#16a34a');H+='<span style="display:inline-block;padding:2px 10px;border:1px solid '+c+';border-radius:12px;margin:2px;color:'+c+'">'+ESC(s.text)+'</span>';}if(!H)H='<span>all clear</span>';el.innerHTML=H;}
 var _inspGen=0;
 const _inspState={sid:null,cursor:null,hasMore:false,pending:null};
-async function inspect(sid){var box=document.getElementById('insp');if(!box)return;box.hidden=false;var g=++_inspGen;if(_inspState.sid!==sid){_inspState.sid=sid;_inspState.cursor=null;_inspState.hasMore=false;_inspState.pending=null;}box.textContent='loading '+sid+' ...';try{var u='/api/inspect?id='+encodeURIComponent(sid)+'&_='+Date.now();if(_inspState.pending)u+='&cursor='+encodeURIComponent(_inspState.pending);var d=await fetchJson(u);if(g!==_inspGen)return;if(!d||!d.found){box.textContent='not found '+sid+' (click the row to retry)';return;}var H='<b>'+ESC(d.title||sid)+'</b> <span style="opacity:.65">'+ESC(d.agent||'')+' / '+ESC(d.model||'')+' / '+ESC(d.directory||'')+'</span>';for(var i=0;i<d.messages.length;i++){var m=d.messages[i];H+='<div style="margin-top:8px"><b>'+ESC(m.role)+'</b> <span style="opacity:.65">'+ESC(m.agent||'')+' '+ESC(m.model||'')+' · '+m.parts.length+' parts'+(m.parts_omitted?(' (+'+m.parts_omitted+' omitted)'):'')+'</span>';if(m.summary)H+='<div>'+ESC(m.summary)+'</div>';for(var j=0;j<m.parts.length;j++){var p=m.parts[j];H+='<div style="margin-left:12px;opacity:.85">['+ESC(p.type)+'] '+p.size+' B'+(p.preview?(', '+ESC(String(p.preview).slice(0,300))+(p.truncated?' …[truncated]':'')+(p.raw_fragment?' [raw fragment]':'')):'')+'</div>';}H+='</div>';}H+='<div style="margin-top:10px;opacity:.75;font-size:11px">'+d.count+' messages shown'+((d.parts_truncated)?' · some parts truncated':'')+((d.response_truncated)?' · response shortened':'')+'</div>';if(d.has_more){H+='<div style="margin-top:6px"><button id="insp-more" class="tbtn">Load next</button></div>';}box.innerHTML=H;if(d.has_more){_inspState.cursor=d.cursor;_inspState.hasMore=true;var b=document.getElementById('insp-more');if(b)b.onclick=function(){_inspState.pending=_inspState.cursor;inspect(_inspState.sid);};}else{_inspState.hasMore=false;}box.scrollIntoView();}catch(e){if(e&&e.status===401){noteAuthFailure();box.textContent='Authorization required — reopen via the launcher link';return;}if(g!==_inspGen)return;box.textContent='ERR '+e.message+' (click the row to retry)';}}
+async function inspect(sid){var box=document.getElementById('insp');if(!box)return;box.hidden=false;var g=++_inspGen;if(_inspState.sid!==sid){_inspState.sid=sid;_inspState.cursor=null;_inspState.hasMore=false;_inspState.pending=null;}box.textContent='loading '+sid+' ...';try{var u='/api/inspect?id='+encodeURIComponent(sid)+'&_='+Date.now();if(_inspState.pending)u+='&cursor='+encodeURIComponent(_inspState.pending);var d=await fetchJson(u);if(g!==_inspGen)return;if(!d||!d.found){box.textContent='not found '+sid+' (click the row to retry)';return;}var H='<b>'+ESC(d.title||sid)+'</b> <span style="opacity:.65">'+ESC(d.agent||'')+' / '+ESC(d.model||'')+(d.provider?' ('+ESC(d.provider)+')':'')+' / '+ESC(d.directory||'')+'</span>';for(var i=0;i<d.messages.length;i++){var m=d.messages[i];H+='<div style="margin-top:8px"><b>'+ESC(m.role)+'</b> <span style="opacity:.65">'+ESC(m.agent||'')+' '+ESC(m.model||'')+' · '+m.parts.length+' parts'+(m.parts_omitted?(' (+'+m.parts_omitted+' omitted)'):'')+'</span>';if(m.summary)H+='<div>'+ESC(m.summary)+'</div>';for(var j=0;j<m.parts.length;j++){var p=m.parts[j];H+='<div style="margin-left:12px;opacity:.85">['+ESC(p.type)+'] '+p.size+' B'+(p.preview?(', '+ESC(String(p.preview).slice(0,300))+(p.truncated?' …[truncated]':'')+(p.raw_fragment?' [raw fragment]':'')):'')+'</div>';}H+='</div>';}H+='<div style="margin-top:10px;opacity:.75;font-size:11px">'+d.count+' messages shown'+((d.parts_truncated)?' · some parts truncated':'')+((d.response_truncated)?' · response shortened':'')+'</div>';if(d.has_more){H+='<div style="margin-top:6px"><button id="insp-more" class="tbtn">Load next</button></div>';}box.innerHTML=H;if(d.has_more){_inspState.cursor=d.cursor;_inspState.hasMore=true;var b=document.getElementById('insp-more');if(b)b.onclick=function(){_inspState.pending=_inspState.cursor;inspect(_inspState.sid);};}else{_inspState.hasMore=false;}box.scrollIntoView();}catch(e){if(e&&e.status===401){noteAuthFailure();box.textContent='Authorization required — reopen via the launcher link';return;}if(g!==_inspGen)return;box.textContent='ERR '+e.message+' (click the row to retry)';}}
 if(!window.__p1wire){window.__p1wire=1;document.addEventListener('click',function(e){var t=(e.target&&e.target.closest)?e.target.closest('[data-sid]'):null;if(t)inspect(t.getAttribute('data-sid'));});['ss-q','ss-agent','ss-model'].forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener('input',function(){if(window.__p1t)clearTimeout(window.__p1t);window.__p1t=setTimeout(fetchSessions,350);});});}
 $('refresh').onclick=()=>{if(AUTH_FAILED)return;load();};
 $('search').addEventListener('input',renderSessions);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!AUTH_FAILED)load();});
 setInterval(()=>{if(!document.hidden&&!AUTH_FAILED)load();},((window.__ocdTimeouts&&window.__ocdTimeouts.refreshMs)||30000));
-try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'){setTab('router');}}catch(_){}
+try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'||saved==='jev'){setTab(saved);}}catch(_){}
 if(S){renderAll();}
 if(R){renderRouter();}
 if(AUTH_TOKEN){load();}else{showAuthLock(true);}
@@ -4908,6 +5206,7 @@ class Handler(BaseHTTPRequestHandler):
     db_path = None
     router_events = None
     router_limits = None
+    jev_logs = None
     server = None
     quiet = False
 
@@ -5140,6 +5439,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 body = json.dumps({"ok": False, "error": str(e)[:200]}).encode("utf-8")
             self._send(200, "application/json", body)
+        elif path.startswith("/api/jev"):
+            try:
+                body = json.dumps(query_jev(self.jev_logs or JEV_LOG_DEFAULTS)).encode("utf-8")
+            except Exception as e:
+                body = json.dumps({"ok": False, "error": str(e)[:200]}).encode("utf-8")
+            self._send(200, "application/json", body)
         elif path.startswith("/api/agents"):
             try:
                 con = connect(self.db_path)
@@ -5259,12 +5564,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
+            # Client went away mid-response (tab reload/close on Windows
+            # surfaces as ConnectionAbortedError, a sibling - not a child -
+            # of ConnectionResetError). Not a server fault: stay quiet.
             pass
 
     def log_message(self, fmt, *args):
         if not Handler.quiet:
             print("[%s] %s" % (self.log_date_time_string(), fmt % args))
+
+
+def _prime_idle_clock():
+    """Seed LAST_REQUEST at launch so an armed idle monitor measures real
+    idle time instead of counting from epoch zero."""
+    globals()["LAST_REQUEST"] = time.time()
 
 
 def _idle_monitor(server, idle_timeout):
@@ -5306,11 +5620,14 @@ def main():
                         help="path to Codex Router usage-events.jsonl")
     parser.add_argument("--router-limits", default=str(ROUTER_LIMITS_DEFAULT),
                         help="path to Codex Router rate-limits.json")
+    parser.add_argument("--jev-logs", action="append", default=[], metavar="FILE",
+                        help="Jev audit.jsonl to read (repeatable; defaults to local JevDesk installs)")
     args = parser.parse_args()
 
     Handler.db_path = args.db
     Handler.router_events = args.router_events
     Handler.router_limits = args.router_limits
+    Handler.jev_logs = args.jev_logs or [str(p) for p in JEV_LOG_DEFAULTS]
     Handler.quiet = args.quiet
     if args.agents_dir:
         AGENT_DIRS.extend(args.agents_dir)
@@ -5321,7 +5638,15 @@ def main():
         print(f"warning: {e}", file=sys.stderr)
         print("The dashboard will still start and show a setup page once OpenCode has written data.", file=sys.stderr)
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    server = None
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    except OSError as e:
+        print(f"error: cannot listen on 127.0.0.1:{args.port} ({e}).\n"
+              "Another dashboard instance is probably still running: close its\n"
+              "console window and start again. The launcher (start-dashboard.bat)\n"
+              "retires a stale instance automatically.", file=sys.stderr)
+        raise SystemExit(2)
     Handler.server = server
     try:
         server.auth_token = _new_token()
@@ -5343,6 +5668,11 @@ def main():
             webbrowser.open(url_with_token)
         except Exception as e:
             print(f"warning: could not open browser: {e}", file=sys.stderr)
+
+    # Seed the idle clock at launch: without it, a monitor with
+    # --idle-timeout > 0 compares against LAST_REQUEST == 0 and stops the
+    # server on its very first tick, before any client can connect.
+    _prime_idle_clock()
 
     monitor = threading.Thread(
         target=_idle_monitor, args=(server, args.idle_timeout), daemon=True

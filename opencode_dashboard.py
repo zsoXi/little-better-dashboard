@@ -21,6 +21,10 @@ _HOME = Path.home()  # cross-platform: %USERPROFILE% on Windows, $HOME elsewhere
 DB_PATH = _HOME / ".local/share/opencode/opencode.db"
 ROUTER_EVENTS_DEFAULT = _HOME / ".codex/codex-router/usage-events.jsonl"
 ROUTER_LIMITS_DEFAULT = _HOME / ".codex/codex-router/rate-limits.json"
+JEV_LOG_DEFAULTS = [
+    _HOME / "AppData/Local/JevDeskEasy/runtime/audit.jsonl",
+    _HOME / "AppData/Local/JevDesk/audit.jsonl",
+]
 
 # All cross-thread shared state is guarded by LOCK.
 LOCK = threading.Lock()
@@ -31,6 +35,8 @@ MAX_ROUTER_ROWS = 400  # recent requests kept in the /api/router payload
 MAX_ROUTER_RECORD_BYTES = 8 * 1024 * 1024  # F6b: per-record read cap
 _ROUTER_READ_BLOCK = 65536  # F6b: byte block size for tail reads/counts
 _ROUTER_COUNT_CACHE = {}  # F6b: str(path) -> line count + fingerprint
+JEV_READ_CAP = 2 * 1024 * 1024  # bounded tail read per Jev audit log
+JEV_MAX_EVENTS = 5000  # most-recent Jev audit events kept per source
 SYNTH_SCHEMA = 3  # bump to force codex-synth rebuild when the writer changes
 
 # What-if paid pricing per 1M tokens (input, output) for known *-free models.
@@ -3008,6 +3014,174 @@ def cached_router_stats(events_path, limits_path=None, worktrees=None, full_scan
     return stats
 
 
+# ---------------------------------------------------------------------------
+# Jev (typesafe System One gate) — local audit logs, read-only.
+def _jev_source_name(path):
+    parent = path.parent
+    top = parent.parent if parent.name.lower() == "runtime" else parent
+    return top.name or str(path)
+
+
+def _jev_local_iso(t):
+    try:
+        return datetime.fromtimestamp(float(t)).strftime("%Y-%m-%dT%H:%M:%S")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _jev_day():
+    return {"proposals": 0, "sessions": 0, "input_tokens": 0,
+            "output_tokens": 0, "elapsed_ms": 0.0}
+
+
+def read_jev_events(path):
+    """Bounded read of one Jev audit log. Returns (events, bad_lines, truncated).
+
+    At most JEV_READ_CAP bytes are read from the tail; when the file is longer
+    the partial first line is dropped. Malformed lines never raise.
+    """
+    events, bad, truncated = [], 0, False
+    size = path.stat().st_size
+    with open(path, "rb") as fh:
+        if size > JEV_READ_CAP:
+            fh.seek(size - JEV_READ_CAP)
+            fh.readline()  # drop the partial first line
+            truncated = True
+        data = fh.read().decode("utf-8", "replace")
+    for line in data.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        if isinstance(rec, dict):
+            events.append(rec)
+        else:
+            bad += 1
+    if len(events) > JEV_MAX_EVENTS:
+        events = events[-JEV_MAX_EVENTS:]
+        truncated = True
+    return events, bad, truncated
+
+
+def query_jev(paths):
+    """Aggregate local Jev audit logs for the Jev tab.
+
+    mock:true events are excluded from aggregates (they are counted as
+    mock_skipped). The audit files are never written to; the hash chain is
+    left for the tools that own it.
+    """
+    paths = [Path(p) for p in (paths or [])]
+    sources, seen = [], set()
+    totals = {"proposals": 0, "sessions": 0, "mock_skipped": 0,
+              "input_tokens": 0, "output_tokens": 0,
+              "elapsed_ms": 0.0, "avg_ms": None,
+              "verdicts": {}, "models": {}}
+    days = {}
+    recent = []
+    for p in paths:
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = {"name": _jev_source_name(p), "path": str(p), "exists": p.is_file(),
+                 "events": 0, "proposals": 0, "sessions": 0, "stops": 0,
+                 "mock_skipped": 0, "bad_lines": 0, "truncated": False, "error": None}
+        if entry["exists"]:
+            try:
+                events, bad, truncated = read_jev_events(p)
+                entry["bad_lines"] = bad
+                entry["truncated"] = truncated
+            except OSError as e:
+                events = []
+                entry["error"] = str(e)[:200]
+        else:
+            events = []
+        for rec in events:
+            kind = rec.get("event")
+            entry["events"] += 1
+            if kind == "session_created":
+                if rec.get("mock"):
+                    entry["mock_skipped"] += 1
+                    totals["mock_skipped"] += 1
+                    continue
+                entry["sessions"] += 1
+                totals["sessions"] += 1
+                day = _jev_local_iso(rec.get("time"))[:10]
+                if day:
+                    days.setdefault(day, _jev_day())["sessions"] += 1
+            elif kind == "stop":
+                entry["stops"] += 1
+            elif kind == "proposal":
+                if rec.get("mock"):
+                    entry["mock_skipped"] += 1
+                    totals["mock_skipped"] += 1
+                    continue
+                usage = rec.get("usage") if isinstance(rec.get("usage"), dict) else {}
+                try:
+                    inp = int(usage.get("input_tokens") or 0)
+                except (TypeError, ValueError):
+                    inp = 0
+                try:
+                    out = int(usage.get("output_tokens") or 0)
+                except (TypeError, ValueError):
+                    out = 0
+                try:
+                    ms = float(rec.get("elapsed_ms") or 0.0)
+                except (TypeError, ValueError):
+                    ms = 0.0
+                verdict = str(rec.get("verdict") or "UNKNOWN")
+                model = str(rec.get("model") or "-")
+                entry["proposals"] += 1
+                totals["proposals"] += 1
+                totals["input_tokens"] += inp
+                totals["output_tokens"] += out
+                totals["elapsed_ms"] += ms
+                totals["verdicts"][verdict] = totals["verdicts"].get(verdict, 0) + 1
+                totals["models"][model] = totals["models"].get(model, 0) + 1
+                at = _jev_local_iso(rec.get("time"))
+                day = at[:10]
+                if day:
+                    d = days.setdefault(day, _jev_day())
+                    d["proposals"] += 1
+                    d["input_tokens"] += inp
+                    d["output_tokens"] += out
+                    d["elapsed_ms"] += ms
+                recent.append((rec.get("time") or 0, {
+                    "at": at, "session_id": str(rec.get("session_id") or ""),
+                    "verdict": verdict, "model": model,
+                    "input_tokens": inp, "output_tokens": out,
+                    "elapsed_ms": round(ms, 2)}))
+        sources.append(entry)
+    recent.sort(key=lambda item: item[0], reverse=True)
+    recent = [r for _t, r in recent[:200]]
+    day_rows = []
+    for day in sorted(days):
+        d = days[day]
+        day_rows.append({
+            "date": day, "proposals": d["proposals"], "sessions": d["sessions"],
+            "input_tokens": d["input_tokens"], "output_tokens": d["output_tokens"],
+            "elapsed_ms": round(d["elapsed_ms"], 2),
+            "avg_ms": round(d["elapsed_ms"] / d["proposals"], 2) if d["proposals"] else None})
+    if totals["proposals"]:
+        totals["avg_ms"] = round(totals["elapsed_ms"] / totals["proposals"], 2)
+    totals["elapsed_ms"] = round(totals["elapsed_ms"], 2)
+    totals["models"] = [{"model": k, "proposals": v} for k, v in
+                        sorted(totals["models"].items(), key=lambda kv: (-kv[1], kv[0]))]
+    totals["verdicts"] = [{"verdict": k, "proposals": v} for k, v in
+                          sorted(totals["verdicts"].items(), key=lambda kv: (-kv[1], kv[0]))]
+    rng = f"{day_rows[0]['date']} → {day_rows[-1]['date']}" if day_rows else "no activity"
+    return {"ok": True, "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+            "range": rng, "sources": sources, "totals": totals,
+            "days": day_rows, "recent": recent}
+
+
 def session_prompts(con, session_id):
     """Prompts for one session, from session_input when available, otherwise
     reconstructed from user text parts (older opencode versions)."""
@@ -3389,6 +3563,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   <div class="source-tabs" role="tablist" aria-label="Data source">
     <button class="stab active" id="tab-opencode" role="tab" aria-selected="true" aria-controls="view-opencode">OpenCode<span class="cnt" id="tab-opencode-cnt"></span></button>
     <button class="stab" id="tab-router" role="tab" aria-selected="false" aria-controls="view-router">Codex<span class="cnt" id="tab-router-cnt"></span></button>
+    <button class="stab" id="tab-jev" role="tab" aria-selected="false" aria-controls="view-jev">Jev<span class="cnt" id="tab-jev-cnt"></span></button>
   </div>
   <div id="view-opencode" role="tabpanel" aria-labelledby="tab-opencode">
   <section class="hero">
@@ -3625,6 +3800,39 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="act-legend" id="r-act-legend"></div>
   </div>
   </div><!-- /view-router -->
+  <div id="view-jev" role="tabpanel" aria-labelledby="tab-jev" hidden>
+  <section class="hero" style="padding-top:26px">
+    <div class="eyebrow" id="j-range">JEV</div>
+    <h1 id="j-headline">Loading Jev usage…</h1>
+    <div class="pills" id="j-pills"></div>
+  </section>
+  <section class="summary" id="j-summary"></section>
+
+  <h2 class="sec">Judgments <span class="hint">local audit log · read-only</span></h2>
+  <div class="card"><div class="chips" id="j-verdicts"></div></div>
+
+  <h2 class="sec">Models <span class="hint">per judgment</span></h2>
+  <div class="card" id="j-model-card"><div class="chips" id="j-models"></div></div>
+
+  <h2 class="sec">Judgments per day <span class="hint">local timezone</span></h2>
+  <div class="card">
+    <div class="tbl-scroll"><table class="tbl" id="j-days">
+      <thead><tr><th>Day</th><th class="num">Judgments</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Avg ms</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </div>
+
+  <h2 class="sec">Recent judgments <span class="hint" id="j-hint"></span></h2>
+  <div class="card">
+    <div class="tbl-scroll"><table class="tbl" id="j-tbl">
+      <thead><tr><th>Time</th><th>Session</th><th>Verdict</th><th>Model</th><th class="num">Input</th><th class="num">Output</th><th class="num">ms</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </div>
+
+  <h2 class="sec">Audit sources <span class="hint">hash-chained JSONL, never uploaded</span></h2>
+  <div class="card"><div id="j-sources" style="line-height:1.7"></div></div>
+  </div><!-- /view-jev -->
 </div>
 
 <div class="overlay" id="overlay"><div class="modal" id="modal" role="dialog" aria-modal="true" aria-label="Session details"></div></div>
@@ -3641,6 +3849,7 @@ const F=n=>{const s=Math.round(Number(n)||0).toString();return s.replace(/\B(?=(
 const FN=n=>{n=Number(n)||0;return n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(Math.round(n));};
 const DT=t=>{if(!t)return'-';const d=new Date(t>1e12?t:t*1000);return d.toLocaleDateString('en-CA')+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
 const DS=t=>{if(!t)return'';const d=new Date(t>1e12?t:t*1000);return d.toLocaleDateString('en-CA');};
+const isoLocal=t=>{if(t==null||t==='')return'';const d=new Date(t);if(isNaN(d.getTime()))return String(t).replace('T',' ').slice(0,19);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());};
 const DUR=m=>{if(m==null)return'-';if(m<1)return'<1m';if(m<60)return Math.round(m)+'m';const h=Math.floor(m/60);return h+'h '+Math.round(m%60)+'m';};
 const BURN=b=>{b=Number(b)||0;return b>=1000?(b/1000).toFixed(1)+'K/m':Math.round(b)+'/m';};
 let S=null; if(typeof S0!=='undefined'&&S0){S=S0;}
@@ -4054,9 +4263,38 @@ function renderCodex(){
     return '<tr>'+'<td><b>'+ESC(r.name||'?')+'</b>'+prev+'<div class="sub">'+ESC(r.cwd||'')+'</div></td>'+
       '<td>'+ESC(r.model||r.provider||'?')+'</td>'+'<td class="sub">'+ESC((r.cwd||'').split('\\').pop()||'')+'</td>'+
       '<td class="num">'+(r.n||0)+'</td>'+'<td class="num">'+(r.tok||0).toLocaleString('en-US')+'</td>'+
-      '<td class="sub">'+ESC((r.last||'').slice(0,19).replace('T',' '))+'</td></tr>'+
+      '<td class="sub">'+ESC(isoLocal(r.last))+'</td></tr>'+
       (tools?'<tr class="toolsrow"><td colspan="6">'+tools+'</td></tr>':'');
   }).join('');
+}
+
+let JV=null;
+function renderJev(){
+  const d=JV;
+  const cnt=$('tab-jev-cnt');
+  if(cnt)cnt.textContent=((d&&d.totals&&d.totals.proposals)||'');
+  if(!d||!d.ok)return;
+  const t=d.totals||{},days=d.days||[],recent=d.recent||[];
+  const range=$('j-range');
+  if(range)range.textContent='JEV · '+String(d.range||'no activity').toUpperCase()+' · LOCAL TIME';
+  const head=$('j-headline');
+  if(head)head.innerHTML=BOLD(ESC(t.proposals+' judgments across '+F(t.sessions)+' sessions — '+FN(t.input_tokens)+' input / '+FN(t.output_tokens)+' output tokens'+(t.mock_skipped?(' ('+F(t.mock_skipped)+(t.mock_skipped===1?' mock session skipped':' mock sessions skipped')+')'):'')+'.'));
+  const pills=$('j-pills');
+  if(pills)pills.innerHTML=[['Avg latency',t.avg_ms==null?'-':Math.round(t.avg_ms)+' ms'],['Models',(t.models||[]).length],['Sources',(d.sources||[]).filter(s=>s.exists).length+'/'+(d.sources||[]).length]].map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+ESC(v)+'</b></span>').join('');
+  const sum=$('j-summary');
+  if(sum)sum.innerHTML=[['Judgments',FN(t.proposals),'proposals'],['Input tokens',FN(t.input_tokens),'tokens'],['Output tokens',FN(t.output_tokens),'tokens'],['Avg latency',t.avg_ms==null?'-':Math.round(t.avg_ms)+' ms','per judgment']].map(([l,v,s])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+v+'</div><div class="ss">'+s+'</div></div>').join('');
+  const vc=$('j-verdicts');
+  if(vc)vc.innerHTML=(t.verdicts||[]).map(v=>'<span class="chip">'+ESC(v.verdict)+' ×'+F(v.proposals)+'</span>').join('')||'<span class="chip">no verdicts</span>';
+  const mc=$('j-models');
+  if(mc)mc.innerHTML=(t.models||[]).map(m=>'<span class="chip">'+ESC(m.model)+' ×'+F(m.proposals)+'</span>').join('')||'<span class="chip">no models</span>';
+  const dtb=document.querySelector('#j-days tbody');
+  if(dtb)dtb.innerHTML=days.map(x=>'<tr><td>'+ESC(x.date)+'</td><td class="num">'+F(x.proposals)+'</td><td class="num">'+F(x.sessions)+'</td><td class="num">'+FN(x.input_tokens)+'</td><td class="num">'+FN(x.output_tokens)+'</td><td class="num">'+(x.avg_ms==null?'-':F(Math.round(x.avg_ms)))+'</td></tr>').join('')||'<tr><td colspan="6"><div class="empty">No Jev activity found.</div></td></tr>';
+  const hint=$('j-hint');
+  if(hint)hint.textContent='latest '+recent.length+' of '+F(t.proposals)+' judgments';
+  const tb=document.querySelector('#j-tbl tbody');
+  if(tb)tb.innerHTML=recent.map(r=>'<tr><td class="sub">'+ESC(isoLocal(r.at))+'</td><td class="sub">'+ESC(String(r.session_id||'').slice(0,10))+'</td><td><span class="badge">'+ESC(r.verdict)+'</span></td><td>'+ESC(r.model)+'</td><td class="num">'+FN(r.input_tokens)+'</td><td class="num">'+FN(r.output_tokens)+'</td><td class="num">'+F(r.elapsed_ms||0)+'</td></tr>').join('')||'<tr><td colspan="7"><div class="empty">No judgments recorded.</div></td></tr>';
+  const src=$('j-sources');
+  if(src)src.innerHTML=(d.sources||[]).map(s=>{var line=ESC(s.name)+' — <span class="mono" style="font-size:11.5px">'+ESC(s.path)+'</span> — ';if(!s.exists){line+='not found'+(s.error?(' ('+ESC(s.error)+')'):'');}else{line+=F(s.events)+' events · '+F(s.proposals)+' judgments · '+F(s.sessions)+' sessions';if(s.mock_skipped)line+=' · '+F(s.mock_skipped)+' mock skipped';if(s.bad_lines)line+=' · '+F(s.bad_lines)+' bad lines';if(s.truncated)line+=' · tail-truncated';}return '<div>'+line+'</div>';}).join('')||'<div class="empty">No audit logs configured.</div>';
 }
 
 const SUB_ACT={recent:'Recent activity',quiet:'No recent activity',stale:'Older activity',unknown:'Unknown'};
@@ -4401,7 +4639,7 @@ function renderRouterRecords(R,totTokens){
   const cards=[];
   if(r.biggest_day)cards.push(['Biggest day',FN(r.biggest_day.total),r.biggest_day.date+' · '+r.biggest_day.sessions+' requests · '+rHumanize(r.biggest_day.total)]);
   if(r.biggest_model)cards.push(['Biggest model',FN(r.biggest_model.total),rModelShort(r.biggest_model.name)+' · '+F(r.biggest_model.requests)+' requests']);
-  if(r.biggest_request)cards.push(['Biggest request',FN(r.biggest_request.total),rModelShort(r.biggest_request.model)+' · '+String(r.biggest_request.at||'').replace('T',' ').slice(0,19)]);
+  if(r.biggest_request)cards.push(['Biggest request',FN(r.biggest_request.total),rModelShort(r.biggest_request.model)+' · '+isoLocal(r.biggest_request.at)]);
   if(r.streaks)cards.push(['Streaks',r.streaks.current+'d now','longest '+r.streaks.longest+'d · '+rHumanize(totTokens)+' total']);
   el.innerHTML=cards.map(([l,v,s])=>'<div class="rec"><div class="rl">'+l+'</div><div class="rv">'+ESC(v)+'</div><div class="rs">'+ESC(s)+'</div></div>').join('')||'<div class="empty">No records yet.</div>';
 }
@@ -4616,24 +4854,27 @@ function renderRouterRequests(){
   const tb=$('r-tbl').querySelector('tbody');
   tb.innerHTML=rows.map(r=>{
     const ok=r.ok;
-    return '<tr><td class="mono" style="font-size:11.5px;color:var(--muted)">'+ESC((r.at||'').replace('T',' ').slice(0,19))+'</td>'+
+    return '<tr><td class="mono" style="font-size:11.5px;color:var(--muted)">'+ESC(isoLocal(r.at))+'</td>'+
     '<td><div class="t" style="font-size:12.5px">'+ESC(rModelShort(r.model))+'</div><div class="badges"><span class="badge">'+ESC(r.provider)+'</span></div></td>'+
-    +(r.outcome==='unknown'?'<td><span class="mono" style="font-size:12px;color:var(--subtle)">Outcome unavailable</span></td>':'<td><span class="'+(ok?'status-ok':'status-err')+' mono" style="font-size:12px">'+r.status+'</span></td>')+
+    (r.outcome==='unknown'?'<td><span class="mono" style="font-size:12px;color:var(--subtle)">Outcome unavailable</span></td>':'<td><span class="'+(ok?'status-ok':'status-err')+' mono" style="font-size:12px">'+r.status+'</span></td>')+
     '<td class="num">'+FN(r.ti||0)+'</td><td class="num">'+FN(r.to||0)+'</td><td class="num">'+FN(r.cache||0)+'</td>'+
     '<td class="num" style="font-weight:700">'+FN(r.total||0)+'</td><td class="num" style="color:var(--subtle)">'+F(r.ms||0)+'</td></tr>';}).join('')
     ||'<tr><td colspan="8"><div class="empty">No requests match.</div></td></tr>';
 }
 function setTab(name){
   TAB=name;
-  const oc=name==='opencode';
+  const oc=name==='opencode',rt=name==='router',jv=name==='jev';
   $('tab-opencode').classList.toggle('active',oc);
-  $('tab-router').classList.toggle('active',!oc);
+  $('tab-router').classList.toggle('active',rt);
+  $('tab-jev').classList.toggle('active',jv);
   $('tab-opencode').setAttribute('aria-selected',oc);
-  $('tab-router').setAttribute('aria-selected',!oc);
+  $('tab-router').setAttribute('aria-selected',rt);
+  $('tab-jev').setAttribute('aria-selected',jv);
   $('view-opencode').hidden=!oc;
-  $('view-router').hidden=oc;
+  $('view-router').hidden=!rt;
+  $('view-jev').hidden=!jv;
   try{sessionStorage.setItem('ocd-tab',name);}catch(_){}
-  if(!oc)renderRouter();else renderAll();
+  if(rt)renderRouter();else if(jv)renderJev();else renderAll();
 }
 function sortH(e){const th=e.target.closest('th');if(!th)return;const k=th.dataset.k;if(!k)return;
   if(k===sortK)sortAsc=!sortAsc;else{sortK=k;sortAsc=false;}
@@ -4738,6 +4979,7 @@ $('r-split-btn').onclick=()=>{RSPLIT=!RSPLIT;$('r-split-btn').textContent='Split
 $('r-share-btn').onclick=()=>{RSHARE=!RSHARE;$('r-share-btn').textContent='Share: '+(RSHARE?'on':'off');$('r-share-btn').setAttribute('aria-pressed',RSHARE);renderRouter();};
 $('tab-opencode').onclick=()=>setTab('opencode');
 $('tab-router').onclick=()=>setTab('router');
+$('tab-jev').onclick=()=>setTab('jev');
 $('r-search').addEventListener('input',renderRouterRequests);
 $('r-status-f').addEventListener('change',e=>{RFSTATE.status=e.target.value||'';renderRouter();});
 $('r-provider-f').addEventListener('change',e=>{RFSTATE.provider=e.target.value||null;renderRouter();});
@@ -4763,6 +5005,11 @@ document.querySelectorAll('#tbl th').forEach(th=>{th.onclick=sortH;th.tabIndex=0
 /* export */
 function exportData(kind){
   const isR=TAB==='router'&&R;
+  if(TAB==='jev'&&JV){
+    const b=new Blob([kind==='json'?JSON.stringify(JV,null,2):['date,proposals,sessions,input_tokens,output_tokens,avg_ms'].concat((JV.days||[]).map(d=>[d.date,d.proposals,d.sessions,d.input_tokens,d.output_tokens,d.avg_ms==null?'':d.avg_ms].join(','))).join('\n')],{type:kind==='json'?'application/json':'text/csv'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=kind==='json'?'jev-usage.json':'jev-proposals-days.csv';a.click();
+    return;
+  }
   if(kind==='json'){
     const b=new Blob([JSON.stringify(isR?R:S,null,2)],{type:'application/json'});
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=isR?'codex-tokens.json':'opencode-tokens.json';a.click();
@@ -4823,7 +5070,8 @@ const SECTIONS=[
  {key:'sessions',url:'/api/sessions',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.rows),render:d=>{SB=d;renderSSTable();}},
  {key:'projects',url:'/api/projects',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.rows),render:d=>{PJ=d;renderProjects();}},
  {key:'signals',url:'/api/signals',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.signals),render:d=>{SG=d;renderSignals();}},
- {key:'codex',url:'/api/codex',validate:d=>d&&d.ok===true&&Array.isArray(d.sessions),render:d=>{CX=d;renderCodex();}}
+ {key:'codex',url:'/api/codex',validate:d=>d&&d.ok===true&&Array.isArray(d.sessions),render:d=>{CX=d;renderCodex();}},
+ {key:'jev',url:'/api/jev',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{JV=d;renderJev();}}
 ];
 function secUnavailable(key,msg){
   var tb=(key==='sessions')?document.querySelector('#sstbl tbody'):((key==='projects')?document.querySelector('#projtbl tbody'):null);
@@ -4831,6 +5079,7 @@ function secUnavailable(key,msg){
   if(key==='graph'){var g=document.getElementById('graph');if(g)g.textContent='unavailable: '+msg;}
   if(key==='signals'){var s=document.getElementById('sig-chips');if(s)s.textContent='unavailable: '+msg;}
   if(key==='codex'){var c=document.querySelector('#cx-tbl tbody');if(c)c.innerHTML='<tr><td colspan="6">unavailable: '+ESC(msg)+'</td></tr>';}
+  if(key==='jev'){var j=document.querySelector('#j-tbl tbody');if(j)j.innerHTML='<tr><td colspan="7">unavailable: '+ESC(msg)+'</td></tr>';}
 }
 function secStrip(){
   var sts=SEC.sections,parts=[];
@@ -4912,7 +5161,7 @@ $('refresh').onclick=()=>{if(AUTH_FAILED)return;load();};
 $('search').addEventListener('input',renderSessions);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!AUTH_FAILED)load();});
 setInterval(()=>{if(!document.hidden&&!AUTH_FAILED)load();},((window.__ocdTimeouts&&window.__ocdTimeouts.refreshMs)||30000));
-try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'){setTab('router');}}catch(_){}
+try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'||saved==='jev'){setTab(saved);}}catch(_){}
 if(S){renderAll();}
 if(R){renderRouter();}
 if(AUTH_TOKEN){load();}else{showAuthLock(true);}
@@ -4931,6 +5180,7 @@ class Handler(BaseHTTPRequestHandler):
     db_path = None
     router_events = None
     router_limits = None
+    jev_logs = None
     server = None
     quiet = False
 
@@ -5163,6 +5413,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 body = json.dumps({"ok": False, "error": str(e)[:200]}).encode("utf-8")
             self._send(200, "application/json", body)
+        elif path.startswith("/api/jev"):
+            try:
+                body = json.dumps(query_jev(self.jev_logs or JEV_LOG_DEFAULTS)).encode("utf-8")
+            except Exception as e:
+                body = json.dumps({"ok": False, "error": str(e)[:200]}).encode("utf-8")
+            self._send(200, "application/json", body)
         elif path.startswith("/api/agents"):
             try:
                 con = connect(self.db_path)
@@ -5293,6 +5549,12 @@ class Handler(BaseHTTPRequestHandler):
             print("[%s] %s" % (self.log_date_time_string(), fmt % args))
 
 
+def _prime_idle_clock():
+    """Seed LAST_REQUEST at launch so an armed idle monitor measures real
+    idle time instead of counting from epoch zero."""
+    globals()["LAST_REQUEST"] = time.time()
+
+
 def _idle_monitor(server, idle_timeout):
     """Exit when the app is abandoned: all dashboard windows closed, or the
     --idle-timeout grace period elapsed with no requests at all."""
@@ -5332,11 +5594,14 @@ def main():
                         help="path to Codex Router usage-events.jsonl")
     parser.add_argument("--router-limits", default=str(ROUTER_LIMITS_DEFAULT),
                         help="path to Codex Router rate-limits.json")
+    parser.add_argument("--jev-logs", action="append", default=[], metavar="FILE",
+                        help="Jev audit.jsonl to read (repeatable; defaults to local JevDesk installs)")
     args = parser.parse_args()
 
     Handler.db_path = args.db
     Handler.router_events = args.router_events
     Handler.router_limits = args.router_limits
+    Handler.jev_logs = args.jev_logs or [str(p) for p in JEV_LOG_DEFAULTS]
     Handler.quiet = args.quiet
     if args.agents_dir:
         AGENT_DIRS.extend(args.agents_dir)
@@ -5377,6 +5642,11 @@ def main():
             webbrowser.open(url_with_token)
         except Exception as e:
             print(f"warning: could not open browser: {e}", file=sys.stderr)
+
+    # Seed the idle clock at launch: without it, a monitor with
+    # --idle-timeout > 0 compares against LAST_REQUEST == 0 and stops the
+    # server on its very first tick, before any client can connect.
+    _prime_idle_clock()
 
     monitor = threading.Thread(
         target=_idle_monitor, args=(server, args.idle_timeout), daemon=True

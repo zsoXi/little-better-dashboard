@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import io
 import json
 import math
 import os
@@ -9,13 +11,16 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
+import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
-from urllib.request import pathname2url
+from urllib.request import Request, pathname2url, urlopen
 
 _HOME = Path.home()  # cross-platform: %USERPROFILE% on Windows, $HOME elsewhere
 DB_PATH = _HOME / ".local/share/opencode/opencode.db"
@@ -40,6 +45,15 @@ JEV_MAX_EVENTS = 5000  # most-recent Jev audit events kept per source
 AG_DIR_DEFAULT = _HOME / ".gemini" / "antigravity"  # local Antigravity client data
 AG_MAX_STEPS = 20000  # newest steps sampled per Antigravity conversation db
 SYNTH_SCHEMA = 3  # bump to force codex-synth rebuild when the writer changes
+DASHBOARD_VERSION = "1.0.0"  # keep in sync with the vX.Y.Z release tag
+UPDATE_REPO = "zsoXi/little-better-dashboard"
+UPDATE_API_LATEST = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_ASSET_MAX = 50 * 1024 * 1024  # download cap for the release zip
+UPDATE_FILES = ("opencode_dashboard.py", "start-dashboard.bat", "logo.png", "logo.ico")
+UPDATE_HOSTS = {"api.github.com", "github.com",
+                "objects.githubusercontent.com", "raw.githubusercontent.com"}
+UPDATE_APPLIED = False  # set after a successful in-place update in this process
+RESTART_REQUESTED = False  # main() relaunches the server after a clean exit
 
 # What-if paid pricing per 1M tokens (input, output) for known *-free models.
 # Actual free cost is always $0; this estimates what the same tokens would cost.
@@ -67,6 +81,157 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{20,128}")
 
 def _new_token():
     return secrets.token_urlsafe(32)
+
+
+def _version_tuple(s):
+    nums = [int(x) for x in re.findall(r"\d+", str(s or ""))][:3]
+    nums += [0] * (3 - len(nums))
+    return tuple(nums)
+
+
+def _update_fetch_latest():
+    """One GitHub API call; only ever runs on an explicit user click."""
+    req = Request(UPDATE_API_LATEST, headers={
+        "User-Agent": "little-better-dashboard",
+        "Accept": "application/vnd.github+json",
+    })
+    with urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+    assets = []
+    for a in (data.get("assets") or []):
+        if not isinstance(a, dict):
+            continue
+        assets.append({
+            "name": a.get("name") or "",
+            "url": a.get("browser_download_url") or "",
+            "size": a.get("size") or 0,
+        })
+    return {
+        "tag": data.get("tag_name") or "",
+        "url": data.get("html_url") or "",
+        "notes": (data.get("body") or "")[:2000],
+        "assets": assets,
+    }
+
+
+def update_check(fetch=None):
+    try:
+        latest = (fetch or _update_fetch_latest)()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:  # no release published yet
+            return {"ok": True, "current": DASHBOARD_VERSION, "latest": None,
+                    "tag": "", "newer": False, "url": "", "notes": "",
+                    "zip": None, "checksums": None}
+        return {"ok": False, "error": "HTTP %s" % e.code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+    tag = latest.get("tag") or ""
+    assets = latest.get("assets") or []
+    zip_asset = next((a for a in assets if a["name"].endswith(".zip")), None)
+    checks = next((a for a in assets if a["name"] == "checksums.txt"), None)
+    return {
+        "ok": True,
+        "current": DASHBOARD_VERSION,
+        "latest": tag.lstrip("vV") or None,
+        "tag": tag,
+        "newer": _version_tuple(tag) > _version_tuple(DASHBOARD_VERSION),
+        "url": latest.get("url") or "",
+        "notes": latest.get("notes") or "",
+        "zip": zip_asset,
+        "checksums": checks,
+    }
+
+
+def _update_download(url):
+    host = (urlparse(url).hostname or "").lower()
+    if host not in UPDATE_HOSTS:
+        raise ValueError("unexpected download host: %s" % host)
+    req = Request(url, headers={"User-Agent": "little-better-dashboard"})
+    with urlopen(req, timeout=60) as resp:
+        data = resp.read(UPDATE_ASSET_MAX + 1)
+    if len(data) > UPDATE_ASSET_MAX:
+        raise ValueError("release asset is too large")
+    return data
+
+
+def _update_target():
+    return Path(__file__).resolve().parent
+
+
+def update_apply(checker=None, downloader=None):
+    """Download the latest release zip, verify its checksum, replace the
+    installed files in place (with .bak copies). The release is re-resolved
+    server-side and downloads are restricted to GitHub hosts, so a client
+    cannot point the updater anywhere else."""
+    chk = checker() if checker else update_check()
+    if not chk.get("ok"):
+        return {"ok": False, "error": chk.get("error") or "update check failed"}
+    if not chk.get("newer"):
+        return {"ok": False, "error": "already up to date"}
+    zip_asset = chk.get("zip") or {}
+    if not zip_asset.get("url"):
+        return {"ok": False, "error": "release has no zip asset"}
+    fetch = downloader or _update_download
+    data = fetch(zip_asset["url"])
+    checks = chk.get("checksums") or {}
+    expected = None
+    if checks.get("url"):
+        try:
+            text = fetch(checks["url"]).decode("utf-8", "replace")
+            for line in text.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[-1].lstrip("*") == zip_asset["name"]:
+                    expected = parts[0].strip().lower()
+                    break
+        except Exception:
+            expected = None
+    if not expected:
+        return {"ok": False, "error": "checksums.txt is missing the zip hash"}
+    got = hashlib.sha256(data).hexdigest()
+    if got != expected:
+        return {"ok": False, "error": "checksum mismatch, nothing was replaced"}
+    target = _update_target()
+    replaced, backups = [], []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for name in UPDATE_FILES:
+            if name not in zf.namelist():
+                continue
+            dest = target / name
+            if not dest.is_file():
+                continue  # only refresh files this install already has
+            content = zf.read(name)
+            try:
+                (target / (name + ".bak")).write_bytes(dest.read_bytes())
+            except OSError:
+                pass
+            tmp = target / (name + ".new")
+            tmp.write_bytes(content)
+            os.replace(str(tmp), str(dest))
+            replaced.append(name)
+            backups.append(name + ".bak")
+    if not replaced:
+        return {"ok": False, "error": "release contains no installed files"}
+    globals()["UPDATE_APPLIED"] = True
+    return {"ok": True, "from": chk.get("current"), "to": chk.get("latest"),
+            "files": replaced, "backups": backups}
+
+
+def _spawn_restarted_server():
+    env = dict(os.environ)
+    tok = getattr(Handler, "auth_token", None)
+    if tok:
+        env["OCD_TOKEN"] = tok  # keep the tab that clicked Restart authorized
+    flags = 0
+    if os.name == "nt":
+        flags = (subprocess.DETACHED_PROCESS
+                 | subprocess.CREATE_NEW_PROCESS_GROUP
+                 | subprocess.CREATE_NO_WINDOW)
+    argv = [a for a in sys.argv[1:] if a != "--open"]
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve())] + argv,
+        env=env, cwd=str(Path.cwd()), creationflags=flags,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, close_fds=True)
 
 
 def _expected_host(server):
@@ -3297,6 +3462,67 @@ def _ag_step_time(meta):
     return None
 
 
+def _ag_fields(buf, max_field=40):
+    """Top-level protobuf fields -> [(number, value)]; bytes for
+    length-delimited values, int for varints. Malformed tails end the walk."""
+    out = []
+    i = 0
+    while i < len(buf or b""):
+        try:
+            tag, i = _ag_varint(buf, i)
+        except Exception:
+            break
+        num, wire = tag >> 3, tag & 7
+        if num > max_field:
+            break
+        if wire == 0:
+            val, i = _ag_varint(buf, i)
+            out.append((num, val))
+        elif wire == 2:
+            ln, i = _ag_varint(buf, i)
+            chunk = buf[i:i + ln]
+            if len(chunk) < ln:
+                break
+            out.append((num, chunk))
+            i += ln
+        elif wire == 1:
+            i += 8
+        elif wire == 5:
+            i += 4
+        else:
+            break
+    return out
+
+
+def _ag_step_usage(meta):
+    """Generation steps (type 15) carry a UsageMetadata protobuf in field 9:
+    1=model id, 2=uncached prompt, 3=output, 5=cached input, 9=thinking,
+    10=response text. Returns a dict, or None when the step has no usage."""
+    if not meta:
+        return None
+    try:
+        sub = None
+        for num, val in _ag_fields(meta):
+            if num == 9 and isinstance(val, bytes):
+                sub = val
+                break
+        if not sub:
+            return None
+        vals = {num: val for num, val in _ag_fields(sub) if isinstance(val, int)}
+        if not vals:
+            return None
+        return {
+            "model": vals.get(1, 0),
+            "uncached": vals.get(2, 0),
+            "output": vals.get(3, 0),
+            "cached": vals.get(5, 0),
+            "thinking": vals.get(9, 0),
+            "text": vals.get(10, 0),
+        }
+    except Exception:
+        return None
+
+
 def _ag_local_iso(s):
     """Time strings from the summaries db -> local naive ISO (or '')."""
     if not s:
@@ -3355,6 +3581,8 @@ def query_antigravity(root):
                         "last_user_input": _ag_local_iso(row[5]),
                         "workspace": _ag_workspace(row[6]),
                         "status": (row[7] or "").replace("CASCADE_RUN_STATUS_", ""),
+                        "tokens": 0,
+                        "requests": 0,
                     })
                 src_sum["conversations"] = len(conversations)
             finally:
@@ -3364,6 +3592,8 @@ def query_antigravity(root):
     per_day = {}
     type_counts = {}
     max_ts = 0
+    tok_totals = {"requests": 0, "uncached": 0, "cached": 0, "output": 0, "thinking": 0, "total": 0}
+    tok_by_conv = {}
     if src_conv["exists"]:
         for f in sorted(conv_dir.glob("*.db")):
             try:
@@ -3379,6 +3609,8 @@ def query_antigravity(root):
                 src_conv["steps"] += int(total or 0)
                 if len(rows) < int(total or 0):
                     src_conv["truncated"] = True
+                conv_tok = {"requests": 0, "uncached": 0, "cached": 0,
+                            "output": 0, "thinking": 0, "total": 0}
                 for stype, meta in rows:
                     t = _ag_step_time(meta)
                     if t is None:
@@ -3386,14 +3618,41 @@ def query_antigravity(root):
                     if t > max_ts:
                         max_ts = t
                     day = datetime.fromtimestamp(t).strftime("%Y-%m-%d")
-                    d = per_day.setdefault(day, {"steps": 0, "conversations": set()})
+                    d = per_day.setdefault(day, {"steps": 0, "conversations": set(),
+                                                 "requests": 0, "ti": 0, "ca": 0,
+                                                 "to": 0, "th": 0, "total": 0})
                     d["steps"] += 1
                     d["conversations"].add(f.stem)
                     if stype is not None:
                         type_counts[int(stype)] = type_counts.get(int(stype), 0) + 1
+                    if stype == 15:
+                        u = _ag_step_usage(meta)
+                        if u:
+                            turn = u["uncached"] + u["cached"] + u["output"]
+                            d["requests"] += 1
+                            d["ti"] += u["uncached"]
+                            d["ca"] += u["cached"]
+                            d["to"] += u["output"]
+                            d["th"] += u["thinking"]
+                            d["total"] += turn
+                            conv_tok["requests"] += 1
+                            conv_tok["uncached"] += u["uncached"]
+                            conv_tok["cached"] += u["cached"]
+                            conv_tok["output"] += u["output"]
+                            conv_tok["thinking"] += u["thinking"]
+                            conv_tok["total"] += turn
+                            tok_totals["requests"] += 1
+                            tok_totals["uncached"] += u["uncached"]
+                            tok_totals["cached"] += u["cached"]
+                            tok_totals["output"] += u["output"]
+                            tok_totals["thinking"] += u["thinking"]
+                            tok_totals["total"] += turn
+                tok_by_conv[f.stem] = conv_tok
             except Exception:
                 continue
-    days = [{"date": day, "steps": v["steps"], "conversations": len(v["conversations"])}
+    days = [{"date": day, "steps": v["steps"], "conversations": len(v["conversations"]),
+             "requests": v["requests"], "ti": v["ti"], "ca": v["ca"],
+             "to": v["to"], "th": v["th"], "total": v["total"]}
             for day, v in sorted(per_day.items())]
     latest = ""
     for c in conversations:
@@ -3403,6 +3662,11 @@ def query_antigravity(root):
         step_latest = datetime.fromtimestamp(max_ts).strftime("%Y-%m-%dT%H:%M:%S")
         if step_latest > latest:
             latest = step_latest
+    for c in conversations:
+        ct = tok_by_conv.get(c["id"])
+        if ct:
+            c["tokens"] = ct["total"]
+            c["requests"] = ct["requests"]
     rng = f"{days[0]['date']} → {days[-1]['date']}" if days else "no activity"
     step_types = [{"type": t, "count": c}
                   for t, c in sorted(type_counts.items(), key=lambda kv: -kv[1])]
@@ -3417,6 +3681,12 @@ def query_antigravity(root):
             "active_days": len(days),
             "latest": latest,
             "step_types": step_types,
+            "requests": tok_totals["requests"],
+            "tokens_total": tok_totals["total"],
+            "tokens_uncached": tok_totals["uncached"],
+            "tokens_cached": tok_totals["cached"],
+            "tokens_output": tok_totals["output"],
+            "tokens_thinking": tok_totals["thinking"],
         },
         "days": days,
         "conversations": conversations,
@@ -3796,12 +4066,14 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
         <button data-x="csvc">CSV <small>commit windows · not additive</small></button>
       </div></span>
     <button class="tbtn" id="refresh">⟳ Refresh</button>
+    <button class="tbtn" id="update" title="Check GitHub for a newer release">⬆ Update</button>
   </div>
 </div>
 <div class="wrap" id="auth-lock" hidden style="margin-top:18px"><div class="card"><b>Authorization required — this tab has no working token, so the page stays empty.</b> Every launcher start mints a fresh token: old tabs and plain <span class="mono">127.0.0.1:8765</span> bookmarks never work. Open the address printed by the launcher (it carries <span class="mono">#token=…</span> in the fragment), or click the desktop shortcut again and use the tab it opens.</div></div>
 
 <div class="wrap">
   <div class="source-tabs" role="tablist" aria-label="Data source">
+    <button class="stab" id="tab-all" role="tab" aria-selected="false" aria-controls="view-all">All<span class="cnt" id="tab-all-cnt"></span></button>
     <button class="stab active" id="tab-opencode" role="tab" aria-selected="true" aria-controls="view-opencode">OpenCode<span class="cnt" id="tab-opencode-cnt"></span></button>
     <button class="stab" id="tab-router" role="tab" aria-selected="false" aria-controls="view-router">Codex<span class="cnt" id="tab-router-cnt"></span></button>
     <button class="stab" id="tab-jev" role="tab" aria-selected="false" aria-controls="view-jev">Jev<span class="cnt" id="tab-jev-cnt"></span></button>
@@ -4105,7 +4377,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   <h2 class="sec">Activity per day <span class="hint">local timezone</span></h2>
   <div class="card">
     <div class="tbl-scroll"><table class="tbl" id="ag-days">
-      <thead><tr><th>Day</th><th class="num">Steps</th><th class="num">Conversations</th></tr></thead>
+      <thead><tr><th>Day</th><th class="num">Requests</th><th class="num">Steps</th><th class="num">Conversations</th><th class="num">Tokens</th></tr></thead>
       <tbody></tbody>
     </table></div>
   </div>
@@ -4113,7 +4385,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   <h2 class="sec">Conversations <span class="hint" id="ag-hint"></span></h2>
   <div class="card">
     <div class="tbl-scroll"><table class="tbl" id="ag-tbl">
-      <thead><tr><th>Conversation</th><th>Workspace</th><th class="num">Steps</th><th>Last activity</th><th>Status</th></tr></thead>
+      <thead><tr><th>Conversation</th><th>Workspace</th><th class="num">Steps</th><th class="num">Tokens</th><th>Last activity</th><th>Status</th></tr></thead>
       <tbody></tbody>
     </table></div>
   </div>
@@ -4121,6 +4393,26 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   <h2 class="sec">Data sources <span class="hint">local Antigravity data · read-only</span></h2>
   <div class="card"><div id="ag-sources" style="line-height:1.7"></div></div>
   </div><!-- /view-antigravity -->
+
+  <div id="view-all" role="tabpanel" aria-labelledby="tab-all" hidden>
+  <section class="hero" style="padding-top:26px">
+    <div class="eyebrow" id="al-range">ALL SOURCES</div>
+    <h1 id="al-headline">Loading combined usage…</h1>
+    <div class="pills" id="al-pills"></div>
+  </section>
+  <section class="summary" id="al-summary"></section>
+
+  <h2 class="sec">Per day <span class="hint">tokens from OpenCode, Codex, Jev and Antigravity · local timezone</span></h2>
+  <div class="card">
+    <div class="tbl-scroll"><table class="tbl" id="al-days">
+      <thead><tr><th>Day</th><th class="num">OpenCode</th><th class="num">Codex</th><th class="num">Jev</th><th class="num">Antigravity</th><th class="num">Total</th><th class="num">Codex reqs</th><th class="num">Jev judgments</th><th class="num">AG steps</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </div>
+
+  <h2 class="sec">Sources <span class="hint">each tab combined · read-only local data</span></h2>
+  <div class="card"><div id="al-sources" style="line-height:1.7"></div></div>
+  </div><!-- /view-all -->
 </div>
 
 <div class="overlay" id="overlay"><div class="modal" id="modal" role="dialog" aria-modal="true" aria-label="Session details"></div></div>
@@ -4641,22 +4933,61 @@ let AG=null;
 function renderAntigravity(){
   const d=AG;
   const cnt=$('tab-antigravity-cnt');
-  if(cnt)cnt.textContent=(d&&d.totals?FN(d.totals.steps)+' steps':'');
+  if(cnt)cnt.textContent=(d&&d.totals?(d.totals.tokens_total?FN(d.totals.tokens_total):FN(d.totals.steps)+' steps'):'');
   if(!d||!d.ok)return;
   const t=d.totals||{},days=d.days||[],convs=d.conversations||[];
   const range=$('ag-range');
   if(range)range.textContent='ANTIGRAVITY · '+String(d.range||'no activity').toUpperCase()+' · LOCAL TIME';
   const head=$('ag-headline');
-  if(head)head.innerHTML=BOLD(ESC(t.conversations+' conversations · '+F(t.steps)+' agent steps across '+F(t.active_days)+' active day'+(t.active_days===1?'':'s')+(t.latest?(' · latest '+isoLocal(t.latest)):'')+'.'));
-  $('ag-pills').innerHTML=[['Conversations',F(t.conversations)],['Steps',F(t.steps)],['Active days',F(t.active_days)],['Sources',(d.sources||[]).filter(s=>s.exists).length+'/'+(d.sources||[]).length]].map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+ESC(v)+'</b></span>').join('');
-  $('ag-summary').innerHTML=[['Conversations',F(t.conversations),'cascades'],['Steps',FN(t.steps),'agent steps'],['Active days',F(t.active_days),'with activity'],['Avg steps',t.active_days?FN(Math.round(t.steps/t.active_days)):'-','per active day']].map(([l,v,s])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+v+'</div><div class="ss">'+s+'</div></div>').join('');
+  if(head)head.innerHTML=BOLD(ESC(t.conversations+' conversations · '+FN(t.tokens_total)+' tokens across '+F(t.requests)+' requests · '+F(t.steps)+' agent steps · '+F(t.active_days)+' active day'+(t.active_days===1?'':'s')+(t.latest?(' · latest '+isoLocal(t.latest)):'')+'.'));
+  $('ag-pills').innerHTML=[['Tokens',FN(t.tokens_total)],['Requests',F(t.requests)],['Conversations',F(t.conversations)],['Steps',F(t.steps)],['Active days',F(t.active_days)],['Sources',(d.sources||[]).filter(s=>s.exists).length+'/'+(d.sources||[]).length]].map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+ESC(v)+'</b></span>').join('');
+  $('ag-summary').innerHTML=[['Tokens total',FN(t.tokens_total),'cached + uncached + output'],['Input cached',FN(t.tokens_cached),'reused context'],['Input uncached',FN(t.tokens_uncached),'new context'],['Output',FN(t.tokens_output),F(t.tokens_thinking)+' thinking'],['Requests',F(t.requests),'model generations']].map(([l,v,s])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+v+'</div><div class="ss">'+s+'</div></div>').join('');
   $('ag-types').innerHTML=(t.step_types||[]).map(x=>'<span class="chip">Type '+x.type+' ×'+F(x.count)+'</span>').join('')||'<span class="chip">no steps</span>';
   const dtb=document.querySelector('#ag-days tbody');
-  if(dtb)dtb.innerHTML=days.map(x=>'<tr><td>'+ESC(x.date)+'</td><td class="num">'+F(x.steps)+'</td><td class="num">'+F(x.conversations)+'</td></tr>').join('')||'<tr><td colspan="3"><div class="empty">No Antigravity activity found.</div></td></tr>';
+  if(dtb)dtb.innerHTML=days.map(x=>'<tr><td>'+ESC(x.date)+'</td><td class="num">'+F(x.requests)+'</td><td class="num">'+F(x.steps)+'</td><td class="num">'+F(x.conversations)+'</td><td class="num" style="font-weight:700">'+FN(x.total)+'</td></tr>').join('')||'<tr><td colspan="5"><div class="empty">No Antigravity activity found.</div></td></tr>';
   $('ag-hint').textContent='newest first · '+convs.length+' total';
   const tb=document.querySelector('#ag-tbl tbody');
-  if(tb)tb.innerHTML=convs.map(c=>{var title=c.title||c.preview||c.id;var prev=(c.title&&c.preview)?'<div class="sub">'+ESC(c.preview.slice(0,110))+'</div>':'';return '<tr><td><b>'+ESC(title.slice(0,90))+'</b>'+prev+'</td><td class="sub">'+ESC(c.workspace||'')+'</td><td class="num">'+F(c.steps)+'</td><td class="sub">'+ESC(isoLocal(c.last))+'</td><td><span class="badge">'+ESC(c.status||'')+'</span></td></tr>';}).join('')||'<tr><td colspan="5"><div class="empty">No conversations found.</div></td></tr>';
+  if(tb)tb.innerHTML=convs.map(c=>{var title=c.title||c.preview||c.id;var prev=(c.title&&c.preview)?'<div class="sub">'+ESC(c.preview.slice(0,110))+'</div>':'';return '<tr><td><b>'+ESC(title.slice(0,90))+'</b>'+prev+'</td><td class="sub">'+ESC(c.workspace||'')+'</td><td class="num">'+F(c.steps)+'</td><td class="num" style="font-weight:700">'+FN(c.tokens||0)+'</td><td class="sub">'+ESC(isoLocal(c.last))+'</td><td><span class="badge">'+ESC(c.status||'')+'</span></td></tr>';}).join('')||'<tr><td colspan="6"><div class="empty">No conversations found.</div></td></tr>';
   $('ag-sources').innerHTML=(d.sources||[]).map(s=>{var line=ESC(s.name)+' — <span class="mono" style="font-size:11.5px">'+ESC(s.path)+'</span> — ';if(!s.exists){line+='not found'+(s.error?(' ('+ESC(s.error)+')'):'');}else if(s.conversations!=null){line+=F(s.conversations)+' conversations';}else{line+=F(s.files)+' file'+(s.files===1?'':'s')+' · '+F(s.steps)+' steps';if(s.truncated)line+=' · newest steps sampled';}if(s.error&&s.exists)line+=' ('+ESC(s.error)+')';return '<div>'+line+'</div>';}).join('')||'<div class="empty">No Antigravity data found.</div>';
+}
+
+function combinedDays(){
+  const m={};
+  const e=d=>{if(!m[d])m[d]={date:d,oc:0,cx:0,jv:0,agt:0,total:0,req:0,judg:0,ag:0};return m[d];};
+  ((S&&S.days)||[]).forEach(x=>{e(x.date).oc+=dayTotal(x);});
+  ((R&&R.days)||[]).forEach(x=>{const y=e(x.date);y.cx+=rDayTokenTotal(x);y.req+=x.reqs||0;});
+  ((JV&&JV.days)||[]).forEach(x=>{const y=e(x.date);y.jv+=(x.input_tokens||0)+(x.output_tokens||0);y.judg+=x.proposals||0;});
+  ((AG&&AG.days)||[]).forEach(x=>{const y=e(x.date);y.ag+=x.steps||0;y.agt+=(x.total||0);});
+  return Object.keys(m).sort().map(k=>{const y=m[k];y.total=y.oc+y.cx+y.jv+y.agt;return y;});
+}
+function renderAllTab(){
+  const sT=(S&&S.totals)||null,rT=(R&&R.totals)||null,jT=(JV&&JV.totals)||null,aT=(AG&&AG.totals)||null;
+  if(!sT&&!rT&&!jT&&!aT)return;
+  const sTok=sT?(sT.tokens_total||0):0,rTok=rT?(rT.tokens_total||0):0;
+  const jTok=jT?((jT.input_tokens||0)+(jT.output_tokens||0)):0;
+  const aTok=aT?(aT.tokens_total||0):0;
+  const grand=sTok+rTok+jTok+aTok;
+  const cnt=$('tab-all-cnt');
+  if(cnt)cnt.textContent=grand?FN(grand):'';
+  $('al-range').textContent='ALL SOURCES · LOCAL TIME';
+  const bits=[];
+  if(sT)bits.push(F(sT.sessions||0)+' sessions');
+  if(rT)bits.push(F(rT.requests||0)+' '+((R&&R.req_word_short)||'requests'));
+  if(jT)bits.push(F(jT.proposals||0)+' judgments');
+  if(aT)bits.push(F(aT.requests||0)+' agent requests');
+  $('al-headline').innerHTML=BOLD(ESC(FN(grand)+' tokens across '+bits.join(' · ')+(bits.length?'':'.')));
+  $('al-pills').innerHTML=[['Tokens total',FN(grand)],['OpenCode',FN(sTok)],['Codex',FN(rTok)],['Jev',FN(jTok)],['Antigravity',FN(aTok)]].map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+v+'</b></span>').join('');
+  const cards=[['Tokens total',FN(grand),'OpenCode + Codex + Jev + Antigravity'],['OpenCode',FN(sTok),sT?F(sT.sessions||0)+' sessions':'not loaded'],['Codex',FN(rTok),rT?F(rT.requests||0)+' '+((R&&R.req_word_short)||'requests'):'not loaded'],['Jev',FN(jTok),jT?F(jT.proposals||0)+' judgments':'not loaded'],['Antigravity',FN(aTok),aT?(F(aT.requests||0)+' requests · '+F(aT.steps||0)+' steps'):'not loaded']];
+  $('al-summary').innerHTML=cards.map(([l,v,s])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+v+'</div><div class="ss">'+s+'</div></div>').join('');
+  const rows=combinedDays();
+  const tb=document.querySelector('#al-days tbody');
+  if(tb)tb.innerHTML=rows.map(x=>'<tr><td>'+ESC(x.date)+'</td><td class="num">'+FN(x.oc)+'</td><td class="num">'+FN(x.cx)+'</td><td class="num">'+FN(x.jv)+'</td><td class="num">'+FN(x.agt)+'</td><td class="num" style="font-weight:700">'+FN(x.total)+'</td><td class="num">'+F(x.req)+'</td><td class="num">'+F(x.judg)+'</td><td class="num">'+F(x.ag)+'</td></tr>').join('')||'<tr><td colspan="9"><div class="empty">No usage found.</div></td></tr>';
+  const line=(name,ok,text)=>'<div><b>'+ESC(name)+'</b> — '+(ok?text:'<span style="color:var(--subtle)">not loaded</span>')+'</div>';
+  $('al-sources').innerHTML=
+    line('OpenCode',sT,FN(sTok)+' tokens · '+F(sT?sT.sessions||0:0)+' sessions')+
+    line('Codex',rT,FN(rTok)+' tokens · '+F(rT?rT.requests||0:0)+' '+((R&&R.req_word_short)||'requests'))+
+    line('Jev',jT,FN(jTok)+' tokens · '+F(jT?jT.proposals||0:0)+' judgments')+
+    line('Antigravity',aT,FN(aTok)+' tokens · '+F(aT?aT.requests||0:0)+' requests · '+F(aT?aT.steps||0:0)+' steps');
 }
 
 const SUB_ACT={recent:'Recent activity',quiet:'No recent activity',stale:'Older activity',unknown:'Unknown'};
@@ -5250,21 +5581,24 @@ function renderRouterRequests(){
 }
 function setTab(name){
   TAB=name;
-  const oc=name==='opencode',rt=name==='router',jv=name==='jev',av=name==='antigravity';
+  const al=name==='all',oc=name==='opencode',rt=name==='router',jv=name==='jev',av=name==='antigravity';
+  $('tab-all').classList.toggle('active',al);
   $('tab-opencode').classList.toggle('active',oc);
   $('tab-router').classList.toggle('active',rt);
   $('tab-jev').classList.toggle('active',jv);
   $('tab-antigravity').classList.toggle('active',av);
+  $('tab-all').setAttribute('aria-selected',al);
   $('tab-opencode').setAttribute('aria-selected',oc);
   $('tab-router').setAttribute('aria-selected',rt);
   $('tab-jev').setAttribute('aria-selected',jv);
   $('tab-antigravity').setAttribute('aria-selected',av);
+  $('view-all').hidden=!al;
   $('view-opencode').hidden=!oc;
   $('view-router').hidden=!rt;
   $('view-jev').hidden=!jv;
   $('view-antigravity').hidden=!av;
   try{sessionStorage.setItem('ocd-tab',name);}catch(_){}
-  if(rt)renderRouter();else if(jv)renderJev();else if(av)renderAntigravity();else renderAll();
+  if(al)renderAllTab();else if(rt)renderRouter();else if(jv)renderJev();else if(av)renderAntigravity();else renderAll();
 }
 function sortH(e){const th=e.target.closest('th');if(!th)return;const k=th.dataset.k;if(!k)return;
   if(k===sortK)sortAsc=!sortAsc;else{sortK=k;sortAsc=false;}
@@ -5389,6 +5723,7 @@ $('r-c-apply').onclick=()=>{
 };
 $('r-split-btn').onclick=()=>{RSPLIT=!RSPLIT;$('r-split-btn').textContent='Split reasoning: '+(RSPLIT?'on':'off');$('r-split-btn').setAttribute('aria-pressed',RSPLIT);renderRouter();};
 $('r-share-btn').onclick=()=>{RSHARE=!RSHARE;$('r-share-btn').textContent='Share: '+(RSHARE?'on':'off');$('r-share-btn').setAttribute('aria-pressed',RSHARE);renderRouter();};
+$('tab-all').onclick=()=>setTab('all');
 $('tab-opencode').onclick=()=>setTab('opencode');
 $('tab-router').onclick=()=>setTab('router');
 $('tab-jev').onclick=()=>setTab('jev');
@@ -5426,6 +5761,12 @@ function exportData(kind){
   if(TAB==='antigravity'&&AG){
     const b=new Blob([kind==='json'?JSON.stringify(AG,null,2):['date,steps,conversations'].concat((AG.days||[]).map(d=>[d.date,d.steps,d.conversations].join(','))).join('\n')],{type:kind==='json'?'application/json':'text/csv'});
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=kind==='json'?'antigravity-usage.json':'antigravity-steps-days.csv';a.click();
+    return;
+  }
+  if(TAB==='all'){
+    const rows=combinedDays();
+    const b=new Blob([kind==='json'?JSON.stringify({opencode:S&&S.totals,codex:R&&R.totals,jev:JV&&JV.totals,antigravity:AG&&AG.totals,days:rows},null,2):['date','opencode_tokens','codex_tokens','jev_tokens','antigravity_tokens','total_tokens','codex_requests','jev_judgments','ag_steps'].concat(rows.map(d=>[d.date,Math.round(d.oc),Math.round(d.cx),Math.round(d.jv),Math.round(d.agt),Math.round(d.total),d.req,d.judg,d.ag].join(','))).join('\n')],{type:kind==='json'?'application/json':'text/csv'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=kind==='json'?'all-usage.json':'all-usage-days.csv';a.click();
     return;
   }
   if(kind==='json'){
@@ -5481,16 +5822,16 @@ document.addEventListener('keydown',e=>{
 let loading=false,pendingRefresh=false;
 const SEC=window.__ocdState={sections:{},cycle:{}};
 const SECTIONS=[
- {key:'stats',url:'/api/stats',validate:d=>d&&typeof d==='object'&&!d.error&&('totals' in d||'days' in d||'day_total' in d),render:d=>{S=d;renderAll();}},
- {key:'router',url:'/api/router',validate:d=>d&&typeof d==='object'&&!d.error&&('totals' in d||'days' in d||'day_total' in d),render:d=>{R=d;renderRouter();}},
+ {key:'stats',url:'/api/stats',validate:d=>d&&typeof d==='object'&&!d.error&&('totals' in d||'days' in d||'day_total' in d),render:d=>{S=d;renderAll();renderAllTab();}},
+ {key:'router',url:'/api/router',validate:d=>d&&typeof d==='object'&&!d.error&&('totals' in d||'days' in d||'day_total' in d),render:d=>{R=d;renderRouter();renderAllTab();}},
  {key:'agents',url:'/api/agents',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.child_runs),render:d=>{SA=d;renderSubagents();renderConfig();}},
  {key:'graph',url:'/api/graph',validate:d=>d&&typeof d==='object'&&!d.error&&d.nodes&&Array.isArray(d.roots),render:d=>{G=d;renderGraph();}},
  {key:'sessions',url:'/api/sessions',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.rows),render:d=>{SB=d;renderSSTable();}},
  {key:'projects',url:'/api/projects',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.rows),render:d=>{PJ=d;renderProjects();}},
  {key:'signals',url:'/api/signals',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.signals),render:d=>{SG=d;renderSignals();}},
  {key:'codex',url:'/api/codex',validate:d=>d&&d.ok===true&&Array.isArray(d.sessions),render:d=>{CX=d;renderCodex();}},
- {key:'jev',url:'/api/jev',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{JV=d;renderJev();}},
- {key:'antigravity',url:'/api/antigravity',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{AG=d;renderAntigravity();}}
+ {key:'jev',url:'/api/jev',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{JV=d;renderJev();renderAllTab();}},
+ {key:'antigravity',url:'/api/antigravity',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{AG=d;renderAntigravity();renderAllTab();}}
 ];
 function secUnavailable(key,msg){
   var tb=(key==='sessions')?document.querySelector('#sstbl tbody'):((key==='projects')?document.querySelector('#projtbl tbody'):null);
@@ -5499,7 +5840,7 @@ function secUnavailable(key,msg){
   if(key==='signals'){var s=document.getElementById('sig-chips');if(s)s.textContent='unavailable: '+msg;}
   if(key==='codex'){var c=document.querySelector('#cx-tbl tbody');if(c)c.innerHTML='<tr><td colspan="6">unavailable: '+ESC(msg)+'</td></tr>';}
   if(key==='jev'){var j=document.querySelector('#j-tbl tbody');if(j)j.innerHTML='<tr><td colspan="7">unavailable: '+ESC(msg)+'</td></tr>';}
-  if(key==='antigravity'){var a=document.querySelector('#ag-tbl tbody');if(a)a.innerHTML='<tr><td colspan="5">unavailable: '+ESC(msg)+'</td></tr>';}
+  if(key==='antigravity'){var a=document.querySelector('#ag-tbl tbody');if(a)a.innerHTML='<tr><td colspan="6">unavailable: '+ESC(msg)+'</td></tr>';}
 }
 function secStrip(){
   var sts=SEC.sections,parts=[];
@@ -5578,12 +5919,43 @@ const _inspState={sid:null,cursor:null,hasMore:false,pending:null};
 async function inspect(sid){var box=document.getElementById('insp');if(!box)return;box.hidden=false;var g=++_inspGen;if(_inspState.sid!==sid){_inspState.sid=sid;_inspState.cursor=null;_inspState.hasMore=false;_inspState.pending=null;}box.textContent='loading '+sid+' ...';try{var u='/api/inspect?id='+encodeURIComponent(sid)+'&_='+Date.now();if(_inspState.pending)u+='&cursor='+encodeURIComponent(_inspState.pending);var d=await fetchJson(u);if(g!==_inspGen)return;if(!d||!d.found){box.textContent='not found '+sid+' (click the row to retry)';return;}var H='<b>'+ESC(d.title||sid)+'</b> <span style="opacity:.65">'+ESC(d.agent||'')+' / '+ESC(d.model||'')+(d.provider?' ('+ESC(d.provider)+')':'')+' / '+ESC(d.directory||'')+'</span>';for(var i=0;i<d.messages.length;i++){var m=d.messages[i];H+='<div style="margin-top:8px"><b>'+ESC(m.role)+'</b> <span style="opacity:.65">'+ESC(m.agent||'')+' '+ESC(m.model||'')+' · '+m.parts.length+' parts'+(m.parts_omitted?(' (+'+m.parts_omitted+' omitted)'):'')+'</span>';if(m.summary)H+='<div>'+ESC(m.summary)+'</div>';for(var j=0;j<m.parts.length;j++){var p=m.parts[j];H+='<div style="margin-left:12px;opacity:.85">['+ESC(p.type)+'] '+p.size+' B'+(p.preview?(', '+ESC(String(p.preview).slice(0,300))+(p.truncated?' …[truncated]':'')+(p.raw_fragment?' [raw fragment]':'')):'')+'</div>';}H+='</div>';}H+='<div style="margin-top:10px;opacity:.75;font-size:11px">'+d.count+' messages shown'+((d.parts_truncated)?' · some parts truncated':'')+((d.response_truncated)?' · response shortened':'')+'</div>';if(d.has_more){H+='<div style="margin-top:6px"><button id="insp-more" class="tbtn">Load next</button></div>';}box.innerHTML=H;if(d.has_more){_inspState.cursor=d.cursor;_inspState.hasMore=true;var b=document.getElementById('insp-more');if(b)b.onclick=function(){_inspState.pending=_inspState.cursor;inspect(_inspState.sid);};}else{_inspState.hasMore=false;}box.scrollIntoView();}catch(e){if(e&&e.status===401){noteAuthFailure();box.textContent='Authorization required — reopen via the launcher link';return;}if(g!==_inspGen)return;box.textContent='ERR '+e.message+' (click the row to retry)';}}
 if(!window.__p1wire){window.__p1wire=1;document.addEventListener('click',function(e){var t=(e.target&&e.target.closest)?e.target.closest('[data-sid]'):null;if(t)inspect(t.getAttribute('data-sid'));});['ss-q','ss-agent','ss-model'].forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener('input',function(){if(window.__p1t)clearTimeout(window.__p1t);window.__p1t=setTimeout(fetchSessions,350);});});}
 $('refresh').onclick=()=>{if(AUTH_FAILED)return;load();};
+/* Update flow: click = check (one GitHub API call), second click = download
+   and install with checksum verification, third click = restart. Nothing
+   runs in the background and no network call happens at page load. */
+var _upState='idle',_upBusy=false;
+function setUpBtn(label,title){var b=$('update');if(!b)return;b.textContent=label;if(title)b.title=title;}
+async function postJson(url){try{var r=await authFetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});var t=await r.text();try{return JSON.parse(t);}catch(_){return {ok:false,error:'bad response'};}}catch(e){return {ok:false,error:String((e&&e.message)||e)};}}
+async function getJsonRaw(url){try{var r=await authFetch(url);var t=await r.text();try{return JSON.parse(t);}catch(_){return {ok:false,error:'bad response'};}}catch(e){return {ok:false,error:String((e&&e.message)||e)};}}
+$('update').onclick=async()=>{
+  if(_upBusy||AUTH_FAILED)return;
+  if(_upState==='applied'){
+    _upBusy=true;setUpBtn('⟳ Restarting');
+    var rr=await postJson('/api/restart');
+    if(!rr||!rr.ok){setUpBtn('⟳ Restart',(rr&&rr.error)||'restart failed');_upBusy=false;}
+    return;
+  }
+  if(_upState==='newer'){
+    _upBusy=true;setUpBtn('⬇ Installing');
+    var r=await postJson('/api/update/apply');
+    _upBusy=false;
+    if(r&&r.ok){_upState='applied';setUpBtn('⟳ Restart','updated to v'+(r.to||'')+'; click to restart');}
+    else{_upState='idle';setUpBtn('⬆ Update','update failed: '+((r&&r.error)||'error'));}
+    return;
+  }
+  _upBusy=true;setUpBtn('… Checking');
+  var d=await getJsonRaw('/api/update/check');
+  _upBusy=false;
+  if(!d||!d.ok){setUpBtn('⬆ Update','check failed: '+((d&&d.error)||'error'));return;}
+  if(d.newer){_upState='newer';setUpBtn('⬆ Update to v'+d.latest,'click to download, verify and install');return;}
+  setUpBtn('✔ Up to date','version '+(d.current||'?')+(d.latest?(' · latest v'+d.latest):' · no releases yet'));
+  setTimeout(function(){if(_upState==='idle')setUpBtn('⬆ Update','Check GitHub for a newer release');},3000);
+};
 $('search').addEventListener('input',renderSessions);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!AUTH_FAILED)load();});
 setInterval(()=>{if(!document.hidden&&!AUTH_FAILED)load();},((window.__ocdTimeouts&&window.__ocdTimeouts.refreshMs)||30000));
 try{const sv=sessionStorage.getItem('ocd-range');if(sv){RANGE=sv;document.querySelectorAll('.pbtn[data-r]').forEach(x=>x.classList.toggle('active',x.dataset.r===RANGE));if(RANGE==='custom'){const cc=JSON.parse(sessionStorage.getItem('ocd-custom')||'null');if(cc&&cc.from&&cc.to){CUSTOM=cc;const fi=document.getElementById('c-from'),ti=document.getElementById('c-to'),ap=document.getElementById('c-apply');if(fi)fi.value=cc.from;if(ti)ti.value=cc.to;if(ap)ap.classList.add('active');}}}}catch(_){}
 try{const rv=sessionStorage.getItem('ocd-rrange');if(rv){RRANGE=rv;document.querySelectorAll('.pbtn[data-rr]').forEach(x=>x.classList.toggle('active',x.dataset.rr===RRANGE));if(RRANGE==='custom'){const rc=JSON.parse(sessionStorage.getItem('ocd-rcustom')||'null');if(rc&&rc.from&&rc.to){RCUSTOM=rc;const fi=document.getElementById('r-c-from'),ti=document.getElementById('r-c-to'),ap=document.getElementById('r-c-apply');if(fi)fi.value=rc.from;if(ti)ti.value=rc.to;if(ap)ap.classList.add('active');}}}}catch(_){}
-try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'||saved==='jev'||saved==='antigravity'){setTab(saved);}}catch(_){}
+try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'||saved==='jev'||saved==='antigravity'||saved==='all'){setTab(saved);}}catch(_){}
 if(S){renderAll();}
 if(R){renderRouter();}
 if(AUTH_TOKEN){load();}else{showAuthLock(true);}
@@ -5848,6 +6220,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 body = json.dumps({"ok": False, "error": str(e)[:200]}).encode("utf-8")
             self._send(200, "application/json", body)
+        elif path.startswith("/api/update/check"):
+            self._send(200, "application/json",
+                       json.dumps(update_check()).encode("utf-8"))
         elif path.startswith("/api/agents"):
             try:
                 con = connect(self.db_path)
@@ -5950,6 +6325,30 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/plain", b"bye")
             if not others:
                 self._arm_close()
+        elif path == "/api/update/apply":
+            try:
+                result = update_apply()
+            except Exception as e:
+                result = {"ok": False, "error": str(e)[:200]}
+            self._send(200, "application/json", json.dumps(result).encode("utf-8"))
+        elif path == "/api/restart":
+            if not globals().get("UPDATE_APPLIED"):
+                self._send(200, "application/json",
+                           json.dumps({"ok": False,
+                                       "error": "no update applied in this process"}).encode("utf-8"))
+                return
+            globals()["RESTART_REQUESTED"] = True
+            self._send(200, "application/json", b'{"ok": true, "restarting": true}')
+            _srv = self.server
+
+            def _shutdown_later():
+                time.sleep(0.4)  # let the response flush before the port frees
+                try:
+                    _srv.shutdown()
+                except Exception:
+                    pass
+
+            threading.Thread(target=_shutdown_later, daemon=True).start()
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -6019,6 +6418,8 @@ def main():
     parser.add_argument("--agents-dir", action="append", default=[], metavar="DIR",
                         help="extra dir with agent .md files (repeatable)")
     parser.add_argument("--open", action="store_true", help="open the dashboard in a browser on start")
+    parser.add_argument("--version", action="version",
+                        version="little-better-dashboard " + DASHBOARD_VERSION)
     parser.add_argument("--router-events", default=str(ROUTER_EVENTS_DEFAULT),
                         help="path to Codex Router usage-events.jsonl")
     parser.add_argument("--router-limits", default=str(ROUTER_LIMITS_DEFAULT),
@@ -6055,7 +6456,11 @@ def main():
         raise SystemExit(2)
     Handler.server = server
     try:
-        server.auth_token = _new_token()
+        # A restarted instance reuses the token handed over by the update
+        # flow, so the tab that clicked Restart stays authorized; normal
+        # starts still mint a fresh token.
+        _env_token = os.environ.get("OCD_TOKEN") or ""
+        server.auth_token = _env_token if _TOKEN_RE.fullmatch(_env_token) else _new_token()
     except Exception:
         pass
     try:
@@ -6090,6 +6495,12 @@ def main():
         print("\nStopped.")
     finally:
         server.server_close()
+    if globals().get("RESTART_REQUESTED"):
+        try:
+            _spawn_restarted_server()
+            print("Restarted with the updated files.")
+        except Exception as e:
+            print(f"warning: could not restart automatically: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

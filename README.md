@@ -14,15 +14,19 @@ It is a single Python file with zero dependencies. Download it, double-click the
 
 The OpenCode and Codex tabs share one set of time controls: **All time, Last 24h, Today, Yesterday, 7 days, 30 days, 90 days, 1 year and a custom from-to range**. Choose a period once and the charts, tables, key metrics, model lists and exports all follow it, and the choice is remembered across refreshes. The summary strip and the all-time records keep their fixed view on purpose, so there is always a stable baseline to compare against.
 
+**All tab** is the combined view and the one that opens first: one headline with total tokens, sessions, requests, judgments and agent steps, a per-day table that lines up OpenCode, Codex, Jev and Antigravity tokens next to Codex request counts, Jev judgments and Antigravity steps, and a source block that shows what loaded. The token total adds up OpenCode, Codex, Jev and Antigravity.
+
 **OpenCode tab** covers sessions, turns, tokens and cost, with tokens per day, tokens by model with provider labels, an activity heatmap and streaks, a session browser that includes search and a click-to-open message inspector, plus projects, warning signals, child and related sessions with **session activity** (recent, no recent activity, older or unknown, based on session updates, not execution status; auto-refreshed), agent configuration tiles, and a team graph of parent and child sessions.
 
 **Codex tab** gives the same treatment to your local Codex sessions, with request, token and model stats synthesized from your rollout files alongside a browsable session table.
 
 **Jev tab** reads the local Jev audit logs (JevDesk and JevDeskEasy installs): proposal counts by verdict, input and output tokens, average latency, sessions, and a table of the newest judgments with the audit source for each. Sessions created in mock mode are excluded from the totals and reported separately.
 
-**Antigravity tab** reads the local Antigravity client data (agent conversations): conversation count, agent steps per day and by step type, and each conversation's workspace, status and last activity. Antigravity does not store token counts locally, so the tab reports steps, not tokens.
+**Antigravity tab** reads the local Antigravity client data (agent conversations): token usage across conversations and per day (cached and uncached input, output including thinking), request counts, agent steps by type, and each conversation's workspace, status and last activity.
 
 There is more under the hood: a split reasoning view, a share view, and one-click JSON or CSV export of exactly what you are looking at.
+
+The topbar has an **Update** button next to Refresh. One click checks the latest GitHub release, the second downloads and installs it in place after a sha256 check, and the third restarts the dashboard on the same port and token. It is the only feature that talks to the network, it runs only when you click it, and nothing is sent anywhere.
 
 Everything is read from files already on your machine. The server binds to `127.0.0.1` only and additionally requires a per-instance bearer token plus strict Host/Origin checks; the bind alone is not claimed to prevent all exfiltration.
 
@@ -34,10 +38,18 @@ Privacy: The dashboard may read and display message content from your local Open
 - Recency labels (recent, no recent activity, older, unknown) come from session update recency (a session-history signal, not execution status).
 - The Codex request list is a bounded **tail** of the newest events with an explicit scanned-vs-total indicator; the synthesized history that feeds the Codex charts keeps the full history (no silent cut-off).
 - The Jev tab is a usage view over local hash-chained audit logs, not an audit tool: it does not verify the hash chain, excludes `mock: true` sessions from totals, and reads a bounded tail of each log.
-- The Antigravity tab reads the local client databases read-only (conversation summaries plus per-conversation step metadata; newest steps are sampled); the client stores no local token or credit data, so none is shown.
+- The Antigravity tab reads the local client databases read-only (conversation summaries plus per-conversation step and generation metadata; newest steps are sampled) and decodes token usage from that local metadata; credit or quota data lives in the cloud and is not shown.
 - "Usage in the 24h before each commit" windows are global and **non-additive**: windows may overlap and may include other projects, so commit rows must not be summed.
 - The Codex synthesis **cache** index lives in `.cache/codex_index.json` (a derived **checkpoint** tied to the published generation): it is **safe to delete** at any time and is never a source of truth; a failed checkpoint write never fails a publish.
 - The server binds to 127.0.0.1 only, requires the per-instance token from the `#token=` fragment, and does not support **tunnels** or public exposure.
+
+## Install
+
+Download the newest release zip from the [Releases page](https://github.com/zsoXi/little-better-dashboard/releases), unzip it anywhere and run `install.bat`. It copies the app to `%LOCALAPPDATA%\Programs\LittleBetterDashboard`, creates Desktop and Start Menu shortcuts with the mascot icon, and needs no admin rights. Run it again any time to update the installed copy; `uninstall.bat` removes it cleanly.
+
+Working with an AI agent? Point it at [AGENT_INSTALL.md](AGENT_INSTALL.md), which has the exact commands for installing from the release zip or from a git clone.
+
+Prefer it portable? Skip the installer and double-click `start-dashboard.bat` straight from the unzipped folder.
 
 ## Quick start (one click)
 
@@ -71,6 +83,7 @@ python opencode_dashboard.py [db] [--port PORT] [--agents-dir DIR] [--open] [--q
 | `--jev-logs FILE` | local JevDesk installs | Jev `audit.jsonl` to read (repeatable) |
 | `--antigravity-dir DIR` | `~/.gemini/antigravity` | Antigravity data dir to read |
 | `--idle-timeout SECONDS` | off | Shut down after N seconds with no requests |
+| `--version` | | Print the version and exit |
 
 If the database is missing, you get a plain message asking you to run OpenCode at least once so it can be created.
 
@@ -81,7 +94,7 @@ If the database is missing, you get a plain message asking you to run OpenCode a
 | OpenCode `opencode.db` (SQLite, read-only) | Everything on the OpenCode tab |
 | `~/.codex/sessions/**/*.jsonl` (local rollout files) | Codex tab. On the first run a small `codex_router_events.jsonl` index is built next to the script. It regenerates automatically and is safe to delete |
 | `%LOCALAPPDATA%\JevDeskEasy\runtime\audit.jsonl` and `%LOCALAPPDATA%\JevDesk\audit.jsonl` (read-only) | Jev tab. One JSON line per session, proposal or stop event; missing files are reported as not found |
-| `%USERPROFILE%\.gemini\antigravity` (read-only) | Antigravity tab. `conversation_summaries.db` plus `conversations/*.db` step metadata; missing files are reported as not found |
+| `%USERPROFILE%\.gemini\antigravity` (read-only) | Antigravity tab. `conversation_summaries.db` plus `conversations/*.db` step and generation metadata; missing files are reported as not found |
 | `.opencode/agent/*.md` and `~/.config/opencode/agent/*.md` in the current project | Agent configuration tiles |
 
 It makes no network calls, collects no telemetry and needs no accounts.

@@ -3297,6 +3297,67 @@ def _ag_step_time(meta):
     return None
 
 
+def _ag_fields(buf, max_field=40):
+    """Top-level protobuf fields -> [(number, value)]; bytes for
+    length-delimited values, int for varints. Malformed tails end the walk."""
+    out = []
+    i = 0
+    while i < len(buf or b""):
+        try:
+            tag, i = _ag_varint(buf, i)
+        except Exception:
+            break
+        num, wire = tag >> 3, tag & 7
+        if num > max_field:
+            break
+        if wire == 0:
+            val, i = _ag_varint(buf, i)
+            out.append((num, val))
+        elif wire == 2:
+            ln, i = _ag_varint(buf, i)
+            chunk = buf[i:i + ln]
+            if len(chunk) < ln:
+                break
+            out.append((num, chunk))
+            i += ln
+        elif wire == 1:
+            i += 8
+        elif wire == 5:
+            i += 4
+        else:
+            break
+    return out
+
+
+def _ag_step_usage(meta):
+    """Generation steps (type 15) carry a UsageMetadata protobuf in field 9:
+    1=model id, 2=uncached prompt, 3=output, 5=cached input, 9=thinking,
+    10=response text. Returns a dict, or None when the step has no usage."""
+    if not meta:
+        return None
+    try:
+        sub = None
+        for num, val in _ag_fields(meta):
+            if num == 9 and isinstance(val, bytes):
+                sub = val
+                break
+        if not sub:
+            return None
+        vals = {num: val for num, val in _ag_fields(sub) if isinstance(val, int)}
+        if not vals:
+            return None
+        return {
+            "model": vals.get(1, 0),
+            "uncached": vals.get(2, 0),
+            "output": vals.get(3, 0),
+            "cached": vals.get(5, 0),
+            "thinking": vals.get(9, 0),
+            "text": vals.get(10, 0),
+        }
+    except Exception:
+        return None
+
+
 def _ag_local_iso(s):
     """Time strings from the summaries db -> local naive ISO (or '')."""
     if not s:
@@ -3355,6 +3416,8 @@ def query_antigravity(root):
                         "last_user_input": _ag_local_iso(row[5]),
                         "workspace": _ag_workspace(row[6]),
                         "status": (row[7] or "").replace("CASCADE_RUN_STATUS_", ""),
+                        "tokens": 0,
+                        "requests": 0,
                     })
                 src_sum["conversations"] = len(conversations)
             finally:
@@ -3364,6 +3427,8 @@ def query_antigravity(root):
     per_day = {}
     type_counts = {}
     max_ts = 0
+    tok_totals = {"requests": 0, "uncached": 0, "cached": 0, "output": 0, "thinking": 0, "total": 0}
+    tok_by_conv = {}
     if src_conv["exists"]:
         for f in sorted(conv_dir.glob("*.db")):
             try:
@@ -3379,6 +3444,8 @@ def query_antigravity(root):
                 src_conv["steps"] += int(total or 0)
                 if len(rows) < int(total or 0):
                     src_conv["truncated"] = True
+                conv_tok = {"requests": 0, "uncached": 0, "cached": 0,
+                            "output": 0, "thinking": 0, "total": 0}
                 for stype, meta in rows:
                     t = _ag_step_time(meta)
                     if t is None:
@@ -3386,14 +3453,41 @@ def query_antigravity(root):
                     if t > max_ts:
                         max_ts = t
                     day = datetime.fromtimestamp(t).strftime("%Y-%m-%d")
-                    d = per_day.setdefault(day, {"steps": 0, "conversations": set()})
+                    d = per_day.setdefault(day, {"steps": 0, "conversations": set(),
+                                                 "requests": 0, "ti": 0, "ca": 0,
+                                                 "to": 0, "th": 0, "total": 0})
                     d["steps"] += 1
                     d["conversations"].add(f.stem)
                     if stype is not None:
                         type_counts[int(stype)] = type_counts.get(int(stype), 0) + 1
+                    if stype == 15:
+                        u = _ag_step_usage(meta)
+                        if u:
+                            turn = u["uncached"] + u["cached"] + u["output"]
+                            d["requests"] += 1
+                            d["ti"] += u["uncached"]
+                            d["ca"] += u["cached"]
+                            d["to"] += u["output"]
+                            d["th"] += u["thinking"]
+                            d["total"] += turn
+                            conv_tok["requests"] += 1
+                            conv_tok["uncached"] += u["uncached"]
+                            conv_tok["cached"] += u["cached"]
+                            conv_tok["output"] += u["output"]
+                            conv_tok["thinking"] += u["thinking"]
+                            conv_tok["total"] += turn
+                            tok_totals["requests"] += 1
+                            tok_totals["uncached"] += u["uncached"]
+                            tok_totals["cached"] += u["cached"]
+                            tok_totals["output"] += u["output"]
+                            tok_totals["thinking"] += u["thinking"]
+                            tok_totals["total"] += turn
+                tok_by_conv[f.stem] = conv_tok
             except Exception:
                 continue
-    days = [{"date": day, "steps": v["steps"], "conversations": len(v["conversations"])}
+    days = [{"date": day, "steps": v["steps"], "conversations": len(v["conversations"]),
+             "requests": v["requests"], "ti": v["ti"], "ca": v["ca"],
+             "to": v["to"], "th": v["th"], "total": v["total"]}
             for day, v in sorted(per_day.items())]
     latest = ""
     for c in conversations:
@@ -3403,6 +3497,11 @@ def query_antigravity(root):
         step_latest = datetime.fromtimestamp(max_ts).strftime("%Y-%m-%dT%H:%M:%S")
         if step_latest > latest:
             latest = step_latest
+    for c in conversations:
+        ct = tok_by_conv.get(c["id"])
+        if ct:
+            c["tokens"] = ct["total"]
+            c["requests"] = ct["requests"]
     rng = f"{days[0]['date']} → {days[-1]['date']}" if days else "no activity"
     step_types = [{"type": t, "count": c}
                   for t, c in sorted(type_counts.items(), key=lambda kv: -kv[1])]
@@ -3417,6 +3516,12 @@ def query_antigravity(root):
             "active_days": len(days),
             "latest": latest,
             "step_types": step_types,
+            "requests": tok_totals["requests"],
+            "tokens_total": tok_totals["total"],
+            "tokens_uncached": tok_totals["uncached"],
+            "tokens_cached": tok_totals["cached"],
+            "tokens_output": tok_totals["output"],
+            "tokens_thinking": tok_totals["thinking"],
         },
         "days": days,
         "conversations": conversations,
@@ -3802,6 +3907,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 
 <div class="wrap">
   <div class="source-tabs" role="tablist" aria-label="Data source">
+    <button class="stab" id="tab-all" role="tab" aria-selected="false" aria-controls="view-all">All<span class="cnt" id="tab-all-cnt"></span></button>
     <button class="stab active" id="tab-opencode" role="tab" aria-selected="true" aria-controls="view-opencode">OpenCode<span class="cnt" id="tab-opencode-cnt"></span></button>
     <button class="stab" id="tab-router" role="tab" aria-selected="false" aria-controls="view-router">Codex<span class="cnt" id="tab-router-cnt"></span></button>
     <button class="stab" id="tab-jev" role="tab" aria-selected="false" aria-controls="view-jev">Jev<span class="cnt" id="tab-jev-cnt"></span></button>
@@ -4105,7 +4211,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   <h2 class="sec">Activity per day <span class="hint">local timezone</span></h2>
   <div class="card">
     <div class="tbl-scroll"><table class="tbl" id="ag-days">
-      <thead><tr><th>Day</th><th class="num">Steps</th><th class="num">Conversations</th></tr></thead>
+      <thead><tr><th>Day</th><th class="num">Requests</th><th class="num">Steps</th><th class="num">Conversations</th><th class="num">Tokens</th></tr></thead>
       <tbody></tbody>
     </table></div>
   </div>
@@ -4113,7 +4219,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   <h2 class="sec">Conversations <span class="hint" id="ag-hint"></span></h2>
   <div class="card">
     <div class="tbl-scroll"><table class="tbl" id="ag-tbl">
-      <thead><tr><th>Conversation</th><th>Workspace</th><th class="num">Steps</th><th>Last activity</th><th>Status</th></tr></thead>
+      <thead><tr><th>Conversation</th><th>Workspace</th><th class="num">Steps</th><th class="num">Tokens</th><th>Last activity</th><th>Status</th></tr></thead>
       <tbody></tbody>
     </table></div>
   </div>
@@ -4121,6 +4227,26 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   <h2 class="sec">Data sources <span class="hint">local Antigravity data · read-only</span></h2>
   <div class="card"><div id="ag-sources" style="line-height:1.7"></div></div>
   </div><!-- /view-antigravity -->
+
+  <div id="view-all" role="tabpanel" aria-labelledby="tab-all" hidden>
+  <section class="hero" style="padding-top:26px">
+    <div class="eyebrow" id="al-range">ALL SOURCES</div>
+    <h1 id="al-headline">Loading combined usage…</h1>
+    <div class="pills" id="al-pills"></div>
+  </section>
+  <section class="summary" id="al-summary"></section>
+
+  <h2 class="sec">Per day <span class="hint">tokens from OpenCode, Codex, Jev and Antigravity · local timezone</span></h2>
+  <div class="card">
+    <div class="tbl-scroll"><table class="tbl" id="al-days">
+      <thead><tr><th>Day</th><th class="num">OpenCode</th><th class="num">Codex</th><th class="num">Jev</th><th class="num">Antigravity</th><th class="num">Total</th><th class="num">Codex reqs</th><th class="num">Jev judgments</th><th class="num">AG steps</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </div>
+
+  <h2 class="sec">Sources <span class="hint">each tab combined · read-only local data</span></h2>
+  <div class="card"><div id="al-sources" style="line-height:1.7"></div></div>
+  </div><!-- /view-all -->
 </div>
 
 <div class="overlay" id="overlay"><div class="modal" id="modal" role="dialog" aria-modal="true" aria-label="Session details"></div></div>
@@ -4641,22 +4767,61 @@ let AG=null;
 function renderAntigravity(){
   const d=AG;
   const cnt=$('tab-antigravity-cnt');
-  if(cnt)cnt.textContent=(d&&d.totals?FN(d.totals.steps)+' steps':'');
+  if(cnt)cnt.textContent=(d&&d.totals?(d.totals.tokens_total?FN(d.totals.tokens_total):FN(d.totals.steps)+' steps'):'');
   if(!d||!d.ok)return;
   const t=d.totals||{},days=d.days||[],convs=d.conversations||[];
   const range=$('ag-range');
   if(range)range.textContent='ANTIGRAVITY · '+String(d.range||'no activity').toUpperCase()+' · LOCAL TIME';
   const head=$('ag-headline');
-  if(head)head.innerHTML=BOLD(ESC(t.conversations+' conversations · '+F(t.steps)+' agent steps across '+F(t.active_days)+' active day'+(t.active_days===1?'':'s')+(t.latest?(' · latest '+isoLocal(t.latest)):'')+'.'));
-  $('ag-pills').innerHTML=[['Conversations',F(t.conversations)],['Steps',F(t.steps)],['Active days',F(t.active_days)],['Sources',(d.sources||[]).filter(s=>s.exists).length+'/'+(d.sources||[]).length]].map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+ESC(v)+'</b></span>').join('');
-  $('ag-summary').innerHTML=[['Conversations',F(t.conversations),'cascades'],['Steps',FN(t.steps),'agent steps'],['Active days',F(t.active_days),'with activity'],['Avg steps',t.active_days?FN(Math.round(t.steps/t.active_days)):'-','per active day']].map(([l,v,s])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+v+'</div><div class="ss">'+s+'</div></div>').join('');
+  if(head)head.innerHTML=BOLD(ESC(t.conversations+' conversations · '+FN(t.tokens_total)+' tokens across '+F(t.requests)+' requests · '+F(t.steps)+' agent steps · '+F(t.active_days)+' active day'+(t.active_days===1?'':'s')+(t.latest?(' · latest '+isoLocal(t.latest)):'')+'.'));
+  $('ag-pills').innerHTML=[['Tokens',FN(t.tokens_total)],['Requests',F(t.requests)],['Conversations',F(t.conversations)],['Steps',F(t.steps)],['Active days',F(t.active_days)],['Sources',(d.sources||[]).filter(s=>s.exists).length+'/'+(d.sources||[]).length]].map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+ESC(v)+'</b></span>').join('');
+  $('ag-summary').innerHTML=[['Tokens total',FN(t.tokens_total),'cached + uncached + output'],['Input cached',FN(t.tokens_cached),'reused context'],['Input uncached',FN(t.tokens_uncached),'new context'],['Output',FN(t.tokens_output),F(t.tokens_thinking)+' thinking'],['Requests',F(t.requests),'model generations']].map(([l,v,s])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+v+'</div><div class="ss">'+s+'</div></div>').join('');
   $('ag-types').innerHTML=(t.step_types||[]).map(x=>'<span class="chip">Type '+x.type+' ×'+F(x.count)+'</span>').join('')||'<span class="chip">no steps</span>';
   const dtb=document.querySelector('#ag-days tbody');
-  if(dtb)dtb.innerHTML=days.map(x=>'<tr><td>'+ESC(x.date)+'</td><td class="num">'+F(x.steps)+'</td><td class="num">'+F(x.conversations)+'</td></tr>').join('')||'<tr><td colspan="3"><div class="empty">No Antigravity activity found.</div></td></tr>';
+  if(dtb)dtb.innerHTML=days.map(x=>'<tr><td>'+ESC(x.date)+'</td><td class="num">'+F(x.requests)+'</td><td class="num">'+F(x.steps)+'</td><td class="num">'+F(x.conversations)+'</td><td class="num" style="font-weight:700">'+FN(x.total)+'</td></tr>').join('')||'<tr><td colspan="5"><div class="empty">No Antigravity activity found.</div></td></tr>';
   $('ag-hint').textContent='newest first · '+convs.length+' total';
   const tb=document.querySelector('#ag-tbl tbody');
-  if(tb)tb.innerHTML=convs.map(c=>{var title=c.title||c.preview||c.id;var prev=(c.title&&c.preview)?'<div class="sub">'+ESC(c.preview.slice(0,110))+'</div>':'';return '<tr><td><b>'+ESC(title.slice(0,90))+'</b>'+prev+'</td><td class="sub">'+ESC(c.workspace||'')+'</td><td class="num">'+F(c.steps)+'</td><td class="sub">'+ESC(isoLocal(c.last))+'</td><td><span class="badge">'+ESC(c.status||'')+'</span></td></tr>';}).join('')||'<tr><td colspan="5"><div class="empty">No conversations found.</div></td></tr>';
+  if(tb)tb.innerHTML=convs.map(c=>{var title=c.title||c.preview||c.id;var prev=(c.title&&c.preview)?'<div class="sub">'+ESC(c.preview.slice(0,110))+'</div>':'';return '<tr><td><b>'+ESC(title.slice(0,90))+'</b>'+prev+'</td><td class="sub">'+ESC(c.workspace||'')+'</td><td class="num">'+F(c.steps)+'</td><td class="num" style="font-weight:700">'+FN(c.tokens||0)+'</td><td class="sub">'+ESC(isoLocal(c.last))+'</td><td><span class="badge">'+ESC(c.status||'')+'</span></td></tr>';}).join('')||'<tr><td colspan="6"><div class="empty">No conversations found.</div></td></tr>';
   $('ag-sources').innerHTML=(d.sources||[]).map(s=>{var line=ESC(s.name)+' — <span class="mono" style="font-size:11.5px">'+ESC(s.path)+'</span> — ';if(!s.exists){line+='not found'+(s.error?(' ('+ESC(s.error)+')'):'');}else if(s.conversations!=null){line+=F(s.conversations)+' conversations';}else{line+=F(s.files)+' file'+(s.files===1?'':'s')+' · '+F(s.steps)+' steps';if(s.truncated)line+=' · newest steps sampled';}if(s.error&&s.exists)line+=' ('+ESC(s.error)+')';return '<div>'+line+'</div>';}).join('')||'<div class="empty">No Antigravity data found.</div>';
+}
+
+function combinedDays(){
+  const m={};
+  const e=d=>{if(!m[d])m[d]={date:d,oc:0,cx:0,jv:0,agt:0,total:0,req:0,judg:0,ag:0};return m[d];};
+  ((S&&S.days)||[]).forEach(x=>{e(x.date).oc+=dayTotal(x);});
+  ((R&&R.days)||[]).forEach(x=>{const y=e(x.date);y.cx+=rDayTokenTotal(x);y.req+=x.reqs||0;});
+  ((JV&&JV.days)||[]).forEach(x=>{const y=e(x.date);y.jv+=(x.input_tokens||0)+(x.output_tokens||0);y.judg+=x.proposals||0;});
+  ((AG&&AG.days)||[]).forEach(x=>{const y=e(x.date);y.ag+=x.steps||0;y.agt+=(x.total||0);});
+  return Object.keys(m).sort().map(k=>{const y=m[k];y.total=y.oc+y.cx+y.jv+y.agt;return y;});
+}
+function renderAllTab(){
+  const sT=(S&&S.totals)||null,rT=(R&&R.totals)||null,jT=(JV&&JV.totals)||null,aT=(AG&&AG.totals)||null;
+  if(!sT&&!rT&&!jT&&!aT)return;
+  const sTok=sT?(sT.tokens_total||0):0,rTok=rT?(rT.tokens_total||0):0;
+  const jTok=jT?((jT.input_tokens||0)+(jT.output_tokens||0)):0;
+  const aTok=aT?(aT.tokens_total||0):0;
+  const grand=sTok+rTok+jTok+aTok;
+  const cnt=$('tab-all-cnt');
+  if(cnt)cnt.textContent=grand?FN(grand):'';
+  $('al-range').textContent='ALL SOURCES · LOCAL TIME';
+  const bits=[];
+  if(sT)bits.push(F(sT.sessions||0)+' sessions');
+  if(rT)bits.push(F(rT.requests||0)+' '+((R&&R.req_word_short)||'requests'));
+  if(jT)bits.push(F(jT.proposals||0)+' judgments');
+  if(aT)bits.push(F(aT.requests||0)+' agent requests');
+  $('al-headline').innerHTML=BOLD(ESC(FN(grand)+' tokens across '+bits.join(' · ')+(bits.length?'':'.')));
+  $('al-pills').innerHTML=[['Tokens total',FN(grand)],['OpenCode',FN(sTok)],['Codex',FN(rTok)],['Jev',FN(jTok)],['Antigravity',FN(aTok)]].map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+v+'</b></span>').join('');
+  const cards=[['Tokens total',FN(grand),'OpenCode + Codex + Jev + Antigravity'],['OpenCode',FN(sTok),sT?F(sT.sessions||0)+' sessions':'not loaded'],['Codex',FN(rTok),rT?F(rT.requests||0)+' '+((R&&R.req_word_short)||'requests'):'not loaded'],['Jev',FN(jTok),jT?F(jT.proposals||0)+' judgments':'not loaded'],['Antigravity',FN(aTok),aT?(F(aT.requests||0)+' requests · '+F(aT.steps||0)+' steps'):'not loaded']];
+  $('al-summary').innerHTML=cards.map(([l,v,s])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+v+'</div><div class="ss">'+s+'</div></div>').join('');
+  const rows=combinedDays();
+  const tb=document.querySelector('#al-days tbody');
+  if(tb)tb.innerHTML=rows.map(x=>'<tr><td>'+ESC(x.date)+'</td><td class="num">'+FN(x.oc)+'</td><td class="num">'+FN(x.cx)+'</td><td class="num">'+FN(x.jv)+'</td><td class="num">'+FN(x.agt)+'</td><td class="num" style="font-weight:700">'+FN(x.total)+'</td><td class="num">'+F(x.req)+'</td><td class="num">'+F(x.judg)+'</td><td class="num">'+F(x.ag)+'</td></tr>').join('')||'<tr><td colspan="9"><div class="empty">No usage found.</div></td></tr>';
+  const line=(name,ok,text)=>'<div><b>'+ESC(name)+'</b> — '+(ok?text:'<span style="color:var(--subtle)">not loaded</span>')+'</div>';
+  $('al-sources').innerHTML=
+    line('OpenCode',sT,FN(sTok)+' tokens · '+F(sT?sT.sessions||0:0)+' sessions')+
+    line('Codex',rT,FN(rTok)+' tokens · '+F(rT?rT.requests||0:0)+' '+((R&&R.req_word_short)||'requests'))+
+    line('Jev',jT,FN(jTok)+' tokens · '+F(jT?jT.proposals||0:0)+' judgments')+
+    line('Antigravity',aT,FN(aTok)+' tokens · '+F(aT?aT.requests||0:0)+' requests · '+F(aT?aT.steps||0:0)+' steps');
 }
 
 const SUB_ACT={recent:'Recent activity',quiet:'No recent activity',stale:'Older activity',unknown:'Unknown'};
@@ -5250,21 +5415,24 @@ function renderRouterRequests(){
 }
 function setTab(name){
   TAB=name;
-  const oc=name==='opencode',rt=name==='router',jv=name==='jev',av=name==='antigravity';
+  const al=name==='all',oc=name==='opencode',rt=name==='router',jv=name==='jev',av=name==='antigravity';
+  $('tab-all').classList.toggle('active',al);
   $('tab-opencode').classList.toggle('active',oc);
   $('tab-router').classList.toggle('active',rt);
   $('tab-jev').classList.toggle('active',jv);
   $('tab-antigravity').classList.toggle('active',av);
+  $('tab-all').setAttribute('aria-selected',al);
   $('tab-opencode').setAttribute('aria-selected',oc);
   $('tab-router').setAttribute('aria-selected',rt);
   $('tab-jev').setAttribute('aria-selected',jv);
   $('tab-antigravity').setAttribute('aria-selected',av);
+  $('view-all').hidden=!al;
   $('view-opencode').hidden=!oc;
   $('view-router').hidden=!rt;
   $('view-jev').hidden=!jv;
   $('view-antigravity').hidden=!av;
   try{sessionStorage.setItem('ocd-tab',name);}catch(_){}
-  if(rt)renderRouter();else if(jv)renderJev();else if(av)renderAntigravity();else renderAll();
+  if(al)renderAllTab();else if(rt)renderRouter();else if(jv)renderJev();else if(av)renderAntigravity();else renderAll();
 }
 function sortH(e){const th=e.target.closest('th');if(!th)return;const k=th.dataset.k;if(!k)return;
   if(k===sortK)sortAsc=!sortAsc;else{sortK=k;sortAsc=false;}
@@ -5389,6 +5557,7 @@ $('r-c-apply').onclick=()=>{
 };
 $('r-split-btn').onclick=()=>{RSPLIT=!RSPLIT;$('r-split-btn').textContent='Split reasoning: '+(RSPLIT?'on':'off');$('r-split-btn').setAttribute('aria-pressed',RSPLIT);renderRouter();};
 $('r-share-btn').onclick=()=>{RSHARE=!RSHARE;$('r-share-btn').textContent='Share: '+(RSHARE?'on':'off');$('r-share-btn').setAttribute('aria-pressed',RSHARE);renderRouter();};
+$('tab-all').onclick=()=>setTab('all');
 $('tab-opencode').onclick=()=>setTab('opencode');
 $('tab-router').onclick=()=>setTab('router');
 $('tab-jev').onclick=()=>setTab('jev');
@@ -5426,6 +5595,12 @@ function exportData(kind){
   if(TAB==='antigravity'&&AG){
     const b=new Blob([kind==='json'?JSON.stringify(AG,null,2):['date,steps,conversations'].concat((AG.days||[]).map(d=>[d.date,d.steps,d.conversations].join(','))).join('\n')],{type:kind==='json'?'application/json':'text/csv'});
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=kind==='json'?'antigravity-usage.json':'antigravity-steps-days.csv';a.click();
+    return;
+  }
+  if(TAB==='all'){
+    const rows=combinedDays();
+    const b=new Blob([kind==='json'?JSON.stringify({opencode:S&&S.totals,codex:R&&R.totals,jev:JV&&JV.totals,antigravity:AG&&AG.totals,days:rows},null,2):['date','opencode_tokens','codex_tokens','jev_tokens','antigravity_tokens','total_tokens','codex_requests','jev_judgments','ag_steps'].concat(rows.map(d=>[d.date,Math.round(d.oc),Math.round(d.cx),Math.round(d.jv),Math.round(d.agt),Math.round(d.total),d.req,d.judg,d.ag].join(','))).join('\n')],{type:kind==='json'?'application/json':'text/csv'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=kind==='json'?'all-usage.json':'all-usage-days.csv';a.click();
     return;
   }
   if(kind==='json'){
@@ -5481,16 +5656,16 @@ document.addEventListener('keydown',e=>{
 let loading=false,pendingRefresh=false;
 const SEC=window.__ocdState={sections:{},cycle:{}};
 const SECTIONS=[
- {key:'stats',url:'/api/stats',validate:d=>d&&typeof d==='object'&&!d.error&&('totals' in d||'days' in d||'day_total' in d),render:d=>{S=d;renderAll();}},
- {key:'router',url:'/api/router',validate:d=>d&&typeof d==='object'&&!d.error&&('totals' in d||'days' in d||'day_total' in d),render:d=>{R=d;renderRouter();}},
+ {key:'stats',url:'/api/stats',validate:d=>d&&typeof d==='object'&&!d.error&&('totals' in d||'days' in d||'day_total' in d),render:d=>{S=d;renderAll();renderAllTab();}},
+ {key:'router',url:'/api/router',validate:d=>d&&typeof d==='object'&&!d.error&&('totals' in d||'days' in d||'day_total' in d),render:d=>{R=d;renderRouter();renderAllTab();}},
  {key:'agents',url:'/api/agents',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.child_runs),render:d=>{SA=d;renderSubagents();renderConfig();}},
  {key:'graph',url:'/api/graph',validate:d=>d&&typeof d==='object'&&!d.error&&d.nodes&&Array.isArray(d.roots),render:d=>{G=d;renderGraph();}},
  {key:'sessions',url:'/api/sessions',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.rows),render:d=>{SB=d;renderSSTable();}},
  {key:'projects',url:'/api/projects',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.rows),render:d=>{PJ=d;renderProjects();}},
  {key:'signals',url:'/api/signals',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.signals),render:d=>{SG=d;renderSignals();}},
  {key:'codex',url:'/api/codex',validate:d=>d&&d.ok===true&&Array.isArray(d.sessions),render:d=>{CX=d;renderCodex();}},
- {key:'jev',url:'/api/jev',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{JV=d;renderJev();}},
- {key:'antigravity',url:'/api/antigravity',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{AG=d;renderAntigravity();}}
+ {key:'jev',url:'/api/jev',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{JV=d;renderJev();renderAllTab();}},
+ {key:'antigravity',url:'/api/antigravity',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{AG=d;renderAntigravity();renderAllTab();}}
 ];
 function secUnavailable(key,msg){
   var tb=(key==='sessions')?document.querySelector('#sstbl tbody'):((key==='projects')?document.querySelector('#projtbl tbody'):null);
@@ -5499,7 +5674,7 @@ function secUnavailable(key,msg){
   if(key==='signals'){var s=document.getElementById('sig-chips');if(s)s.textContent='unavailable: '+msg;}
   if(key==='codex'){var c=document.querySelector('#cx-tbl tbody');if(c)c.innerHTML='<tr><td colspan="6">unavailable: '+ESC(msg)+'</td></tr>';}
   if(key==='jev'){var j=document.querySelector('#j-tbl tbody');if(j)j.innerHTML='<tr><td colspan="7">unavailable: '+ESC(msg)+'</td></tr>';}
-  if(key==='antigravity'){var a=document.querySelector('#ag-tbl tbody');if(a)a.innerHTML='<tr><td colspan="5">unavailable: '+ESC(msg)+'</td></tr>';}
+  if(key==='antigravity'){var a=document.querySelector('#ag-tbl tbody');if(a)a.innerHTML='<tr><td colspan="6">unavailable: '+ESC(msg)+'</td></tr>';}
 }
 function secStrip(){
   var sts=SEC.sections,parts=[];
@@ -5583,7 +5758,7 @@ document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!AUTH_FAI
 setInterval(()=>{if(!document.hidden&&!AUTH_FAILED)load();},((window.__ocdTimeouts&&window.__ocdTimeouts.refreshMs)||30000));
 try{const sv=sessionStorage.getItem('ocd-range');if(sv){RANGE=sv;document.querySelectorAll('.pbtn[data-r]').forEach(x=>x.classList.toggle('active',x.dataset.r===RANGE));if(RANGE==='custom'){const cc=JSON.parse(sessionStorage.getItem('ocd-custom')||'null');if(cc&&cc.from&&cc.to){CUSTOM=cc;const fi=document.getElementById('c-from'),ti=document.getElementById('c-to'),ap=document.getElementById('c-apply');if(fi)fi.value=cc.from;if(ti)ti.value=cc.to;if(ap)ap.classList.add('active');}}}}catch(_){}
 try{const rv=sessionStorage.getItem('ocd-rrange');if(rv){RRANGE=rv;document.querySelectorAll('.pbtn[data-rr]').forEach(x=>x.classList.toggle('active',x.dataset.rr===RRANGE));if(RRANGE==='custom'){const rc=JSON.parse(sessionStorage.getItem('ocd-rcustom')||'null');if(rc&&rc.from&&rc.to){RCUSTOM=rc;const fi=document.getElementById('r-c-from'),ti=document.getElementById('r-c-to'),ap=document.getElementById('r-c-apply');if(fi)fi.value=rc.from;if(ti)ti.value=rc.to;if(ap)ap.classList.add('active');}}}}catch(_){}
-try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'||saved==='jev'||saved==='antigravity'){setTab(saved);}}catch(_){}
+try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'||saved==='jev'||saved==='antigravity'||saved==='all'){setTab(saved);}}catch(_){}
 if(S){renderAll();}
 if(R){renderRouter();}
 if(AUTH_TOKEN){load();}else{showAuthLock(true);}

@@ -40,6 +40,18 @@ def _step_meta(seconds):
     return b"\x0a" + _varint(len(sub)) + sub
 
 
+def _usage_sub(model, uncached, output, cached, thinking, text):
+    return (b"\x08" + _varint(model) + b"\x10" + _varint(uncached)
+            + b"\x18" + _varint(output) + b"\x28" + _varint(cached)
+            + b"\x48" + _varint(thinking) + b"\x50" + _varint(text))
+
+
+def _step_meta_usage(seconds, usage):
+    sub = b"\x08" + _varint(seconds)
+    return (b"\x0a" + _varint(len(sub)) + sub
+            + b"\x4a" + _varint(len(usage)) + usage)
+
+
 class TestAgHelpers(unittest.TestCase):
     def test_varint(self):
         d = _load_dashboard()
@@ -66,6 +78,16 @@ class TestAgHelpers(unittest.TestCase):
         self.assertIsNone(d._ag_step_time(_step_meta(5)))
         sub = b"\x08" + b"\xff" * 12
         self.assertIsNone(d._ag_step_time(b"\x0a" + _varint(len(sub)) + sub))
+
+    def test_step_usage(self):
+        d = _load_dashboard()
+        meta = _step_meta_usage(1789771939, _usage_sub(1319, 100, 10, 200, 4, 6))
+        self.assertEqual(d._ag_step_usage(meta), {
+            "model": 1319, "uncached": 100, "output": 10,
+            "cached": 200, "thinking": 4, "text": 6})
+        self.assertIsNone(d._ag_step_usage(_step_meta(1789771939)))
+        self.assertIsNone(d._ag_step_usage(b"garbage"))
+        self.assertIsNone(d._ag_step_usage(None))
 
     def test_workspace(self):
         d = _load_dashboard()
@@ -107,10 +129,12 @@ class TestQueryAntigravity(unittest.TestCase):
             "INSERT INTO conversation_summaries VALUES (?,?,?,?,?,?,?,?)", rows)
         con.commit()
         con.close()
+        u1 = _usage_sub(1319, 100, 10, 200, 4, 6)
+        u2 = _usage_sub(1319, 50, 5, 25, 2, 3)
         self._make_steps("c-1", [
-            (0, 15, _step_meta(self.t1)),
+            (0, 15, _step_meta_usage(self.t1, u1)),
             (1, 132, _step_meta(self.t1 + 60)),
-            (2, 15, _step_meta(self.t1 + 120)),
+            (2, 15, _step_meta_usage(self.t1 + 120, u2)),
         ])
         self._make_steps("c-2", [(0, 14, b"garbage")])
 
@@ -146,6 +170,24 @@ class TestQueryAntigravity(unittest.TestCase):
                for x in out["days"]}
         self.assertEqual(got, {day1: {"steps": 3, "conversations": 1}})
         self.assertEqual(out["range"], day1 + " \u2192 " + day1)
+
+    def test_token_totals(self):
+        d = _load_dashboard()
+        out = d.query_antigravity(self.root)
+        t = out["totals"]
+        self.assertEqual(t["requests"], 2)
+        self.assertEqual(t["tokens_total"], 390)
+        self.assertEqual(t["tokens_uncached"], 150)
+        self.assertEqual(t["tokens_cached"], 225)
+        self.assertEqual(t["tokens_output"], 15)
+        self.assertEqual(t["tokens_thinking"], 6)
+        day1 = datetime.fromtimestamp(self.t1).strftime("%Y-%m-%d")
+        day = next(x for x in out["days"] if x["date"] == day1)
+        self.assertEqual(day["requests"], 2)
+        self.assertEqual(day["total"], 390)
+        c1 = out["conversations"][0]
+        self.assertEqual(c1["tokens"], 390)
+        self.assertEqual(c1["requests"], 2)
 
     def test_conversations_parsed(self):
         d = _load_dashboard()

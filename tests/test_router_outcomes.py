@@ -439,7 +439,8 @@ class TestF4UnknownOutcomes(unittest.TestCase):
         self.assertIn("Unknown", src)
         # Export header includes unknown (no silent ok/err-only CSV).
         exp_idx = src.index("function exportData")
-        self.assertIn("unknown", src[exp_idx:exp_idx + 2000].lower())
+        exp_end = src.index("\nfunction ", exp_idx + 10)
+        self.assertIn("unknown", src[exp_idx:exp_end].lower())
         # Requests table never prints raw null/200 as confirmed success.
         self.assertIn("Outcome unavailable", src[src.index("function renderRouterRequests") - 2000:
                                                  src.index("function renderRouterRequests") + 4000]

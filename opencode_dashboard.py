@@ -14,7 +14,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import pathname2url
 
 _HOME = Path.home()  # cross-platform: %USERPROFILE% on Windows, $HOME elsewhere
@@ -37,6 +37,8 @@ _ROUTER_READ_BLOCK = 65536  # F6b: byte block size for tail reads/counts
 _ROUTER_COUNT_CACHE = {}  # F6b: str(path) -> line count + fingerprint
 JEV_READ_CAP = 2 * 1024 * 1024  # bounded tail read per Jev audit log
 JEV_MAX_EVENTS = 5000  # most-recent Jev audit events kept per source
+AG_DIR_DEFAULT = _HOME / ".gemini" / "antigravity"  # local Antigravity client data
+AG_MAX_STEPS = 20000  # newest steps sampled per Antigravity conversation db
 SYNTH_SCHEMA = 3  # bump to force codex-synth rebuild when the writer changes
 
 # What-if paid pricing per 1M tokens (input, output) for known *-free models.
@@ -1692,6 +1694,36 @@ def query_stats(con):
         models[m]["cache"] += r["ca"]
         models[m]["cost"] += r["cost"]
 
+    # Per-day per-model rollup so the UI can scope the model list to a period
+    # or a single day without re-reading sessions.
+    model_days = defaultdict(lambda: {"n": 0, "ti": 0, "to": 0, "tr": 0, "cache": 0, "cost": 0})
+    for r in con.execute(
+        """
+        SELECT date(time_created/1000,'unixepoch','localtime') AS d, model, COUNT(*) AS n,
+                COALESCE(SUM(tokens_input),0) AS ti,
+                COALESCE(SUM(tokens_output),0) AS to_,
+                COALESCE(SUM(tokens_reasoning),0) AS tr,
+                COALESCE(SUM(tokens_cache_read),0)+COALESCE(SUM(tokens_cache_write),0) AS ca,
+                COALESCE(SUM(cost),0) AS cost
+        FROM session GROUP BY d, model
+        """
+    ):
+        if not r["d"]:
+            continue
+        m = model_key(r["model"])
+        md = model_days[(r["d"], m)]
+        md["n"] += r["n"]
+        md["ti"] += r["ti"]
+        md["to"] += r["to_"]
+        md["tr"] += r["tr"]
+        md["cache"] += r["ca"]
+        md["cost"] += r["cost"]
+    model_day_rows = sorted(
+        ([d, m, v["n"], v["ti"], v["to"], v["tr"], v["cache"], v["cost"]]
+         for (d, m), v in model_days.items()),
+        key=lambda row: row[0],
+    )
+
     # Most recent sessions only, the payload stays bounded and the detail
     # endpoint fetches prompts on demand.
     sessions = []
@@ -1952,6 +1984,7 @@ def query_stats(con):
         "tools": [],
         "agents": sorted([[k, v["n"], v["toks"]] for k, v in agents.items()], key=lambda kv: -kv[1]),
         "models": model_rows,
+        "model_days": model_day_rows,
         "projects": sorted([[k, v["n"], v["toks"]] for k, v in projects.items()], key=lambda kv: -kv[2]),
         "files": file_rows,
         "subsystems": subsys_rows,
@@ -2012,6 +2045,7 @@ def blank_stats(source="local", source_label="Local OpenCode data", error=None, 
         "tools": [],
         "agents": [],
         "models": [],
+        "model_days": [],
         "projects": [],
         "files": [],
         "subsystems": [],
@@ -2706,6 +2740,7 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
     ok_times.sort()
 
     by_model = {}
+    model_days = {}
     for e in events:
         m = by_model.setdefault(
             e["model"],
@@ -2731,6 +2766,29 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
             m["reasoning"] += e.get("reasoning", 0)
             m["what_if"] += e["what_if"]
         m["ms"] += e["ms"]
+        if e["date"]:
+            md = model_days.setdefault(
+                (e["date"], e["model"]),
+                {"provider": e["provider"], "reqs": 0, "ok": 0, "err": 0,
+                 "unknown": 0, "measured": 0, "ti": 0.0, "to": 0.0,
+                 "cache": 0.0, "tr": 0.0, "total": 0.0, "what_if": 0.0,
+                 "free": e["free"]},
+            )
+            md["reqs"] += 1
+            if e["outcome"] == "success":
+                md["ok"] += 1
+            elif e["outcome"] == "error":
+                md["err"] += 1
+            else:
+                md["unknown"] += 1
+            if e.get("usage_known"):
+                md["measured"] += 1
+                md["ti"] += e["ti"]
+                md["to"] += e["to"]
+                md["cache"] += e["cache"]
+                md["tr"] += e.get("reasoning", 0)
+                md["total"] += e["total"]
+                md["what_if"] += e["what_if"]
 
     model_rows = []
     for name, m in by_model.items():
@@ -2743,6 +2801,13 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
              m["unknown"]]
         )
     model_rows.sort(key=lambda r: -r[2])
+
+    model_day_rows = [
+        [d, name, v["reqs"], v["ok"], v["err"], v["unknown"], v["measured"],
+         v["ti"], v["to"], v["cache"], v["tr"], v["total"], v["what_if"],
+         v["free"], v["provider"]]
+        for (d, name), v in sorted(model_days.items())
+    ]
 
     by_provider = defaultdict(lambda: {"reqs": 0, "toks": 0.0})
     for e in events:
@@ -2906,6 +2971,7 @@ def query_router_stats(events_path, limits_path=None, worktrees=None, full_scan=
         "latency_na": full_scan,
         "totals": totals,
         "models": model_rows,
+        "model_days": model_day_rows,
         "providers": sorted([[k, v["reqs"], round(v["toks"], 1)] for k, v in by_provider.items()],
                             key=lambda kv: -kv[2]),
         "days": day_entries,
@@ -2960,6 +3026,7 @@ def blank_router_stats(error=None):
                    "avg_duration_min": 0, "avg_tokens_per_session": 0,
                    "avg_tokens_per_metered": 0},
         "models": [],
+        "model_days": [],
         "providers": [],
         "days": [],
         "hours": [0] * 24,
@@ -3180,6 +3247,180 @@ def query_jev(paths):
     return {"ok": True, "generated_at": datetime.now().replace(microsecond=0).isoformat(),
             "range": rng, "sources": sources, "totals": totals,
             "days": day_rows, "recent": recent}
+
+
+# --- Antigravity (local agent client) --------------------------------------
+# Read-only view over the local Antigravity data dir: conversation summaries
+# plus per-step timestamps from each conversation db. The client keeps no
+# token usage locally, so the tab reports agent steps per local day.
+
+def _ag_ro_connect(path):
+    return sqlite3.connect(f"file:{pathname2url(str(path))}?mode=ro", uri=True, timeout=3)
+
+
+def _ag_varint(buf, i):
+    shift = 0
+    val = 0
+    while i < len(buf):
+        b = buf[i]
+        i += 1
+        val |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return val, i
+        shift += 7
+        if shift > 63:
+            break
+    raise ValueError("bad varint")
+
+
+def _ag_step_time(meta):
+    """Step metadata is a protobuf; field 1 is a submessage whose field 1 is
+    the step timestamp in epoch seconds. Returns None when it does not fit."""
+    if not meta:
+        return None
+    try:
+        tag, i = _ag_varint(meta, 0)
+        if (tag >> 3) != 1 or (tag & 7) != 2:
+            return None
+        ln, i = _ag_varint(meta, i)
+        sub = meta[i:i + ln]
+        if len(sub) < ln:
+            return None
+        t2, j = _ag_varint(sub, 0)
+        if (t2 >> 3) != 1 or (t2 & 7) != 0:
+            return None
+        val, _ = _ag_varint(sub, j)
+        if 1_000_000_000 <= val <= 4_100_000_000:
+            return val
+    except Exception:
+        return None
+    return None
+
+
+def _ag_local_iso(s):
+    """Time strings from the summaries db -> local naive ISO (or '')."""
+    if not s:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(s))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return str(s)[:19].replace(" ", "T")
+
+
+def _ag_workspace(uris):
+    """workspace_uris column (JSON list or plain string) -> display path."""
+    raw = uris or ""
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            raw = parsed[0] if parsed else ""
+    except Exception:
+        pass
+    s = str(raw)
+    if s.startswith("file:///"):
+        s = unquote(s[len("file:///"):])
+        if len(s) > 2 and s[1] == ":":
+            s = s[0].lower() + s[1:]
+    return s
+
+
+def query_antigravity(root):
+    root = Path(root)
+    summaries_db = root / "conversation_summaries.db"
+    conv_dir = root / "conversations"
+    conversations = []
+    src_sum = {"name": "conversation_summaries.db", "path": str(summaries_db),
+               "exists": summaries_db.exists(), "conversations": 0, "error": None}
+    src_conv = {"name": "conversations", "path": str(conv_dir),
+                "exists": conv_dir.exists(), "files": 0, "steps": 0,
+                "truncated": False, "error": None}
+    if src_sum["exists"]:
+        try:
+            con = _ag_ro_connect(summaries_db)
+            try:
+                cur = con.execute(
+                    "SELECT conversation_id, title, preview, step_count, "
+                    "last_modified_time, last_user_input_time, workspace_uris, status "
+                    "FROM conversation_summaries ORDER BY last_modified_time DESC")
+                for row in cur.fetchall():
+                    conversations.append({
+                        "id": row[0] or "",
+                        "title": row[1] or "",
+                        "preview": (row[2] or "")[:220],
+                        "steps": int(row[3] or 0),
+                        "last": _ag_local_iso(row[4]),
+                        "last_user_input": _ag_local_iso(row[5]),
+                        "workspace": _ag_workspace(row[6]),
+                        "status": (row[7] or "").replace("CASCADE_RUN_STATUS_", ""),
+                    })
+                src_sum["conversations"] = len(conversations)
+            finally:
+                con.close()
+        except Exception as e:
+            src_sum["error"] = str(e)[:200]
+    per_day = {}
+    type_counts = {}
+    max_ts = 0
+    if src_conv["exists"]:
+        for f in sorted(conv_dir.glob("*.db")):
+            try:
+                con = _ag_ro_connect(f)
+                try:
+                    total = con.execute("SELECT COUNT(*) FROM steps").fetchone()[0]
+                    rows = con.execute(
+                        "SELECT step_type, metadata FROM steps "
+                        "ORDER BY idx DESC LIMIT ?", (AG_MAX_STEPS,)).fetchall()
+                finally:
+                    con.close()
+                src_conv["files"] += 1
+                src_conv["steps"] += int(total or 0)
+                if len(rows) < int(total or 0):
+                    src_conv["truncated"] = True
+                for stype, meta in rows:
+                    t = _ag_step_time(meta)
+                    if t is None:
+                        continue
+                    if t > max_ts:
+                        max_ts = t
+                    day = datetime.fromtimestamp(t).strftime("%Y-%m-%d")
+                    d = per_day.setdefault(day, {"steps": 0, "conversations": set()})
+                    d["steps"] += 1
+                    d["conversations"].add(f.stem)
+                    if stype is not None:
+                        type_counts[int(stype)] = type_counts.get(int(stype), 0) + 1
+            except Exception:
+                continue
+    days = [{"date": day, "steps": v["steps"], "conversations": len(v["conversations"])}
+            for day, v in sorted(per_day.items())]
+    latest = ""
+    for c in conversations:
+        if c["last"] and c["last"] > latest:
+            latest = c["last"]
+    if max_ts:
+        step_latest = datetime.fromtimestamp(max_ts).strftime("%Y-%m-%dT%H:%M:%S")
+        if step_latest > latest:
+            latest = step_latest
+    rng = f"{days[0]['date']} → {days[-1]['date']}" if days else "no activity"
+    step_types = [{"type": t, "count": c}
+                  for t, c in sorted(type_counts.items(), key=lambda kv: -kv[1])]
+    return {
+        "ok": True,
+        "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+        "range": rng,
+        "sources": [src_sum, src_conv],
+        "totals": {
+            "conversations": len(conversations),
+            "steps": src_conv["steps"],
+            "active_days": len(days),
+            "latest": latest,
+            "step_types": step_types,
+        },
+        "days": days,
+        "conversations": conversations,
+    }
 
 
 def session_prompts(con, session_id):
@@ -3564,6 +3805,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <button class="stab active" id="tab-opencode" role="tab" aria-selected="true" aria-controls="view-opencode">OpenCode<span class="cnt" id="tab-opencode-cnt"></span></button>
     <button class="stab" id="tab-router" role="tab" aria-selected="false" aria-controls="view-router">Codex<span class="cnt" id="tab-router-cnt"></span></button>
     <button class="stab" id="tab-jev" role="tab" aria-selected="false" aria-controls="view-jev">Jev<span class="cnt" id="tab-jev-cnt"></span></button>
+    <button class="stab" id="tab-antigravity" role="tab" aria-selected="false" aria-controls="view-antigravity">Antigravity<span class="cnt" id="tab-antigravity-cnt"></span></button>
   </div>
   <div id="view-opencode" role="tabpanel" aria-labelledby="tab-opencode">
   <section class="hero">
@@ -3581,6 +3823,11 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       <button class="pbtn" data-r="30">30 days</button>
       <button class="pbtn" data-r="90">90 days</button>
       <button class="pbtn" data-r="365">1 year</button>
+      <span class="pl" style="margin-left:14px">Custom</span>
+      <input type="date" class="pbtn" id="c-from" aria-label="Custom range start">
+      <span class="pl">→</span>
+      <input type="date" class="pbtn" id="c-to" aria-label="Custom range end">
+      <button class="pbtn" id="c-apply">Apply</button>
       <span class="pl" style="margin-left:14px">View</span>
       <button class="pbtn" id="split-btn" aria-pressed="false" title="Split Output into Output + Reasoning">Split reasoning: off</button>
       <button class="pbtn" id="share-btn" aria-pressed="false" title="Show 100% share instead of absolute tokens">Share: off</button>
@@ -3717,6 +3964,11 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
       <button class="pbtn" data-rr="30">30 days</button>
       <button class="pbtn" data-rr="90">90 days</button>
       <button class="pbtn" data-rr="365">1 year</button>
+      <span class="pl" style="margin-left:14px">Custom</span>
+      <input type="date" class="pbtn" id="r-c-from" aria-label="Codex custom range start">
+      <span class="pl">→</span>
+      <input type="date" class="pbtn" id="r-c-to" aria-label="Codex custom range end">
+      <button class="pbtn" id="r-c-apply">Apply</button>
       <span class="pl" style="margin-left:14px">View</span>
       <button class="pbtn" id="r-split-btn" aria-pressed="false" title="Split Output into Output + Reasoning">Split reasoning: off</button>
       <button class="pbtn" id="r-share-btn" aria-pressed="false" title="Show 100% share instead of absolute tokens">Share: off</button>
@@ -3839,6 +4091,36 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   <h2 class="sec">Audit sources <span class="hint">hash-chained JSONL, never uploaded</span></h2>
   <div class="card"><div id="j-sources" style="line-height:1.7"></div></div>
   </div><!-- /view-jev -->
+  <div id="view-antigravity" role="tabpanel" aria-labelledby="tab-antigravity" hidden>
+  <section class="hero" style="padding-top:26px">
+    <div class="eyebrow" id="ag-range">ANTIGRAVITY</div>
+    <h1 id="ag-headline">Loading Antigravity activity…</h1>
+    <div class="pills" id="ag-pills"></div>
+  </section>
+  <section class="summary" id="ag-summary"></section>
+
+  <h2 class="sec">Steps by type <span class="hint">reported by the local Antigravity client</span></h2>
+  <div class="card"><div class="chips" id="ag-types"></div></div>
+
+  <h2 class="sec">Activity per day <span class="hint">local timezone</span></h2>
+  <div class="card">
+    <div class="tbl-scroll"><table class="tbl" id="ag-days">
+      <thead><tr><th>Day</th><th class="num">Steps</th><th class="num">Conversations</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </div>
+
+  <h2 class="sec">Conversations <span class="hint" id="ag-hint"></span></h2>
+  <div class="card">
+    <div class="tbl-scroll"><table class="tbl" id="ag-tbl">
+      <thead><tr><th>Conversation</th><th>Workspace</th><th class="num">Steps</th><th>Last activity</th><th>Status</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </div>
+
+  <h2 class="sec">Data sources <span class="hint">local Antigravity data · read-only</span></h2>
+  <div class="card"><div id="ag-sources" style="line-height:1.7"></div></div>
+  </div><!-- /view-antigravity -->
 </div>
 
 <div class="overlay" id="overlay"><div class="modal" id="modal" role="dialog" aria-modal="true" aria-label="Session details"></div></div>
@@ -3862,8 +4144,8 @@ let S=null; if(typeof S0!=='undefined'&&S0){S=S0;}
 let R=null; try{if(typeof R0!=='undefined'&&R0){R=R0;}}catch(_){R=null;}
 let TAB='opencode';
 let sortK='time_created', sortAsc=false;
-let RANGE='all', SPLIT=false, SHARE=false;
-let RRANGE='all', RSPLIT=false, RSHARE=false;
+let RANGE='all', SPLIT=false, SHARE=false, CUSTOM=null;
+let RRANGE='all', RSPLIT=false, RSHARE=false, RCUSTOM=null;
 let FS='file', CS='toks', RFS='file', RCS='toks';
 let FS_EXP=false, CS_EXP=false, RFS_EXP=false, RCS_EXP=false;
 let currentRows=[];
@@ -4094,8 +4376,11 @@ function renderCommitChart(){
   }).join('')+(rows.length>6?'<button class="more-btn" data-exp="cs">'+(CS_EXP?'Show less':'Show all '+rows.length)+' '+(CS_EXP?'▴':'▾')+'</button>':'');
 }
 /* period helpers */
+function cFrom(){return (CUSTOM&&CUSTOM.from)||'';}
+function cTo(){return (CUSTOM&&CUSTOM.to)||'';}
 function rangeCutMs(){
   if(RANGE==='all')return 0;
+  if(RANGE==='custom'){const f=cFrom();return f?Date.parse(f+'T00:00:00'):0;}
   if(RANGE==='24h')return Date.now()-86400000;
   const d=new Date();d.setHours(0,0,0,0);
   if(RANGE==='today')return d.getTime();
@@ -4104,10 +4389,12 @@ function rangeCutMs(){
 }
 function rangeEndMs(){
   if(RANGE==='yesterday'){const d=new Date();d.setHours(0,0,0,0);return d.getTime();}
+  if(RANGE==='custom'){const t=cTo();return t?Date.parse(t+'T00:00:00')+86400000:null;}
   return null;
 }
 function cutDate(){
   if(RANGE==='all')return'';
+  if(RANGE==='custom')return cFrom();
   if(RANGE==='today'||RANGE==='yesterday'||RANGE==='24h'){
     let t=Date.now();
     if(RANGE==='yesterday'){const d=new Date(t);d.setHours(0,0,0,0);t=d.getTime()-86400000;}
@@ -4117,12 +4404,19 @@ function cutDate(){
   const d=new Date(Date.now()-Number(RANGE)*86400000);
   return d.toLocaleDateString('en-CA');
 }
-function inPeriod(day){const c=cutDate();if(!c)return true;if(RANGE==='yesterday')return day.date===c;return day.date>=c;}
+function inPeriod(day){const c=cutDate();if(!c)return true;if(RANGE==='yesterday')return day.date===c;if(RANGE==='custom'){const b=cTo();return (!b||day.date<=b)&&day.date>=c;}return day.date>=c;}
 function periodDays(){return S.days.filter(inPeriod);}
 function inRangeMs(ms){const c=rangeCutMs(),e=rangeEndMs();if(!ms)return true;if(c&&ms<c)return false;if(e&&ms>=e)return false;return true;}
-function inRangeDay(ds){const c=cutDate();if(!c)return true;if(RANGE==='yesterday')return ds===c;if(RANGE==='today'||RANGE==='24h')return ds>=c;const ms=Date.parse(ds+'T00:00:00');const cut=rangeCutMs();return !(ms&&ms<cut-86400000);}
-function rangeLabel(r){if(r==='all')return'ALL TIME';if(r==='24h')return'LAST 24 HOURS';if(r==='today')return'TODAY';if(r==='yesterday')return'YESTERDAY';const n=Number(r);if(n>=365)return'1 YEAR';if(n/30>=1)return Math.round(n/30)+' MO';return n+' DAYS';}
+function inRangeDay(ds){const c=cutDate();if(!c)return true;if(RANGE==='yesterday')return ds===c;if(RANGE==='custom'){const b=cTo();return (!b||ds<=b)&&ds>=c;}if(RANGE==='today'||RANGE==='24h')return ds>=c;const ms=Date.parse(ds+'T00:00:00');const cut=rangeCutMs();return !(ms&&ms<cut-86400000);}
+function rangeLabel(r){if(r==='all')return'ALL TIME';if(r==='custom')return'CUSTOM';if(r==='24h')return'LAST 24 HOURS';if(r==='today')return'TODAY';if(r==='yesterday')return'YESTERDAY';const n=Number(r);if(n>=365)return'1 YEAR';if(n/30>=1)return Math.round(n/30)+' MO';return n+' DAYS';}
 function periodPrev(){
+  if(RANGE==='custom'){
+    const a=cFrom(),b=cTo();if(!a||!b)return[];
+    const start=new Date(a+'T00:00:00'),end=new Date(b+'T00:00:00');
+    const len=Math.round((end-start)/86400000)+1;
+    const ps=new Date(start.getTime()-len*86400000).toLocaleDateString('en-CA');
+    return S.days.filter(d=>d.date>=ps&&d.date<a);
+  }
   if(RANGE==='today'){const y=new Date(Date.now()-86400000).toLocaleDateString('en-CA');return S.days.filter(d=>d.date===y);}
   if(RANGE==='yesterday'){const y=new Date(Date.now()-2*86400000).toLocaleDateString('en-CA');return S.days.filter(d=>d.date===y);}
   const n=RANGE==='24h'?2:Number(RANGE);
@@ -4146,15 +4440,16 @@ function renderAll(){
   renderHero();renderSummary();renderKpis();renderRecords();renderInsights();renderCharts();renderModels();renderProjAgents();renderAct();renderFilterBar();renderSessions();
 }
 function renderHero(){
-  const periodLbl=rangeLabel(RANGE);
-  $('range').textContent='LOCAL · RECORDED '+S.range.toUpperCase()+' · LAST '+periodLbl+' · REFRESHES AUTOMATICALLY';
+  const periodLbl=RANGE==='custom'?('CUSTOM '+cFrom()+' → '+cTo()):('LAST '+rangeLabel(RANGE));
+  $('range').textContent='LOCAL · RECORDED '+S.range.toUpperCase()+' · '+periodLbl+' · REFRESHES AUTOMATICALLY';
   $('headline').innerHTML=BOLD(ESC(S.insights[0]||'No activity yet.'));
   const last=[...S.sessions].sort((a,b)=>b.time_created-a.time_created)[0];
   const ltitle=last?ESC(last.title):'-';
-  const nModels=S.models.length;
+  const mrows=periodModelRows();
+  const nModels=mrows.length;
   $('pills').innerHTML=[
     ['Total tokens',FN(S.totals.tokens_total||0)],
-    ['Models',nModels>1?nModels+' models':ESC(((S.models[0]||['-'])[0]+'').split('/').pop())],
+    ['Models',nModels>1?nModels+' models':ESC(((mrows[0]||['-'])[0]+'').split('/').pop())],
     ['Latest',ltitle.length>36?ltitle.slice(0,36)+'…':ltitle]]
     .map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+v+'</b></span>').join('');
 }
@@ -4235,13 +4530,33 @@ function renderCharts(){
   renderCommitChart();
 }
 function modelShort(m){return (m||'-').split('/').pop();}
+function periodModelRows(){
+  const all=S.models||[];
+  if(RANGE==='all'&&!FSTATE.day)return all;
+  const rows=S.model_days||[];
+  if(!rows.length)return all;
+  const agg={};
+  rows.forEach(function(r){
+    if(!inRangeDay(r[0]))return;
+    if(FSTATE.day&&r[0]!==FSTATE.day)return;
+    const a=agg[r[1]]||(agg[r[1]]={n:0,ti:0,to:0,tr:0,cache:0,cost:0});
+    a.n+=r[2]||0;a.ti+=r[3]||0;a.to+=r[4]||0;a.tr+=r[5]||0;a.cache+=r[6]||0;a.cost+=r[7]||0;
+  });
+  const out=Object.keys(agg).map(function(name){
+    const a=agg[name],tot=a.ti+a.to+a.tr+a.cache;
+    return [name,a.n,tot,a.ti,a.to,a.tr,a.cache,a.cost,a.n?Math.round(tot/a.n):0,a.ti?(a.cache/a.ti*100).toFixed(1):0];
+  });
+  out.sort(function(x,y){return y[2]-x[2];});
+  return out.length?out:all;
+}
 function renderModels(){
   const el=$('models');if(!el)return;
   const t=T();
-  const max=Math.max(...S.models.map(m=>m[2]||0),1);
-  const totalAll=S.models.reduce((a,m)=>a+(m[2]||0),0)||1;
-  if(!S.models.length){el.innerHTML='<div class="empty">No models yet.</div>';return;}
-  el.innerHTML=S.models.map(m=>{
+  const rows=periodModelRows();
+  const max=Math.max(...rows.map(m=>m[2]||0),1);
+  const totalAll=rows.reduce((a,m)=>a+(m[2]||0),0)||1;
+  if(!rows.length){el.innerHTML='<div class="empty">No models yet.</div>';return;}
+  el.innerHTML=rows.map(m=>{
     const name=m[0],n=m[1],tot=m[2]||0,ti=m[3]||0,to=m[4]||0,tr=m[5]||0,ca=m[6]||0,avg=m[8]||0,hr=m[9]||0;
     const prov=name.indexOf('/')>=0?name.split('/')[0]:'';
     const out=to+tr;
@@ -4320,6 +4635,28 @@ function renderJev(){
   if(tb)tb.innerHTML=recent.map(r=>'<tr><td class="sub">'+ESC(isoLocal(r.at))+'</td><td class="sub">'+ESC(String(r.session_id||'').slice(0,10))+'</td><td><span class="badge">'+ESC(r.verdict)+'</span></td><td>'+ESC(r.model)+'</td><td class="num">'+FN(r.input_tokens)+'</td><td class="num">'+FN(r.output_tokens)+'</td><td class="num">'+F(r.elapsed_ms||0)+'</td></tr>').join('')||'<tr><td colspan="7"><div class="empty">No judgments recorded.</div></td></tr>';
   const src=$('j-sources');
   if(src)src.innerHTML=(d.sources||[]).map(s=>{var line=ESC(s.name)+' — <span class="mono" style="font-size:11.5px">'+ESC(s.path)+'</span> — ';if(!s.exists){line+='not found'+(s.error?(' ('+ESC(s.error)+')'):'');}else{line+=F(s.events)+' events · '+F(s.proposals)+' judgments · '+F(s.sessions)+' sessions';if(s.mock_skipped)line+=' · '+F(s.mock_skipped)+' mock skipped';if(s.bad_lines)line+=' · '+F(s.bad_lines)+' bad lines';if(s.truncated)line+=' · tail-truncated';}return '<div>'+line+'</div>';}).join('')||'<div class="empty">No audit logs configured.</div>';
+}
+
+let AG=null;
+function renderAntigravity(){
+  const d=AG;
+  const cnt=$('tab-antigravity-cnt');
+  if(cnt)cnt.textContent=(d&&d.totals?FN(d.totals.steps)+' steps':'');
+  if(!d||!d.ok)return;
+  const t=d.totals||{},days=d.days||[],convs=d.conversations||[];
+  const range=$('ag-range');
+  if(range)range.textContent='ANTIGRAVITY · '+String(d.range||'no activity').toUpperCase()+' · LOCAL TIME';
+  const head=$('ag-headline');
+  if(head)head.innerHTML=BOLD(ESC(t.conversations+' conversations · '+F(t.steps)+' agent steps across '+F(t.active_days)+' active day'+(t.active_days===1?'':'s')+(t.latest?(' · latest '+isoLocal(t.latest)):'')+'.'));
+  $('ag-pills').innerHTML=[['Conversations',F(t.conversations)],['Steps',F(t.steps)],['Active days',F(t.active_days)],['Sources',(d.sources||[]).filter(s=>s.exists).length+'/'+(d.sources||[]).length]].map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+ESC(v)+'</b></span>').join('');
+  $('ag-summary').innerHTML=[['Conversations',F(t.conversations),'cascades'],['Steps',FN(t.steps),'agent steps'],['Active days',F(t.active_days),'with activity'],['Avg steps',t.active_days?FN(Math.round(t.steps/t.active_days)):'-','per active day']].map(([l,v,s])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+v+'</div><div class="ss">'+s+'</div></div>').join('');
+  $('ag-types').innerHTML=(t.step_types||[]).map(x=>'<span class="chip">Type '+x.type+' ×'+F(x.count)+'</span>').join('')||'<span class="chip">no steps</span>';
+  const dtb=document.querySelector('#ag-days tbody');
+  if(dtb)dtb.innerHTML=days.map(x=>'<tr><td>'+ESC(x.date)+'</td><td class="num">'+F(x.steps)+'</td><td class="num">'+F(x.conversations)+'</td></tr>').join('')||'<tr><td colspan="3"><div class="empty">No Antigravity activity found.</div></td></tr>';
+  $('ag-hint').textContent='newest first · '+convs.length+' total';
+  const tb=document.querySelector('#ag-tbl tbody');
+  if(tb)tb.innerHTML=convs.map(c=>{var title=c.title||c.preview||c.id;var prev=(c.title&&c.preview)?'<div class="sub">'+ESC(c.preview.slice(0,110))+'</div>':'';return '<tr><td><b>'+ESC(title.slice(0,90))+'</b>'+prev+'</td><td class="sub">'+ESC(c.workspace||'')+'</td><td class="num">'+F(c.steps)+'</td><td class="sub">'+ESC(isoLocal(c.last))+'</td><td><span class="badge">'+ESC(c.status||'')+'</span></td></tr>';}).join('')||'<tr><td colspan="5"><div class="empty">No conversations found.</div></td></tr>';
+  $('ag-sources').innerHTML=(d.sources||[]).map(s=>{var line=ESC(s.name)+' — <span class="mono" style="font-size:11.5px">'+ESC(s.path)+'</span> — ';if(!s.exists){line+='not found'+(s.error?(' ('+ESC(s.error)+')'):'');}else if(s.conversations!=null){line+=F(s.conversations)+' conversations';}else{line+=F(s.files)+' file'+(s.files===1?'':'s')+' · '+F(s.steps)+' steps';if(s.truncated)line+=' · newest steps sampled';}if(s.error&&s.exists)line+=' ('+ESC(s.error)+')';return '<div>'+line+'</div>';}).join('')||'<div class="empty">No Antigravity data found.</div>';
 }
 
 const SUB_ACT={recent:'Recent activity',quiet:'No recent activity',stale:'Older activity',unknown:'Unknown'};
@@ -4526,10 +4863,13 @@ function renderFilterBar(){
 /* ---- Codex tab (all models, from usage-events.jsonl) ---- */
 function rModelShort(m){return (m||'-').split('/').pop();}
 function rDayTokenTotal(d){return (d.ti||0)+(d.to||0);}
-function rRangeCutMs(){if(RRANGE==='all')return 0;if(RRANGE==='24h')return Date.now()-86400000;const d=new Date();d.setHours(0,0,0,0);if(RRANGE==='today')return d.getTime();if(RRANGE==='yesterday')return d.getTime()-86400000;return Date.now()-Number(RRANGE)*86400000;}
-function rRangeEndMs(){if(RRANGE==='yesterday'){const d=new Date();d.setHours(0,0,0,0);return d.getTime();}return null;}
+function rCFrom(){return (RCUSTOM&&RCUSTOM.from)||'';}
+function rCTo(){return (RCUSTOM&&RCUSTOM.to)||'';}
+function rRangeCutMs(){if(RRANGE==='all')return 0;if(RRANGE==='custom'){const f=rCFrom();return f?Date.parse(f+'T00:00:00'):0;}if(RRANGE==='24h')return Date.now()-86400000;const d=new Date();d.setHours(0,0,0,0);if(RRANGE==='today')return d.getTime();if(RRANGE==='yesterday')return d.getTime()-86400000;return Date.now()-Number(RRANGE)*86400000;}
+function rRangeEndMs(){if(RRANGE==='yesterday'){const d=new Date();d.setHours(0,0,0,0);return d.getTime();}if(RRANGE==='custom'){const t=rCTo();return t?Date.parse(t+'T00:00:00')+86400000:null;}return null;}
 function rCutDate(){
   if(RRANGE==='all')return'';
+  if(RRANGE==='custom')return rCFrom();
   if(RRANGE==='today'||RRANGE==='yesterday'||RRANGE==='24h'){
     let t=Date.now();
     if(RRANGE==='yesterday'){const d=new Date(t);d.setHours(0,0,0,0);t=d.getTime()-86400000;}
@@ -4539,9 +4879,9 @@ function rCutDate(){
   const d=new Date(Date.now()-Number(RRANGE)*86400000);
   return d.toLocaleDateString('en-CA');
 }
-function rInPeriod(day){const c=rCutDate();if(!c)return true;if(RRANGE==='yesterday')return day.date===c;return day.date>=c;}
+function rInPeriod(day){const c=rCutDate();if(!c)return true;if(RRANGE==='yesterday')return day.date===c;if(RRANGE==='custom'){const b=rCTo();return (!b||day.date<=b)&&day.date>=c;}return day.date>=c;}
 function rInRangeMs(ms){const c=rRangeCutMs(),e=rRangeEndMs();if(!ms)return true;if(c&&ms<c)return false;if(e&&ms>=e)return false;return true;}
-function rInRangeDay(ds){const c=rCutDate();if(!c)return true;if(RRANGE==='yesterday')return ds===c;if(RRANGE==='today'||RRANGE==='24h')return ds>=c;const ms=Date.parse(ds+'T00:00:00');const cut=rRangeCutMs();return !(ms&&ms<cut-86400000);}
+function rInRangeDay(ds){const c=rCutDate();if(!c)return true;if(RRANGE==='yesterday')return ds===c;if(RRANGE==='custom'){const b=rCTo();return (!b||ds<=b)&&ds>=c;}if(RRANGE==='today'||RRANGE==='24h')return ds>=c;const ms=Date.parse(ds+'T00:00:00');const cut=rRangeCutMs();return !(ms&&ms<cut-86400000);}
 function rPeriodDays(){return (R&&R.days?R.days:[]).filter(rInPeriod);}
 function rSumDays(list){
   const t={reqs:0,ok:0,err:0,unknown:0,err429:0,err500:0,ti:0,to:0,tr:0,cache:0,total:0,what_if:0};
@@ -4746,16 +5086,36 @@ function renderRouterFilterBar(){
   });
   bar.querySelector('.fclear').onclick=()=>{for(const k in RFSTATE)RFSTATE[k]=null;$('r-status-f').value='';$('r-provider-f').value='';$('r-model-f').value='';renderRouter();};
 }
+function rPeriodModelRows(){
+  const all=R.models||[];
+  if(RRANGE==='all'&&!RFSTATE.day)return all;
+  const rows=R.model_days||[];
+  if(!rows.length)return all;
+  const agg={};
+  rows.forEach(function(r){
+    if(!rInRangeDay(r[0]))return;
+    if(RFSTATE.day&&r[0]!==RFSTATE.day)return;
+    const a=agg[r[1]]||(agg[r[1]]={reqs:0,ok:0,err:0,unknown:0,measured:0,ti:0,to:0,cache:0,tr:0,total:0,what_if:0,free:r[13],provider:r[14]});
+    a.reqs+=r[2]||0;a.ok+=r[3]||0;a.err+=r[4]||0;a.unknown+=r[5]||0;a.measured+=r[6]||0;
+    a.ti+=r[7]||0;a.to+=r[8]||0;a.cache+=r[9]||0;a.tr+=r[10]||0;a.total+=r[11]||0;a.what_if+=r[12]||0;
+  });
+  const out=Object.keys(agg).map(function(name){
+    const a=agg[name];
+    return [name,a.reqs,a.total,a.ti,a.to,a.cache,a.ok,a.err,a.measured?Math.round(a.total/a.measured):0,a.ti?(a.cache/a.ti*100).toFixed(1):0,a.provider,a.free,a.what_if,a.tr,a.unknown];
+  });
+  out.sort(function(x,y){return y[2]-x[2];});
+  return out.length?out:all;
+}
 function renderRouter(){
   if(!R)return;
   const t=R.totals||{};
-  const periodLbl=rangeLabel(RRANGE);
-  $('r-range').textContent='CODEX · '+(R.range||'').toUpperCase()+' · LAST '+periodLbl+' · REFRESHES AUTOMATICALLY';
+  const periodLbl=RRANGE==='custom'?('CUSTOM '+rCFrom()+' → '+rCTo()):('LAST '+rangeLabel(RRANGE));
+  $('r-range').textContent='CODEX · '+(R.range||'').toUpperCase()+' · '+periodLbl+' · REFRESHES AUTOMATICALLY';
   const cur=RRANGE==='all'?null:rSumDays(rPeriodDays());
   const totTokens=cur?cur.total:(t.tokens_total||0);
   const totReqs=cur?cur.reqs:(t.requests||0);
   $('r-headline').innerHTML=BOLD(ESC(totReqs+' '+(R.req_word||'requests')+' · '+Math.round(totTokens).toLocaleString('en-US')+' tokens with Codex.'));
-  const nModels=(R.models||[]).length;
+  const nModels=rPeriodModelRows().length;
   $('r-pills').innerHTML=[
     [(R.is_synth?'Model calls':'Requests'),F(totReqs)],
     ['Tokens',FN(totTokens)],
@@ -4816,8 +5176,9 @@ function renderRouter(){
   $('r-providers').innerHTML=(R.providers||[]).map(p=>'<span class="chip'+(RFSTATE.provider===p[0]?' active':'')+'" data-rp="'+ESC(p[0])+'" data-tip="<b>'+ESC(p[0])+'</b><span class=\'trow\'><span>Requests</span><b>'+p[1]+'</b></span><span class=\'trow\'><span>Tokens</span><b>'+FN(p[2]||0)+'</b></span>">'+
     '<b>'+FN(p[2]||p[1])+'</b><span class="n">'+ESC(p[0])+' · '+p[1]+'</span></span>').join('')||'<span class="empty">No providers</span>';
   renderRouterStatus(cur);
-  const totalAll=(R.models||[]).reduce((a,m)=>a+(m[2]||0),0)||1;
-  $('r-models').innerHTML=(R.models||[]).length?(R.models||[]).map(m=>{
+  const mrows=rPeriodModelRows();
+  const totalAll=mrows.reduce((a,m)=>a+(m[2]||0),0)||1;
+  $('r-models').innerHTML=mrows.length?mrows.map(m=>{
     const name=m[0],reqs=m[1],tot=m[2]||0,ti=m[3]||0,to=m[4]||0,ca=m[5]||0,ok=m[6]||0,err=m[7]||0;
     const prov=m[10]||'',free=m[11],wi=m[12]||0;
     const tr=m[13]||0,out=to,uncached=Math.max(0,ti-ca);
@@ -4889,18 +5250,21 @@ function renderRouterRequests(){
 }
 function setTab(name){
   TAB=name;
-  const oc=name==='opencode',rt=name==='router',jv=name==='jev';
+  const oc=name==='opencode',rt=name==='router',jv=name==='jev',av=name==='antigravity';
   $('tab-opencode').classList.toggle('active',oc);
   $('tab-router').classList.toggle('active',rt);
   $('tab-jev').classList.toggle('active',jv);
+  $('tab-antigravity').classList.toggle('active',av);
   $('tab-opencode').setAttribute('aria-selected',oc);
   $('tab-router').setAttribute('aria-selected',rt);
   $('tab-jev').setAttribute('aria-selected',jv);
+  $('tab-antigravity').setAttribute('aria-selected',av);
   $('view-opencode').hidden=!oc;
   $('view-router').hidden=!rt;
   $('view-jev').hidden=!jv;
+  $('view-antigravity').hidden=!av;
   try{sessionStorage.setItem('ocd-tab',name);}catch(_){}
-  if(rt)renderRouter();else if(jv)renderJev();else renderAll();
+  if(rt)renderRouter();else if(jv)renderJev();else if(av)renderAntigravity();else renderAll();
 }
 function sortH(e){const th=e.target.closest('th');if(!th)return;const k=th.dataset.k;if(!k)return;
   if(k===sortK)sortAsc=!sortAsc;else{sortK=k;sortAsc=false;}
@@ -4991,21 +5355,44 @@ document.addEventListener('click',e=>{
 });
 document.querySelectorAll('.pbtn[data-r]').forEach(b=>b.onclick=()=>{
   RANGE=b.dataset.r;
+  try{sessionStorage.setItem('ocd-range',RANGE);}catch(_){}
   document.querySelectorAll('.pbtn[data-r]').forEach(x=>x.classList.toggle('active',x===b));
+  const ap=document.getElementById('c-apply');if(ap)ap.classList.remove('active');
   renderAll();
 });
+$('c-apply').onclick=()=>{
+  const f=($('c-from').value||''),t=($('c-to').value||'');
+  if(!f||!t||f>t)return;
+  RANGE='custom';CUSTOM={from:f,to:t};
+  try{sessionStorage.setItem('ocd-range','custom');sessionStorage.setItem('ocd-custom',JSON.stringify(CUSTOM));}catch(_){}
+  document.querySelectorAll('.pbtn[data-r]').forEach(x=>x.classList.remove('active'));
+  $('c-apply').classList.add('active');
+  renderAll();
+};
 $('split-btn').onclick=()=>{SPLIT=!SPLIT;$('split-btn').textContent='Split reasoning: '+(SPLIT?'on':'off');$('split-btn').setAttribute('aria-pressed',SPLIT);renderAll();};
 $('share-btn').onclick=()=>{SHARE=!SHARE;$('share-btn').textContent='Share: '+(SHARE?'on':'off');$('share-btn').setAttribute('aria-pressed',SHARE);renderAll();};
 document.querySelectorAll('.pbtn[data-rr]').forEach(b=>b.onclick=()=>{
   RRANGE=b.dataset.rr;
+  try{sessionStorage.setItem('ocd-rrange',RRANGE);}catch(_){}
   document.querySelectorAll('.pbtn[data-rr]').forEach(x=>x.classList.toggle('active',x===b));
+  const ap=document.getElementById('r-c-apply');if(ap)ap.classList.remove('active');
   renderRouter();
 });
+$('r-c-apply').onclick=()=>{
+  const f=($('r-c-from').value||''),t=($('r-c-to').value||'');
+  if(!f||!t||f>t)return;
+  RRANGE='custom';RCUSTOM={from:f,to:t};
+  try{sessionStorage.setItem('ocd-rrange','custom');sessionStorage.setItem('ocd-rcustom',JSON.stringify(RCUSTOM));}catch(_){}
+  document.querySelectorAll('.pbtn[data-rr]').forEach(x=>x.classList.remove('active'));
+  $('r-c-apply').classList.add('active');
+  renderRouter();
+};
 $('r-split-btn').onclick=()=>{RSPLIT=!RSPLIT;$('r-split-btn').textContent='Split reasoning: '+(RSPLIT?'on':'off');$('r-split-btn').setAttribute('aria-pressed',RSPLIT);renderRouter();};
 $('r-share-btn').onclick=()=>{RSHARE=!RSHARE;$('r-share-btn').textContent='Share: '+(RSHARE?'on':'off');$('r-share-btn').setAttribute('aria-pressed',RSHARE);renderRouter();};
 $('tab-opencode').onclick=()=>setTab('opencode');
 $('tab-router').onclick=()=>setTab('router');
 $('tab-jev').onclick=()=>setTab('jev');
+$('tab-antigravity').onclick=()=>setTab('antigravity');
 $('r-search').addEventListener('input',renderRouterRequests);
 $('r-status-f').addEventListener('change',e=>{RFSTATE.status=e.target.value||'';renderRouter();});
 $('r-provider-f').addEventListener('change',e=>{RFSTATE.provider=e.target.value||null;renderRouter();});
@@ -5034,6 +5421,11 @@ function exportData(kind){
   if(TAB==='jev'&&JV){
     const b=new Blob([kind==='json'?JSON.stringify(JV,null,2):['date,proposals,sessions,input_tokens,output_tokens,avg_ms'].concat((JV.days||[]).map(d=>[d.date,d.proposals,d.sessions,d.input_tokens,d.output_tokens,d.avg_ms==null?'':d.avg_ms].join(','))).join('\n')],{type:kind==='json'?'application/json':'text/csv'});
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=kind==='json'?'jev-usage.json':'jev-proposals-days.csv';a.click();
+    return;
+  }
+  if(TAB==='antigravity'&&AG){
+    const b=new Blob([kind==='json'?JSON.stringify(AG,null,2):['date,steps,conversations'].concat((AG.days||[]).map(d=>[d.date,d.steps,d.conversations].join(','))).join('\n')],{type:kind==='json'?'application/json':'text/csv'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=kind==='json'?'antigravity-usage.json':'antigravity-steps-days.csv';a.click();
     return;
   }
   if(kind==='json'){
@@ -5097,7 +5489,8 @@ const SECTIONS=[
  {key:'projects',url:'/api/projects',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.rows),render:d=>{PJ=d;renderProjects();}},
  {key:'signals',url:'/api/signals',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.signals),render:d=>{SG=d;renderSignals();}},
  {key:'codex',url:'/api/codex',validate:d=>d&&d.ok===true&&Array.isArray(d.sessions),render:d=>{CX=d;renderCodex();}},
- {key:'jev',url:'/api/jev',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{JV=d;renderJev();}}
+ {key:'jev',url:'/api/jev',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{JV=d;renderJev();}},
+ {key:'antigravity',url:'/api/antigravity',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{AG=d;renderAntigravity();}}
 ];
 function secUnavailable(key,msg){
   var tb=(key==='sessions')?document.querySelector('#sstbl tbody'):((key==='projects')?document.querySelector('#projtbl tbody'):null);
@@ -5106,6 +5499,7 @@ function secUnavailable(key,msg){
   if(key==='signals'){var s=document.getElementById('sig-chips');if(s)s.textContent='unavailable: '+msg;}
   if(key==='codex'){var c=document.querySelector('#cx-tbl tbody');if(c)c.innerHTML='<tr><td colspan="6">unavailable: '+ESC(msg)+'</td></tr>';}
   if(key==='jev'){var j=document.querySelector('#j-tbl tbody');if(j)j.innerHTML='<tr><td colspan="7">unavailable: '+ESC(msg)+'</td></tr>';}
+  if(key==='antigravity'){var a=document.querySelector('#ag-tbl tbody');if(a)a.innerHTML='<tr><td colspan="5">unavailable: '+ESC(msg)+'</td></tr>';}
 }
 function secStrip(){
   var sts=SEC.sections,parts=[];
@@ -5187,7 +5581,9 @@ $('refresh').onclick=()=>{if(AUTH_FAILED)return;load();};
 $('search').addEventListener('input',renderSessions);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!AUTH_FAILED)load();});
 setInterval(()=>{if(!document.hidden&&!AUTH_FAILED)load();},((window.__ocdTimeouts&&window.__ocdTimeouts.refreshMs)||30000));
-try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'||saved==='jev'){setTab(saved);}}catch(_){}
+try{const sv=sessionStorage.getItem('ocd-range');if(sv){RANGE=sv;document.querySelectorAll('.pbtn[data-r]').forEach(x=>x.classList.toggle('active',x.dataset.r===RANGE));if(RANGE==='custom'){const cc=JSON.parse(sessionStorage.getItem('ocd-custom')||'null');if(cc&&cc.from&&cc.to){CUSTOM=cc;const fi=document.getElementById('c-from'),ti=document.getElementById('c-to'),ap=document.getElementById('c-apply');if(fi)fi.value=cc.from;if(ti)ti.value=cc.to;if(ap)ap.classList.add('active');}}}}catch(_){}
+try{const rv=sessionStorage.getItem('ocd-rrange');if(rv){RRANGE=rv;document.querySelectorAll('.pbtn[data-rr]').forEach(x=>x.classList.toggle('active',x.dataset.rr===RRANGE));if(RRANGE==='custom'){const rc=JSON.parse(sessionStorage.getItem('ocd-rcustom')||'null');if(rc&&rc.from&&rc.to){RCUSTOM=rc;const fi=document.getElementById('r-c-from'),ti=document.getElementById('r-c-to'),ap=document.getElementById('r-c-apply');if(fi)fi.value=rc.from;if(ti)ti.value=rc.to;if(ap)ap.classList.add('active');}}}}catch(_){}
+try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'||saved==='jev'||saved==='antigravity'){setTab(saved);}}catch(_){}
 if(S){renderAll();}
 if(R){renderRouter();}
 if(AUTH_TOKEN){load();}else{showAuthLock(true);}
@@ -5207,6 +5603,7 @@ class Handler(BaseHTTPRequestHandler):
     router_events = None
     router_limits = None
     jev_logs = None
+    antigravity_dir = None
     server = None
     quiet = False
 
@@ -5445,6 +5842,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 body = json.dumps({"ok": False, "error": str(e)[:200]}).encode("utf-8")
             self._send(200, "application/json", body)
+        elif path.startswith("/api/antigravity"):
+            try:
+                body = json.dumps(query_antigravity(self.antigravity_dir or str(AG_DIR_DEFAULT))).encode("utf-8")
+            except Exception as e:
+                body = json.dumps({"ok": False, "error": str(e)[:200]}).encode("utf-8")
+            self._send(200, "application/json", body)
         elif path.startswith("/api/agents"):
             try:
                 con = connect(self.db_path)
@@ -5622,12 +6025,15 @@ def main():
                         help="path to Codex Router rate-limits.json")
     parser.add_argument("--jev-logs", action="append", default=[], metavar="FILE",
                         help="Jev audit.jsonl to read (repeatable; defaults to local JevDesk installs)")
+    parser.add_argument("--antigravity-dir", default=str(AG_DIR_DEFAULT), metavar="DIR",
+                        help="Antigravity data dir (default: ~/.gemini/antigravity)")
     args = parser.parse_args()
 
     Handler.db_path = args.db
     Handler.router_events = args.router_events
     Handler.router_limits = args.router_limits
     Handler.jev_logs = args.jev_logs or [str(p) for p in JEV_LOG_DEFAULTS]
+    Handler.antigravity_dir = args.antigravity_dir
     Handler.quiet = args.quiet
     if args.agents_dir:
         AGENT_DIRS.extend(args.agents_dir)

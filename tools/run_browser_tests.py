@@ -153,8 +153,32 @@ def _write_fixture(root, mode="canary", xss=False):
     with open(jev_path, "w", encoding="utf-8", newline="") as f:
         for rec in jev_recs:
             f.write(json.dumps(rec) + "\n")
+    ag_root = root / "antigravity"
+    ag_convs = ag_root / "conversations"
+    ag_convs.mkdir(parents=True)
+    ag_db = sqlite3.connect(str(ag_root / "conversation_summaries.db"))
+    ag_db.execute("""CREATE TABLE conversation_summaries (
+        conversation_id TEXT PRIMARY KEY, title TEXT, preview TEXT,
+        step_count INTEGER, last_modified_time TEXT, last_user_input_time TEXT,
+        workspace_uris TEXT, status TEXT)""")
+    ag_db.execute(
+        "INSERT INTO conversation_summaries VALUES (?,?,?,?,?,?,?,?)",
+        ("ag-c1", "Synthetic Antigravity conversation", "synthetic preview",
+         2, "2026-09-20 19:59:46.1+00:00", "2026-09-20 19:59:22.4+00:00",
+         '["file:///d%3A/Fixture%20Workspace"]', "CASCADE_RUN_STATUS_IDLE"))
+    ag_db.commit()
+    ag_db.close()
+    ag_steps = sqlite3.connect(str(ag_convs / "ag-c1.db"))
+    ag_steps.execute("CREATE TABLE steps (idx INTEGER PRIMARY KEY, "
+                     "step_type INTEGER, status INTEGER, metadata BLOB)")
+    ag_steps.execute("INSERT INTO steps VALUES (?,?,?,?)",
+                     (0, 15, 3, b"\x0a\x06\x08\x80\xd5\xa9\xc6\x06"))
+    ag_steps.execute("INSERT INTO steps VALUES (?,?,?,?)",
+                     (1, 132, 3, b"\x0a\x06\x08\xbc\xd5\xa9\xc6\x06"))
+    ag_steps.commit()
+    ag_steps.close()
     return {"db": str(db_path), "events": events, "jev": str(jev_path),
-            "codex_dir": codex_dir, "root": root}
+            "codex_dir": codex_dir, "antigravity": str(ag_root), "root": root}
 
 
 # --------------------------------------------------------------------------
@@ -423,10 +447,30 @@ class Ctx:
                 pass
 
 
+# Ports Chromium refuses to load (net::ERR_UNSAFE_PORT). Even 127.0.0.1 is
+# blocked for them, so the fixture server must never bind one.
+CHROMIUM_UNSAFE_PORTS = frozenset((
+    1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77,
+    79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123,
+    135, 137, 138, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515,
+    526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990,
+    993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000,
+    6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080,
+))
+
+
 def _start_server(d, fixture):
     handler = _make_handler(d)
     token = secrets.token_urlsafe(32)
-    server = QuietServer(("127.0.0.1", 0), handler)
+    server = None
+    for _ in range(20):
+        candidate = QuietServer(("127.0.0.1", 0), handler)
+        if candidate.server_address[1] not in CHROMIUM_UNSAFE_PORTS:
+            server = candidate
+            break
+        candidate.server_close()
+    if server is None:
+        raise RuntimeError("could not bind a Chromium-safe ephemeral port")
     server.auth_token = token
     try:
         d.Handler.auth_token = token
@@ -508,7 +552,7 @@ def case_t01(ctx):
     _assert("timeout after" in (secs["codex"]["error"] or ""),
             "codex error should mention the timeout, got %r" % secs["codex"]["error"])
     status = ctx.status()
-    _assert("Partial update: 8/9" in status,
+    _assert("Partial update: 9/10" in status,
             "status should be a partial update, got %r" % status)
     _assert("codex" in status, "status should name the failing source, got %r" % status)
     ctx.evidence["status"] = status
@@ -531,7 +575,7 @@ def case_t02(ctx):
     for key in SEVEN_FAST:
         _assert(secs[key]["state"] == "success",
                 "section %s should still succeed, got %r" % (key, secs[key]))
-    _assert("Partial update: 8/9" in ctx.status(),
+    _assert("Partial update: 9/10" in ctx.status(),
             "status should be partial, got %r" % ctx.status())
     ctx.evidence["codex_error"] = secs["codex"]["error"]
     return ctx.shot("body-hang-timeout")
@@ -543,7 +587,7 @@ def case_t04(ctx):
     ctx.goto()
     ctx.cycle_finished()
     secs = ctx.sections()
-    _assert(all(secs[k]["state"] == "success" for k in SEVEN_FAST + ("codex", "jev")),
+    _assert(all(secs[k]["state"] == "success" for k in SEVEN_FAST + ("codex", "jev", "antigravity")),
             "first cycle should be fully green")
     first_status = ctx.status()
     _assert(first_status.startswith("Updated"),
@@ -569,7 +613,7 @@ def case_t04(ctx):
     _assert(rows_after == rows_before,
             "previous rows must be kept, before=%d after=%d" % (rows_before, rows_after))
     status = ctx.status()
-    _assert("Partial update: 8/9" in status and "stats" in status,
+    _assert("Partial update: 9/10" in status and "stats" in status,
             "status should be partial and name stats, got %r" % status)
     _assert(not status.startswith("Updated"),
             "no Updated for a partial cycle, got %r" % status)
@@ -627,7 +671,7 @@ def case_t09(ctx):
     ctx.goto()
     ctx.cycle_finished()
     secs = ctx.sections()
-    _assert(all(secs[k]["state"] == "success" for k in SEVEN_FAST + ("codex", "jev")),
+    _assert(all(secs[k]["state"] == "success" for k in SEVEN_FAST + ("codex", "jev", "antigravity")),
             "first cycle should be fully green")
 
     # -- inspect ---------------------------------------------------------
@@ -968,6 +1012,7 @@ def _run_case(case_id, desc, fn, d, artifacts_dir, shots_dir, browser, log):
         d.Handler.router_events = fixture["events"]
         d.Handler.router_limits = None
         d.Handler.jev_logs = [fixture["jev"]]
+        d.Handler.antigravity_dir = fixture["antigravity"]
         d.Handler.quiet = True
         try:
             d.CODEX_DIR = fixture["codex_dir"]

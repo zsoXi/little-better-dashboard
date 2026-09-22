@@ -1,0 +1,36 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build and publish the release zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version matches the tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION=$(python -c "import re;print(re.search(r'DASHBOARD_VERSION = \"([^\"]+)\"', open('opencode_dashboard.py', encoding='utf-8').read()).group(1))")
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "tag $TAG does not match DASHBOARD_VERSION $VERSION"
+            exit 1
+          fi
+      - name: Build zip and checksums
+        run: |
+          zip -j little-better-dashboard.zip opencode_dashboard.py start-dashboard.bat start-dashboard.sh install.bat uninstall.bat logo.ico logo.png README.md LICENSE CHANGELOG.md
+          sha256sum little-better-dashboard.zip > checksums.txt
+          cat checksums.txt
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            little-better-dashboard.zip
+            checksums.txt
+          generate_release_notes: true

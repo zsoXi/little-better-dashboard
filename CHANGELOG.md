@@ -1,6 +1,11 @@
 # Changelog
 
-## [Unreleased] — audit repair F1-F8 (0.1.0-alpha candidate)
+## [1.0.0] — audit repair F1-F8
+
+### Added
+- In-app update: the topbar Update button checks the latest GitHub release, downloads the zip, verifies the sha256 from the release `checksums.txt`, replaces the installed files in place (keeping `.bak` copies) and restarts the dashboard on the same port and token.
+- Windows installer `install.bat` (Desktop and Start Menu shortcuts, no admin rights), `uninstall.bat`, and `AGENT_INSTALL.md` with exact commands for agents installing the app for someone.
+- Release workflow: pushing a `vX.Y.Z` tag checks that the tag matches `DASHBOARD_VERSION`, builds `little-better-dashboard.zip` plus `checksums.txt` and publishes them as a GitHub release.
 
 ### Fixed
 - F1: router token normalization — the shared scope shows 100/20/40/5 as 120.

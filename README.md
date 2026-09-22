@@ -26,6 +26,8 @@ The OpenCode and Codex tabs share one set of time controls: **All time, Last 24h
 
 There is more under the hood: a split reasoning view, a share view, and one-click JSON or CSV export of exactly what you are looking at.
 
+The topbar has an **Update** button next to Refresh. One click checks the latest GitHub release, the second downloads and installs it in place after a sha256 check, and the third restarts the dashboard on the same port and token. It is the only feature that talks to the network, it runs only when you click it, and nothing is sent anywhere.
+
 Everything is read from files already on your machine. The server binds to `127.0.0.1` only and additionally requires a per-instance bearer token plus strict Host/Origin checks; the bind alone is not claimed to prevent all exfiltration.
 
 Privacy: The dashboard may read and display message content from your local OpenCode and Codex sessions for session inspection, and reads local Jev audit logs (session ids, verdicts, token counts) for the Jev tab, and local Antigravity conversation data (titles, workspace paths, step times) for the Antigravity tab. This content stays on your machine and is only served to a browser session presenting the instance token over the local 127.0.0.1 dashboard. Nothing is uploaded or sent to external services. Private content is visible to anyone holding the instance link, and tunnels or public exposure are not supported.
@@ -40,6 +42,14 @@ Privacy: The dashboard may read and display message content from your local Open
 - "Usage in the 24h before each commit" windows are global and **non-additive**: windows may overlap and may include other projects, so commit rows must not be summed.
 - The Codex synthesis **cache** index lives in `.cache/codex_index.json` (a derived **checkpoint** tied to the published generation): it is **safe to delete** at any time and is never a source of truth; a failed checkpoint write never fails a publish.
 - The server binds to 127.0.0.1 only, requires the per-instance token from the `#token=` fragment, and does not support **tunnels** or public exposure.
+
+## Install
+
+Download the newest release zip from the [Releases page](https://github.com/zsoXi/little-better-dashboard/releases), unzip it anywhere and run `install.bat`. It copies the app to `%LOCALAPPDATA%\Programs\LittleBetterDashboard`, creates Desktop and Start Menu shortcuts with the mascot icon, and needs no admin rights. Run it again any time to update the installed copy; `uninstall.bat` removes it cleanly.
+
+Working with an AI agent? Point it at [AGENT_INSTALL.md](AGENT_INSTALL.md), which has the exact commands for installing from the release zip or from a git clone.
+
+Prefer it portable? Skip the installer and double-click `start-dashboard.bat` straight from the unzipped folder.
 
 ## Quick start (one click)
 
@@ -73,6 +83,7 @@ python opencode_dashboard.py [db] [--port PORT] [--agents-dir DIR] [--open] [--q
 | `--jev-logs FILE` | local JevDesk installs | Jev `audit.jsonl` to read (repeatable) |
 | `--antigravity-dir DIR` | `~/.gemini/antigravity` | Antigravity data dir to read |
 | `--idle-timeout SECONDS` | off | Shut down after N seconds with no requests |
+| `--version` | | Print the version and exit |
 
 If the database is missing, you get a plain message asking you to run OpenCode at least once so it can be created.
 

@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import io
 import json
 import math
 import os
@@ -9,13 +11,16 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
+import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
-from urllib.request import pathname2url
+from urllib.request import Request, pathname2url, urlopen
 
 _HOME = Path.home()  # cross-platform: %USERPROFILE% on Windows, $HOME elsewhere
 DB_PATH = _HOME / ".local/share/opencode/opencode.db"
@@ -40,6 +45,15 @@ JEV_MAX_EVENTS = 5000  # most-recent Jev audit events kept per source
 AG_DIR_DEFAULT = _HOME / ".gemini" / "antigravity"  # local Antigravity client data
 AG_MAX_STEPS = 20000  # newest steps sampled per Antigravity conversation db
 SYNTH_SCHEMA = 3  # bump to force codex-synth rebuild when the writer changes
+DASHBOARD_VERSION = "1.0.0"  # keep in sync with the vX.Y.Z release tag
+UPDATE_REPO = "zsoXi/little-better-dashboard"
+UPDATE_API_LATEST = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_ASSET_MAX = 50 * 1024 * 1024  # download cap for the release zip
+UPDATE_FILES = ("opencode_dashboard.py", "start-dashboard.bat", "logo.png", "logo.ico")
+UPDATE_HOSTS = {"api.github.com", "github.com",
+                "objects.githubusercontent.com", "raw.githubusercontent.com"}
+UPDATE_APPLIED = False  # set after a successful in-place update in this process
+RESTART_REQUESTED = False  # main() relaunches the server after a clean exit
 
 # What-if paid pricing per 1M tokens (input, output) for known *-free models.
 # Actual free cost is always $0; this estimates what the same tokens would cost.
@@ -67,6 +81,157 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{20,128}")
 
 def _new_token():
     return secrets.token_urlsafe(32)
+
+
+def _version_tuple(s):
+    nums = [int(x) for x in re.findall(r"\d+", str(s or ""))][:3]
+    nums += [0] * (3 - len(nums))
+    return tuple(nums)
+
+
+def _update_fetch_latest():
+    """One GitHub API call; only ever runs on an explicit user click."""
+    req = Request(UPDATE_API_LATEST, headers={
+        "User-Agent": "little-better-dashboard",
+        "Accept": "application/vnd.github+json",
+    })
+    with urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+    assets = []
+    for a in (data.get("assets") or []):
+        if not isinstance(a, dict):
+            continue
+        assets.append({
+            "name": a.get("name") or "",
+            "url": a.get("browser_download_url") or "",
+            "size": a.get("size") or 0,
+        })
+    return {
+        "tag": data.get("tag_name") or "",
+        "url": data.get("html_url") or "",
+        "notes": (data.get("body") or "")[:2000],
+        "assets": assets,
+    }
+
+
+def update_check(fetch=None):
+    try:
+        latest = (fetch or _update_fetch_latest)()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:  # no release published yet
+            return {"ok": True, "current": DASHBOARD_VERSION, "latest": None,
+                    "tag": "", "newer": False, "url": "", "notes": "",
+                    "zip": None, "checksums": None}
+        return {"ok": False, "error": "HTTP %s" % e.code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+    tag = latest.get("tag") or ""
+    assets = latest.get("assets") or []
+    zip_asset = next((a for a in assets if a["name"].endswith(".zip")), None)
+    checks = next((a for a in assets if a["name"] == "checksums.txt"), None)
+    return {
+        "ok": True,
+        "current": DASHBOARD_VERSION,
+        "latest": tag.lstrip("vV") or None,
+        "tag": tag,
+        "newer": _version_tuple(tag) > _version_tuple(DASHBOARD_VERSION),
+        "url": latest.get("url") or "",
+        "notes": latest.get("notes") or "",
+        "zip": zip_asset,
+        "checksums": checks,
+    }
+
+
+def _update_download(url):
+    host = (urlparse(url).hostname or "").lower()
+    if host not in UPDATE_HOSTS:
+        raise ValueError("unexpected download host: %s" % host)
+    req = Request(url, headers={"User-Agent": "little-better-dashboard"})
+    with urlopen(req, timeout=60) as resp:
+        data = resp.read(UPDATE_ASSET_MAX + 1)
+    if len(data) > UPDATE_ASSET_MAX:
+        raise ValueError("release asset is too large")
+    return data
+
+
+def _update_target():
+    return Path(__file__).resolve().parent
+
+
+def update_apply(checker=None, downloader=None):
+    """Download the latest release zip, verify its checksum, replace the
+    installed files in place (with .bak copies). The release is re-resolved
+    server-side and downloads are restricted to GitHub hosts, so a client
+    cannot point the updater anywhere else."""
+    chk = checker() if checker else update_check()
+    if not chk.get("ok"):
+        return {"ok": False, "error": chk.get("error") or "update check failed"}
+    if not chk.get("newer"):
+        return {"ok": False, "error": "already up to date"}
+    zip_asset = chk.get("zip") or {}
+    if not zip_asset.get("url"):
+        return {"ok": False, "error": "release has no zip asset"}
+    fetch = downloader or _update_download
+    data = fetch(zip_asset["url"])
+    checks = chk.get("checksums") or {}
+    expected = None
+    if checks.get("url"):
+        try:
+            text = fetch(checks["url"]).decode("utf-8", "replace")
+            for line in text.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[-1].lstrip("*") == zip_asset["name"]:
+                    expected = parts[0].strip().lower()
+                    break
+        except Exception:
+            expected = None
+    if not expected:
+        return {"ok": False, "error": "checksums.txt is missing the zip hash"}
+    got = hashlib.sha256(data).hexdigest()
+    if got != expected:
+        return {"ok": False, "error": "checksum mismatch, nothing was replaced"}
+    target = _update_target()
+    replaced, backups = [], []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for name in UPDATE_FILES:
+            if name not in zf.namelist():
+                continue
+            dest = target / name
+            if not dest.is_file():
+                continue  # only refresh files this install already has
+            content = zf.read(name)
+            try:
+                (target / (name + ".bak")).write_bytes(dest.read_bytes())
+            except OSError:
+                pass
+            tmp = target / (name + ".new")
+            tmp.write_bytes(content)
+            os.replace(str(tmp), str(dest))
+            replaced.append(name)
+            backups.append(name + ".bak")
+    if not replaced:
+        return {"ok": False, "error": "release contains no installed files"}
+    globals()["UPDATE_APPLIED"] = True
+    return {"ok": True, "from": chk.get("current"), "to": chk.get("latest"),
+            "files": replaced, "backups": backups}
+
+
+def _spawn_restarted_server():
+    env = dict(os.environ)
+    tok = getattr(Handler, "auth_token", None)
+    if tok:
+        env["OCD_TOKEN"] = tok  # keep the tab that clicked Restart authorized
+    flags = 0
+    if os.name == "nt":
+        flags = (subprocess.DETACHED_PROCESS
+                 | subprocess.CREATE_NEW_PROCESS_GROUP
+                 | subprocess.CREATE_NO_WINDOW)
+    argv = [a for a in sys.argv[1:] if a != "--open"]
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve())] + argv,
+        env=env, cwd=str(Path.cwd()), creationflags=flags,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, close_fds=True)
 
 
 def _expected_host(server):
@@ -3901,6 +4066,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
         <button data-x="csvc">CSV <small>commit windows · not additive</small></button>
       </div></span>
     <button class="tbtn" id="refresh">⟳ Refresh</button>
+    <button class="tbtn" id="update" title="Check GitHub for a newer release">⬆ Update</button>
   </div>
 </div>
 <div class="wrap" id="auth-lock" hidden style="margin-top:18px"><div class="card"><b>Authorization required — this tab has no working token, so the page stays empty.</b> Every launcher start mints a fresh token: old tabs and plain <span class="mono">127.0.0.1:8765</span> bookmarks never work. Open the address printed by the launcher (it carries <span class="mono">#token=…</span> in the fragment), or click the desktop shortcut again and use the tab it opens.</div></div>
@@ -5753,6 +5919,37 @@ const _inspState={sid:null,cursor:null,hasMore:false,pending:null};
 async function inspect(sid){var box=document.getElementById('insp');if(!box)return;box.hidden=false;var g=++_inspGen;if(_inspState.sid!==sid){_inspState.sid=sid;_inspState.cursor=null;_inspState.hasMore=false;_inspState.pending=null;}box.textContent='loading '+sid+' ...';try{var u='/api/inspect?id='+encodeURIComponent(sid)+'&_='+Date.now();if(_inspState.pending)u+='&cursor='+encodeURIComponent(_inspState.pending);var d=await fetchJson(u);if(g!==_inspGen)return;if(!d||!d.found){box.textContent='not found '+sid+' (click the row to retry)';return;}var H='<b>'+ESC(d.title||sid)+'</b> <span style="opacity:.65">'+ESC(d.agent||'')+' / '+ESC(d.model||'')+(d.provider?' ('+ESC(d.provider)+')':'')+' / '+ESC(d.directory||'')+'</span>';for(var i=0;i<d.messages.length;i++){var m=d.messages[i];H+='<div style="margin-top:8px"><b>'+ESC(m.role)+'</b> <span style="opacity:.65">'+ESC(m.agent||'')+' '+ESC(m.model||'')+' · '+m.parts.length+' parts'+(m.parts_omitted?(' (+'+m.parts_omitted+' omitted)'):'')+'</span>';if(m.summary)H+='<div>'+ESC(m.summary)+'</div>';for(var j=0;j<m.parts.length;j++){var p=m.parts[j];H+='<div style="margin-left:12px;opacity:.85">['+ESC(p.type)+'] '+p.size+' B'+(p.preview?(', '+ESC(String(p.preview).slice(0,300))+(p.truncated?' …[truncated]':'')+(p.raw_fragment?' [raw fragment]':'')):'')+'</div>';}H+='</div>';}H+='<div style="margin-top:10px;opacity:.75;font-size:11px">'+d.count+' messages shown'+((d.parts_truncated)?' · some parts truncated':'')+((d.response_truncated)?' · response shortened':'')+'</div>';if(d.has_more){H+='<div style="margin-top:6px"><button id="insp-more" class="tbtn">Load next</button></div>';}box.innerHTML=H;if(d.has_more){_inspState.cursor=d.cursor;_inspState.hasMore=true;var b=document.getElementById('insp-more');if(b)b.onclick=function(){_inspState.pending=_inspState.cursor;inspect(_inspState.sid);};}else{_inspState.hasMore=false;}box.scrollIntoView();}catch(e){if(e&&e.status===401){noteAuthFailure();box.textContent='Authorization required — reopen via the launcher link';return;}if(g!==_inspGen)return;box.textContent='ERR '+e.message+' (click the row to retry)';}}
 if(!window.__p1wire){window.__p1wire=1;document.addEventListener('click',function(e){var t=(e.target&&e.target.closest)?e.target.closest('[data-sid]'):null;if(t)inspect(t.getAttribute('data-sid'));});['ss-q','ss-agent','ss-model'].forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener('input',function(){if(window.__p1t)clearTimeout(window.__p1t);window.__p1t=setTimeout(fetchSessions,350);});});}
 $('refresh').onclick=()=>{if(AUTH_FAILED)return;load();};
+/* Update flow: click = check (one GitHub API call), second click = download
+   and install with checksum verification, third click = restart. Nothing
+   runs in the background and no network call happens at page load. */
+var _upState='idle',_upBusy=false;
+function setUpBtn(label,title){var b=$('update');if(!b)return;b.textContent=label;if(title)b.title=title;}
+async function postJson(url){try{var r=await authFetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});var t=await r.text();try{return JSON.parse(t);}catch(_){return {ok:false,error:'bad response'};}}catch(e){return {ok:false,error:String((e&&e.message)||e)};}}
+async function getJsonRaw(url){try{var r=await authFetch(url);var t=await r.text();try{return JSON.parse(t);}catch(_){return {ok:false,error:'bad response'};}}catch(e){return {ok:false,error:String((e&&e.message)||e)};}}
+$('update').onclick=async()=>{
+  if(_upBusy||AUTH_FAILED)return;
+  if(_upState==='applied'){
+    _upBusy=true;setUpBtn('⟳ Restarting');
+    var rr=await postJson('/api/restart');
+    if(!rr||!rr.ok){setUpBtn('⟳ Restart',(rr&&rr.error)||'restart failed');_upBusy=false;}
+    return;
+  }
+  if(_upState==='newer'){
+    _upBusy=true;setUpBtn('⬇ Installing');
+    var r=await postJson('/api/update/apply');
+    _upBusy=false;
+    if(r&&r.ok){_upState='applied';setUpBtn('⟳ Restart','updated to v'+(r.to||'')+'; click to restart');}
+    else{_upState='idle';setUpBtn('⬆ Update','update failed: '+((r&&r.error)||'error'));}
+    return;
+  }
+  _upBusy=true;setUpBtn('… Checking');
+  var d=await getJsonRaw('/api/update/check');
+  _upBusy=false;
+  if(!d||!d.ok){setUpBtn('⬆ Update','check failed: '+((d&&d.error)||'error'));return;}
+  if(d.newer){_upState='newer';setUpBtn('⬆ Update to v'+d.latest,'click to download, verify and install');return;}
+  setUpBtn('✔ Up to date','version '+(d.current||'?')+(d.latest?(' · latest v'+d.latest):' · no releases yet'));
+  setTimeout(function(){if(_upState==='idle')setUpBtn('⬆ Update','Check GitHub for a newer release');},3000);
+};
 $('search').addEventListener('input',renderSessions);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!AUTH_FAILED)load();});
 setInterval(()=>{if(!document.hidden&&!AUTH_FAILED)load();},((window.__ocdTimeouts&&window.__ocdTimeouts.refreshMs)||30000));
@@ -6023,6 +6220,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 body = json.dumps({"ok": False, "error": str(e)[:200]}).encode("utf-8")
             self._send(200, "application/json", body)
+        elif path.startswith("/api/update/check"):
+            self._send(200, "application/json",
+                       json.dumps(update_check()).encode("utf-8"))
         elif path.startswith("/api/agents"):
             try:
                 con = connect(self.db_path)
@@ -6125,6 +6325,30 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/plain", b"bye")
             if not others:
                 self._arm_close()
+        elif path == "/api/update/apply":
+            try:
+                result = update_apply()
+            except Exception as e:
+                result = {"ok": False, "error": str(e)[:200]}
+            self._send(200, "application/json", json.dumps(result).encode("utf-8"))
+        elif path == "/api/restart":
+            if not globals().get("UPDATE_APPLIED"):
+                self._send(200, "application/json",
+                           json.dumps({"ok": False,
+                                       "error": "no update applied in this process"}).encode("utf-8"))
+                return
+            globals()["RESTART_REQUESTED"] = True
+            self._send(200, "application/json", b'{"ok": true, "restarting": true}')
+            _srv = self.server
+
+            def _shutdown_later():
+                time.sleep(0.4)  # let the response flush before the port frees
+                try:
+                    _srv.shutdown()
+                except Exception:
+                    pass
+
+            threading.Thread(target=_shutdown_later, daemon=True).start()
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -6194,6 +6418,8 @@ def main():
     parser.add_argument("--agents-dir", action="append", default=[], metavar="DIR",
                         help="extra dir with agent .md files (repeatable)")
     parser.add_argument("--open", action="store_true", help="open the dashboard in a browser on start")
+    parser.add_argument("--version", action="version",
+                        version="little-better-dashboard " + DASHBOARD_VERSION)
     parser.add_argument("--router-events", default=str(ROUTER_EVENTS_DEFAULT),
                         help="path to Codex Router usage-events.jsonl")
     parser.add_argument("--router-limits", default=str(ROUTER_LIMITS_DEFAULT),
@@ -6230,7 +6456,11 @@ def main():
         raise SystemExit(2)
     Handler.server = server
     try:
-        server.auth_token = _new_token()
+        # A restarted instance reuses the token handed over by the update
+        # flow, so the tab that clicked Restart stays authorized; normal
+        # starts still mint a fresh token.
+        _env_token = os.environ.get("OCD_TOKEN") or ""
+        server.auth_token = _env_token if _TOKEN_RE.fullmatch(_env_token) else _new_token()
     except Exception:
         pass
     try:
@@ -6265,6 +6495,12 @@ def main():
         print("\nStopped.")
     finally:
         server.server_close()
+    if globals().get("RESTART_REQUESTED"):
+        try:
+            _spawn_restarted_server()
+            print("Restarted with the updated files.")
+        except Exception as e:
+            print(f"warning: could not restart automatically: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

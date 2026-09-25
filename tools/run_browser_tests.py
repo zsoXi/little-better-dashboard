@@ -177,8 +177,30 @@ def _write_fixture(root, mode="canary", xss=False):
                      (1, 132, 3, b"\x0a\x06\x08\xbc\xd5\xa9\xc6\x06"))
     ag_steps.commit()
     ag_steps.close()
+    cc_root = root / "claude"
+    cc_proj = cc_root / "projects" / "proj-a"
+    cc_proj.mkdir(parents=True)
+    cc_sess = cc_proj / "sess-1.jsonl"
+    with open(cc_sess, "w", encoding="utf-8", newline="") as f:
+        f.write(json.dumps({"type": "custom-title",
+                            "customTitle": "Synthetic Claude session"}) + "\n")
+        f.write(json.dumps({
+            "type": "assistant", "timestamp": "2026-09-20T19:59:50.000Z",
+            "cwd": "D:\\Fixture", "requestId": "cc-r1",
+            "message": {"id": "cc-m1", "model": "claude-opus-5-5",
+                        "usage": {"input_tokens": 10, "cache_creation_input_tokens": 100,
+                                  "cache_read_input_tokens": 1000, "output_tokens": 5,
+                                  "output_tokens_details": {"thinking_tokens": 2}}}}) + "\n")
+        f.write(json.dumps({
+            "type": "assistant", "timestamp": "2026-09-20T20:05:00.000Z",
+            "cwd": "D:\\Fixture", "requestId": "cc-r2",
+            "message": {"id": "cc-m2", "model": "claude-opus-5-5",
+                        "usage": {"input_tokens": 20, "cache_creation_input_tokens": 200,
+                                  "cache_read_input_tokens": 2000, "output_tokens": 7,
+                                  "output_tokens_details": {"thinking_tokens": 3}}}}) + "\n")
     return {"db": str(db_path), "events": events, "jev": str(jev_path),
-            "codex_dir": codex_dir, "antigravity": str(ag_root), "root": root}
+            "codex_dir": codex_dir, "antigravity": str(ag_root),
+            "claude": str(cc_root), "root": root}
 
 
 # --------------------------------------------------------------------------
@@ -552,7 +574,7 @@ def case_t01(ctx):
     _assert("timeout after" in (secs["codex"]["error"] or ""),
             "codex error should mention the timeout, got %r" % secs["codex"]["error"])
     status = ctx.status()
-    _assert("Partial update: 9/10" in status,
+    _assert("Partial update: 10/11" in status,
             "status should be a partial update, got %r" % status)
     _assert("codex" in status, "status should name the failing source, got %r" % status)
     ctx.evidence["status"] = status
@@ -575,7 +597,7 @@ def case_t02(ctx):
     for key in SEVEN_FAST:
         _assert(secs[key]["state"] == "success",
                 "section %s should still succeed, got %r" % (key, secs[key]))
-    _assert("Partial update: 9/10" in ctx.status(),
+    _assert("Partial update: 10/11" in ctx.status(),
             "status should be partial, got %r" % ctx.status())
     ctx.evidence["codex_error"] = secs["codex"]["error"]
     return ctx.shot("body-hang-timeout")
@@ -587,7 +609,7 @@ def case_t04(ctx):
     ctx.goto()
     ctx.cycle_finished()
     secs = ctx.sections()
-    _assert(all(secs[k]["state"] == "success" for k in SEVEN_FAST + ("codex", "jev", "antigravity")),
+    _assert(all(secs[k]["state"] == "success" for k in SEVEN_FAST + ("codex", "claude", "jev", "antigravity")),
             "first cycle should be fully green")
     first_status = ctx.status()
     _assert(first_status.startswith("Updated"),
@@ -613,7 +635,7 @@ def case_t04(ctx):
     _assert(rows_after == rows_before,
             "previous rows must be kept, before=%d after=%d" % (rows_before, rows_after))
     status = ctx.status()
-    _assert("Partial update: 9/10" in status and "stats" in status,
+    _assert("Partial update: 10/11" in status and "stats" in status,
             "status should be partial and name stats, got %r" % status)
     _assert(not status.startswith("Updated"),
             "no Updated for a partial cycle, got %r" % status)
@@ -671,7 +693,7 @@ def case_t09(ctx):
     ctx.goto()
     ctx.cycle_finished()
     secs = ctx.sections()
-    _assert(all(secs[k]["state"] == "success" for k in SEVEN_FAST + ("codex", "jev", "antigravity")),
+    _assert(all(secs[k]["state"] == "success" for k in SEVEN_FAST + ("codex", "claude", "jev", "antigravity")),
             "first cycle should be fully green")
 
     # -- inspect ---------------------------------------------------------
@@ -1013,6 +1035,7 @@ def _run_case(case_id, desc, fn, d, artifacts_dir, shots_dir, browser, log):
         d.Handler.router_limits = None
         d.Handler.jev_logs = [fixture["jev"]]
         d.Handler.antigravity_dir = fixture["antigravity"]
+        d.Handler.claude_dir = fixture["claude"]
         d.Handler.quiet = True
         try:
             d.CODEX_DIR = fixture["codex_dir"]
@@ -1112,6 +1135,23 @@ def main(argv=None):
         % (datetime.datetime.now().isoformat(timespec="seconds"),
            ", ".join(c[0] for c in selected)))
 
+    # Launch the browser before redirecting the environment: Edge resolves
+    # its profile from USERPROFILE at startup and exits immediately when it
+    # points at a fresh temp dir. The redirect below still keeps the
+    # dashboard itself away from real user data.
+    pw, browser, reason = _launch_browser(log)
+    if browser is None:
+        results = []
+        for case_id, desc, _ in selected:
+            res = {"acceptance_id": case_id, "result": "NOT_RUN",
+                   "reason": desc, "detail": reason}
+            results.append(res)
+            log("%s: NOT_RUN (%s)" % (case_id, reason))
+        json_path.write_text(
+            "\n".join(json.dumps(r) for r in results) + "\n", encoding="utf-8")
+        log.flush()
+        return 2
+
     # Isolated HOME before importing the dashboard (never real user data).
     home_tmp = tempfile.TemporaryDirectory(prefix="f6d-browser-home-")
     os.environ["HOME"] = home_tmp.name
@@ -1124,19 +1164,14 @@ def main(argv=None):
         for case_id, desc, _ in selected:
             log("%s: NOT_RUN (dashboard import failed: %s)" % (case_id, e))
         log.flush()
-        return 2
-
-    pw, browser, reason = _launch_browser(log)
-    if browser is None:
-        results = []
-        for case_id, desc, _ in selected:
-            res = {"acceptance_id": case_id, "result": "NOT_RUN",
-                   "reason": desc, "detail": reason}
-            results.append(res)
-            log("%s: NOT_RUN (%s)" % (case_id, reason))
-        json_path.write_text(
-            "\n".join(json.dumps(r) for r in results) + "\n", encoding="utf-8")
-        log.flush()
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            pw.stop()
+        except Exception:
+            pass
         home_tmp.cleanup()
         return 2
 

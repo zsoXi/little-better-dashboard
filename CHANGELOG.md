@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0] — Claude Code tab
+
+### Added
+- Claude Code tab: token usage decoded from local `~/.claude/projects/*.jsonl` transcripts. Totals and per-day usage (fresh input, cache writes, cache reads, output including thinking), request counts, models, and a session table with custom titles, workspaces and per-session tokens.
+- Requests are deduped by (message id, request id) before summing, because resumed sessions copy earlier history into new transcript files.
+- `--claude-dir DIR` option (default `~/.claude`), `/api/claude` endpoint, and a Claude column in the All tab, the combined per-day table and the exports.
+
 ## [1.0.0] — audit repair F1-F8
 
 ### Added

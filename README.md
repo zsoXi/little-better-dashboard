@@ -2,7 +2,7 @@
 
 **The local dashboard that shows what your AI coding tools actually did.**
 
-Your tools keep a remarkably detailed record of everything you do with them. OpenCode has a full SQLite database, Codex writes rollout files and a router ledger, Jev and Antigravity leave their own traces on disk. Reading any single one of those raw sources is a chore. Seeing all of them together, on one page, is the entire point of this project.
+Your tools keep a remarkably detailed record of everything you do with them. OpenCode has a full SQLite database, Codex writes rollout files and a router ledger, Claude Code keeps its own transcripts, Jev and Antigravity leave their own traces on disk. Reading any single one of those raw sources is a chore. Seeing all of them together, on one page, is the entire point of this project.
 
 It is a single Python file with zero dependencies. Download it, double-click the launcher, and your own stats appear in the browser.
 
@@ -14,11 +14,13 @@ It is a single Python file with zero dependencies. Download it, double-click the
 
 The OpenCode and Codex tabs share one set of time controls: **All time, Last 24h, Today, Yesterday, 7 days, 30 days, 90 days, 1 year and a custom from-to range**. Choose a period once and the charts, tables, key metrics, model lists and exports all follow it, and the choice is remembered across refreshes. The summary strip and the all-time records keep their fixed view on purpose, so there is always a stable baseline to compare against.
 
-**All tab** is the combined view and the one that opens first: one headline with total tokens, sessions, requests, judgments and agent steps, a per-day table that lines up OpenCode, Codex, Jev and Antigravity tokens next to Codex request counts, Jev judgments and Antigravity steps, and a source block that shows what loaded. The token total adds up OpenCode, Codex, Jev and Antigravity.
+**All tab** is the combined view and the one that opens first: one headline with total tokens, sessions, requests, judgments and agent steps, a per-day table that lines up OpenCode, Codex, Claude, Jev and Antigravity tokens next to Codex request counts, Jev judgments and Antigravity steps, and a source block that shows what loaded. The token total adds up OpenCode, Codex, Claude, Jev and Antigravity.
 
 **OpenCode tab** covers sessions, turns, tokens and cost, with tokens per day, tokens by model with provider labels, an activity heatmap and streaks, a session browser that includes search and a click-to-open message inspector, plus projects, warning signals, child and related sessions with **session activity** (recent, no recent activity, older or unknown, based on session updates, not execution status; auto-refreshed), agent configuration tiles, and a team graph of parent and child sessions.
 
 **Codex tab** gives the same treatment to your local Codex sessions, with request, token and model stats synthesized from your rollout files alongside a browsable session table.
+
+**Claude Code tab** reads your local Claude Code transcripts: token usage overall and per day (fresh input, cache writes and cache reads, output including thinking), request counts, models, and a session table with custom titles and workspaces. Resumed sessions repeat earlier history, so requests are deduped by message id and request id before anything is summed.
 
 **Jev tab** reads the local Jev audit logs (JevDesk and JevDeskEasy installs): proposal counts by verdict, input and output tokens, average latency, sessions, and a table of the newest judgments with the audit source for each. Sessions created in mock mode are excluded from the totals and reported separately.
 
@@ -30,7 +32,7 @@ The topbar has an **Update** button next to Refresh. One click checks the latest
 
 Everything is read from files already on your machine. The server binds to `127.0.0.1` only and additionally requires a per-instance bearer token plus strict Host/Origin checks; the bind alone is not claimed to prevent all exfiltration.
 
-Privacy: The dashboard may read and display message content from your local OpenCode and Codex sessions for session inspection, and reads local Jev audit logs (session ids, verdicts, token counts) for the Jev tab, and local Antigravity conversation data (titles, workspace paths, step times) for the Antigravity tab. This content stays on your machine and is only served to a browser session presenting the instance token over the local 127.0.0.1 dashboard. Nothing is uploaded or sent to external services. Private content is visible to anyone holding the instance link, and tunnels or public exposure are not supported.
+Privacy: The dashboard may read and display message content from your local OpenCode and Codex sessions for session inspection, and reads local Jev audit logs (session ids, verdicts, token counts) for the Jev tab, local Antigravity conversation data (titles, workspace paths, step times) for the Antigravity tab, and local Claude Code transcripts (token usage, session titles, workspace paths) for the Claude Code tab. This content stays on your machine and is only served to a browser session presenting the instance token over the local 127.0.0.1 dashboard. Nothing is uploaded or sent to external services. Private content is visible to anyone holding the instance link, and tunnels or public exposure are not supported.
 
 ## Data handling and limits
 
@@ -39,6 +41,7 @@ Privacy: The dashboard may read and display message content from your local Open
 - The Codex request list is a bounded **tail** of the newest events with an explicit scanned-vs-total indicator; the synthesized history that feeds the Codex charts keeps the full history (no silent cut-off).
 - The Jev tab is a usage view over local hash-chained audit logs, not an audit tool: it does not verify the hash chain, excludes `mock: true` sessions from totals, and reads a bounded tail of each log.
 - The Antigravity tab reads the local client databases read-only (conversation summaries plus per-conversation step and generation metadata; newest steps are sampled) and decodes token usage from that local metadata; credit or quota data lives in the cloud and is not shown.
+- The Claude Code tab reads local transcripts read-only and dedupes requests across resumed sessions (the same message id and request id are counted once), which is why its totals can be lower than the raw line count.
 - "Usage in the 24h before each commit" windows are global and **non-additive**: windows may overlap and may include other projects, so commit rows must not be summed.
 - The Codex synthesis **cache** index lives in `.cache/codex_index.json` (a derived **checkpoint** tied to the published generation): it is **safe to delete** at any time and is never a source of truth; a failed checkpoint write never fails a publish.
 - The server binds to 127.0.0.1 only, requires the per-instance token from the `#token=` fragment, and does not support **tunnels** or public exposure.
@@ -82,6 +85,7 @@ python opencode_dashboard.py [db] [--port PORT] [--agents-dir DIR] [--open] [--q
 | `--router-events / --router-limits` | unset | Use a real Codex Router ledger instead of the synthesized one |
 | `--jev-logs FILE` | local JevDesk installs | Jev `audit.jsonl` to read (repeatable) |
 | `--antigravity-dir DIR` | `~/.gemini/antigravity` | Antigravity data dir to read |
+| `--claude-dir DIR` | `~/.claude` | Claude Code data dir to read |
 | `--idle-timeout SECONDS` | off | Shut down after N seconds with no requests |
 | `--version` | | Print the version and exit |
 
@@ -95,9 +99,10 @@ If the database is missing, you get a plain message asking you to run OpenCode a
 | `~/.codex/sessions/**/*.jsonl` (local rollout files) | Codex tab. On the first run a small `codex_router_events.jsonl` index is built next to the script. It regenerates automatically and is safe to delete |
 | `%LOCALAPPDATA%\JevDeskEasy\runtime\audit.jsonl` and `%LOCALAPPDATA%\JevDesk\audit.jsonl` (read-only) | Jev tab. One JSON line per session, proposal or stop event; missing files are reported as not found |
 | `%USERPROFILE%\.gemini\antigravity` (read-only) | Antigravity tab. `conversation_summaries.db` plus `conversations/*.db` step and generation metadata; missing files are reported as not found |
+| `%USERPROFILE%\.claude\projects\*.jsonl` (read-only) | Claude Code tab. One JSONL transcript per session; token usage is decoded from assistant usage records and deduped across resumed sessions |
 | `.opencode/agent/*.md` and `~/.config/opencode/agent/*.md` in the current project | Agent configuration tiles |
 
-It makes no network calls, collects no telemetry and needs no accounts.
+It makes no network calls except the update button you click, collects no telemetry and needs no accounts.
 
 ## Notes
 

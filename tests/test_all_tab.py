@@ -22,18 +22,19 @@ class TestAllTabWiring(unittest.TestCase):
 
     def test_all_tab_is_first_in_strip(self):
         self.assertLess(self.src.index('id="tab-all"'), self.src.index('id="tab-opencode"'))
-        self.assertEqual(self.src.count('class="stab'), 5)
+        self.assertEqual(self.src.count('class="stab'), 6)
 
     def test_renderers_defined(self):
         self.assertIn("function combinedDays(){", self.src)
         self.assertIn("function renderAllTab(){", self.src)
 
     def test_render_hooks(self):
-        self.assertEqual(self.src.count("renderAllTab();"), 5)
+        self.assertEqual(self.src.count("renderAllTab();"), 6)
         for token in ['render:d=>{S=d;renderAll();renderAllTab();}}',
                       'render:d=>{R=d;renderRouter();renderAllTab();}}',
                       'render:d=>{JV=d;renderJev();renderAllTab();}}',
-                      'render:d=>{AG=d;renderAntigravity();renderAllTab();}}']:
+                      'render:d=>{AG=d;renderAntigravity();renderAllTab();}}',
+                      'render:d=>{CL=d;renderClaude();renderAllTab();}}']:
             self.assertIn(token, self.src)
 
     def test_tab_switch_and_restore(self):
@@ -45,7 +46,8 @@ class TestAllTabWiring(unittest.TestCase):
 
     def test_export_and_table_columns(self):
         for token in ["TAB==='all'", 'all-usage.json', 'all-usage-days.csv',
-                      'Jev judgments', 'AG steps', 'const rows=combinedDays();']:
+                      'Jev judgments', 'AG steps', 'const rows=combinedDays();',
+                      'claude_tokens']:
             self.assertIn(token, self.src)
 
 

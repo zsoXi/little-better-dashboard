@@ -44,8 +44,10 @@ JEV_READ_CAP = 2 * 1024 * 1024  # bounded tail read per Jev audit log
 JEV_MAX_EVENTS = 5000  # most-recent Jev audit events kept per source
 AG_DIR_DEFAULT = _HOME / ".gemini" / "antigravity"  # local Antigravity client data
 AG_MAX_STEPS = 20000  # newest steps sampled per Antigravity conversation db
+CLAUDE_DIR_DEFAULT = _HOME / ".claude"  # Claude Code data dir (projects/*.jsonl transcripts)
+CLAUDE_CACHE = {}  # str(path) -> ((mtime_ns, size), parsed transcript)
 SYNTH_SCHEMA = 3  # bump to force codex-synth rebuild when the writer changes
-DASHBOARD_VERSION = "1.0.0"  # keep in sync with the vX.Y.Z release tag
+DASHBOARD_VERSION = "1.1.0"  # keep in sync with the vX.Y.Z release tag
 UPDATE_REPO = "zsoXi/little-better-dashboard"
 UPDATE_API_LATEST = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_ASSET_MAX = 50 * 1024 * 1024  # download cap for the release zip
@@ -3693,6 +3695,179 @@ def query_antigravity(root):
     }
 
 
+def _cc_local_iso(ts):
+    """Claude Code timestamps are ISO UTC ('...Z') -> local naive ISO seconds."""
+    if not ts:
+        return ""
+    s = str(ts).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return s[:19].replace(" ", "T")
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _cc_parse_file(path):
+    """Parse one Claude Code transcript. Returns (entries, meta, bad_lines).
+
+    Entries are locally deduped usage records; global dedupe happens in
+    query_claude because resumed sessions copy earlier requests into new files.
+    """
+    try:
+        st = os.stat(path)
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return [], {}, 0
+    hit = CLAUDE_CACHE.get(str(path))
+    if hit and hit[0] == key:
+        return hit[1]
+    entries = []
+    meta = {"title": "", "cwd": "", "first": "", "last": "", "session": Path(path).stem}
+    bad = 0
+    seen_local = set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"usage"' not in line and '"custom-title"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    bad += 1
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("type") == "custom-title":
+                    ct = obj.get("customTitle")
+                    if ct and not meta["title"]:
+                        meta["title"] = str(ct)[:80]
+                    continue
+                m = obj.get("message")
+                if not isinstance(m, dict):
+                    continue
+                u = m.get("usage")
+                if not isinstance(u, dict):
+                    continue
+                mid = m.get("id")
+                rid = obj.get("requestId")
+                dk = (str(mid), str(rid)) if mid else ("line", str(obj.get("uuid")))
+                if dk in seen_local:
+                    continue
+                seen_local.add(dk)
+                iso = _cc_local_iso(obj.get("timestamp"))
+                ot = u.get("output_tokens_details") or {}
+                th = (ot.get("thinking_tokens") or 0) if isinstance(ot, dict) else 0
+                entries.append((dk, iso[:10], iso, str(m.get("model") or "?"),
+                                int(u.get("input_tokens") or 0),
+                                int(u.get("cache_creation_input_tokens") or 0),
+                                int(u.get("cache_read_input_tokens") or 0),
+                                int(u.get("output_tokens") or 0),
+                                int(th or 0)))
+                if not meta["cwd"] and obj.get("cwd"):
+                    meta["cwd"] = str(obj.get("cwd"))
+                if iso:
+                    if not meta["first"] or iso < meta["first"]:
+                        meta["first"] = iso
+                    if not meta["last"] or iso > meta["last"]:
+                        meta["last"] = iso
+    except Exception:
+        pass
+    info = (entries, meta, bad)
+    CLAUDE_CACHE[str(path)] = (key, info)
+    return info
+
+
+def query_claude(root=None):
+    """Token usage from local Claude Code transcripts (~/.claude/projects).
+
+    Read-only: usage numbers, session titles and metadata only. Requests are
+    deduped globally by (message.id, requestId) because resumed sessions copy
+    earlier history into new transcript files.
+    """
+    root = Path(root or CLAUDE_DIR_DEFAULT)
+    proj = root / "projects"
+    try:
+        files = sorted(str(p) for p in proj.rglob("*.jsonl")) if proj.is_dir() else []
+    except OSError:
+        files = []
+    src = {"name": "projects", "path": str(proj), "exists": proj.is_dir(),
+           "files": len(files), "requests": 0, "bad_lines": 0, "error": None}
+    seen = set()
+    totals = {"requests": 0, "input": 0, "cache_new": 0, "cache_read": 0,
+              "output": 0, "thinking": 0, "total": 0}
+    per_day = {}
+    per_model = {}
+    sessions = []
+    try:
+        for fp in files:
+            entries, meta, bad = _cc_parse_file(fp)
+            src["bad_lines"] += bad
+            s = {"id": meta.get("session") or Path(fp).stem, "title": meta.get("title") or "",
+                 "cwd": meta.get("cwd") or "", "first": meta.get("first") or "",
+                 "last": meta.get("last") or "", "reqs": 0, "tokens": 0, "models": {}}
+            for (dk, day, iso, model, ti, cn, cr, to, th) in entries:
+                if dk in seen:
+                    continue
+                seen.add(dk)
+                turn = ti + cn + cr + to
+                totals["requests"] += 1
+                totals["input"] += ti
+                totals["cache_new"] += cn
+                totals["cache_read"] += cr
+                totals["output"] += to
+                totals["thinking"] += th
+                totals["total"] += turn
+                s["reqs"] += 1
+                s["tokens"] += turn
+                s["models"][model] = s["models"].get(model, 0) + 1
+                if day:
+                    d = per_day.get(day)
+                    if not d:
+                        d = per_day[day] = {"requests": 0, "input": 0, "cache_new": 0,
+                                            "cache_read": 0, "output": 0, "thinking": 0, "total": 0}
+                    d["requests"] += 1
+                    d["input"] += ti
+                    d["cache_new"] += cn
+                    d["cache_read"] += cr
+                    d["output"] += to
+                    d["thinking"] += th
+                    d["total"] += turn
+                pm = per_model.get(model)
+                if not pm:
+                    pm = per_model[model] = {"requests": 0, "input": 0, "cache_new": 0,
+                                             "cache_read": 0, "output": 0, "thinking": 0, "total": 0}
+                pm["requests"] += 1
+                pm["input"] += ti
+                pm["cache_new"] += cn
+                pm["cache_read"] += cr
+                pm["output"] += to
+                pm["thinking"] += th
+                pm["total"] += turn
+            if s["reqs"]:
+                ml = sorted(s["models"].items(), key=lambda kv: -kv[1])
+                s["models"] = [m for m, _ in ml[:4]]
+                sessions.append(s)
+    except Exception as e:
+        src["error"] = str(e)[:200]
+    src["requests"] = totals["requests"]
+    days = [{"date": d, "requests": v["requests"], "ti": v["input"], "cn": v["cache_new"],
+             "cr": v["cache_read"], "to": v["output"], "th": v["thinking"], "total": v["total"]}
+            for d, v in sorted(per_day.items())]
+    models = [{"model": k, "requests": v["requests"], "input": v["input"],
+               "cache_new": v["cache_new"], "cache_read": v["cache_read"],
+               "output": v["output"], "thinking": v["thinking"], "total": v["total"]}
+              for k, v in sorted(per_model.items(), key=lambda kv: -kv[1]["total"])]
+    sessions.sort(key=lambda s: s["last"] or "", reverse=True)
+    rng = f"{days[0]['date']} → {days[-1]['date']}" if days else "no activity"
+    return {"ok": True, "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+            "range": rng, "sources": [src], "totals": totals,
+            "models": models, "days": days, "sessions": sessions[:300]}
+
+
 def session_prompts(con, session_id):
     """Prompts for one session, from session_input when available, otherwise
     reconstructed from user text parts (older opencode versions)."""
@@ -4076,6 +4251,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <button class="stab" id="tab-all" role="tab" aria-selected="false" aria-controls="view-all">All<span class="cnt" id="tab-all-cnt"></span></button>
     <button class="stab active" id="tab-opencode" role="tab" aria-selected="true" aria-controls="view-opencode">OpenCode<span class="cnt" id="tab-opencode-cnt"></span></button>
     <button class="stab" id="tab-router" role="tab" aria-selected="false" aria-controls="view-router">Codex<span class="cnt" id="tab-router-cnt"></span></button>
+    <button class="stab" id="tab-claude" role="tab" aria-selected="false" aria-controls="view-claude">Claude<span class="cnt" id="tab-claude-cnt"></span></button>
     <button class="stab" id="tab-jev" role="tab" aria-selected="false" aria-controls="view-jev">Jev<span class="cnt" id="tab-jev-cnt"></span></button>
     <button class="stab" id="tab-antigravity" role="tab" aria-selected="false" aria-controls="view-antigravity">Antigravity<span class="cnt" id="tab-antigravity-cnt"></span></button>
   </div>
@@ -4330,6 +4506,36 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
     <div class="act-legend" id="r-act-legend"></div>
   </div>
   </div><!-- /view-router -->
+  <div id="view-claude" role="tabpanel" aria-labelledby="tab-claude" hidden>
+  <section class="hero" style="padding-top:26px">
+    <div class="eyebrow" id="cl-range">CLAUDE CODE</div>
+    <h1 id="cl-headline">Loading Claude Code usage…</h1>
+    <div class="pills" id="cl-pills"></div>
+  </section>
+  <section class="summary" id="cl-summary"></section>
+
+  <h2 class="sec">Models <span class="hint">requests per model · local timezone</span></h2>
+  <div class="card"><div class="chips" id="cl-models"></div></div>
+
+  <h2 class="sec">Activity per day <span class="hint">local timezone</span></h2>
+  <div class="card">
+    <div class="tbl-scroll"><table class="tbl" id="cl-days">
+      <thead><tr><th>Day</th><th class="num">Requests</th><th class="num">Input</th><th class="num">Cache new</th><th class="num">Cache read</th><th class="num">Output</th><th class="num">Total</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </div>
+
+  <h2 class="sec">Sessions <span class="hint" id="cl-hint"></span></h2>
+  <div class="card">
+    <div class="tbl-scroll"><table class="tbl" id="cl-tbl">
+      <thead><tr><th>Session</th><th>Workspace</th><th class="num">Requests</th><th class="num">Tokens</th><th>Models</th><th>Last activity</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </div>
+
+  <h2 class="sec">Data sources <span class="hint">local Claude Code transcripts · read-only</span></h2>
+  <div class="card"><div id="cl-sources" style="line-height:1.7"></div></div>
+  </div><!-- /view-claude -->
   <div id="view-jev" role="tabpanel" aria-labelledby="tab-jev" hidden>
   <section class="hero" style="padding-top:26px">
     <div class="eyebrow" id="j-range">JEV</div>
@@ -4402,10 +4608,10 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   </section>
   <section class="summary" id="al-summary"></section>
 
-  <h2 class="sec">Per day <span class="hint">tokens from OpenCode, Codex, Jev and Antigravity · local timezone</span></h2>
+  <h2 class="sec">Per day <span class="hint">tokens from OpenCode, Codex, Claude, Jev and Antigravity · local timezone</span></h2>
   <div class="card">
     <div class="tbl-scroll"><table class="tbl" id="al-days">
-      <thead><tr><th>Day</th><th class="num">OpenCode</th><th class="num">Codex</th><th class="num">Jev</th><th class="num">Antigravity</th><th class="num">Total</th><th class="num">Codex reqs</th><th class="num">Jev judgments</th><th class="num">AG steps</th></tr></thead>
+      <thead><tr><th>Day</th><th class="num">OpenCode</th><th class="num">Codex</th><th class="num">Claude</th><th class="num">Jev</th><th class="num">Antigravity</th><th class="num">Total</th><th class="num">Codex reqs</th><th class="num">Jev judgments</th><th class="num">AG steps</th></tr></thead>
       <tbody></tbody>
     </table></div>
   </div>
@@ -4951,41 +5157,69 @@ function renderAntigravity(){
   $('ag-sources').innerHTML=(d.sources||[]).map(s=>{var line=ESC(s.name)+' — <span class="mono" style="font-size:11.5px">'+ESC(s.path)+'</span> — ';if(!s.exists){line+='not found'+(s.error?(' ('+ESC(s.error)+')'):'');}else if(s.conversations!=null){line+=F(s.conversations)+' conversations';}else{line+=F(s.files)+' file'+(s.files===1?'':'s')+' · '+F(s.steps)+' steps';if(s.truncated)line+=' · newest steps sampled';}if(s.error&&s.exists)line+=' ('+ESC(s.error)+')';return '<div>'+line+'</div>';}).join('')||'<div class="empty">No Antigravity data found.</div>';
 }
 
+let CL=null;
+function renderClaude(){
+  const d=CL;
+  const cnt=$('tab-claude-cnt');
+  if(cnt)cnt.textContent=(d&&d.totals?FN(d.totals.total):'');
+  if(!d||!d.ok)return;
+  const t=d.totals||{},days=d.days||[],models=d.models||[],sess=d.sessions||[];
+  const range=$('cl-range');
+  if(range)range.textContent='CLAUDE CODE · '+String(d.range||'no activity').toUpperCase()+' · LOCAL TIME';
+  const head=$('cl-headline');
+  if(head)head.innerHTML=BOLD(ESC(FN(t.total)+' tokens across '+F(t.requests)+' Claude requests in '+F(sess.length)+' sessions'+(t.thinking?(' · '+F(t.thinking)+' thinking'):'')+'.'));
+  $('cl-pills').innerHTML=[['Tokens',FN(t.total)],['Requests',F(t.requests)],['Sessions',F(sess.length)],['Models',F(models.length)],['Cache read',FN(t.cache_read)]].map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+ESC(v)+'</b></span>').join('');
+  $('cl-summary').innerHTML=[['Tokens total',FN(t.total),'input + cache + output'],['Requests',F(t.requests),'assistant turns'],['Cache read',FN(t.cache_read),'reused context'],['Cache write',FN(t.cache_new),'new cached context'],['Output',FN(t.output),F(t.thinking)+' thinking'],['Sessions',F(sess.length),'transcripts']].map(([l,v,s])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+v+'</div><div class="ss">'+s+'</div></div>').join('');
+  $('cl-models').innerHTML=models.map(x=>'<span class="chip">'+ESC(x.model)+' ×'+F(x.requests)+' · '+FN(x.total)+'</span>').join('')||'<span class="chip">no usage</span>';
+  const dtb=document.querySelector('#cl-days tbody');
+  if(dtb)dtb.innerHTML=days.map(x=>'<tr><td>'+ESC(x.date)+'</td><td class="num">'+F(x.requests)+'</td><td class="num">'+FN(x.ti)+'</td><td class="num">'+FN(x.cn)+'</td><td class="num">'+FN(x.cr)+'</td><td class="num">'+FN(x.to)+'</td><td class="num" style="font-weight:700">'+FN(x.total)+'</td></tr>').join('')||'<tr><td colspan="7"><div class="empty">No Claude Code usage found.</div></td></tr>';
+  const hint=$('cl-hint');
+  if(hint)hint.textContent='newest first · '+sess.length+' total';
+  const tb=document.querySelector('#cl-tbl tbody');
+  if(tb)tb.innerHTML=sess.map(s=>'<tr><td><b>'+ESC((s.title||s.id).slice(0,80))+'</b><div class="sub">'+ESC(String(s.id).slice(0,18))+'</div></td><td class="sub">'+ESC(s.cwd||'')+'</td><td class="num">'+F(s.reqs)+'</td><td class="num" style="font-weight:700">'+FN(s.tokens)+'</td><td class="sub">'+ESC((s.models||[]).join(', '))+'</td><td class="sub">'+ESC(isoLocal(s.last))+'</td></tr>').join('')||'<tr><td colspan="6"><div class="empty">No sessions found.</div></td></tr>';
+  const src=$('cl-sources');
+  if(src)src.innerHTML=(d.sources||[]).map(s=>{var line=ESC(s.name)+' — <span class="mono" style="font-size:11.5px">'+ESC(s.path)+'</span> — ';if(!s.exists){line+='not found'+(s.error?(' ('+ESC(s.error)+')'):'');}else{line+=F(s.files)+' file'+(s.files===1?'':'s')+' · '+F(s.requests)+' requests';if(s.bad_lines)line+=' · '+F(s.bad_lines)+' bad lines';if(s.error)line+=' ('+ESC(s.error)+')';}return '<div>'+line+'</div>';}).join('')||'<div class="empty">No Claude Code data found.</div>';
+}
+
 function combinedDays(){
   const m={};
-  const e=d=>{if(!m[d])m[d]={date:d,oc:0,cx:0,jv:0,agt:0,total:0,req:0,judg:0,ag:0};return m[d];};
+  const e=d=>{if(!m[d])m[d]={date:d,oc:0,cx:0,jv:0,cl:0,agt:0,total:0,req:0,judg:0,ag:0};return m[d];};
   ((S&&S.days)||[]).forEach(x=>{e(x.date).oc+=dayTotal(x);});
   ((R&&R.days)||[]).forEach(x=>{const y=e(x.date);y.cx+=rDayTokenTotal(x);y.req+=x.reqs||0;});
   ((JV&&JV.days)||[]).forEach(x=>{const y=e(x.date);y.jv+=(x.input_tokens||0)+(x.output_tokens||0);y.judg+=x.proposals||0;});
+  ((CL&&CL.days)||[]).forEach(x=>{const y=e(x.date);y.cl+=(x.total||0);});
   ((AG&&AG.days)||[]).forEach(x=>{const y=e(x.date);y.ag+=x.steps||0;y.agt+=(x.total||0);});
-  return Object.keys(m).sort().map(k=>{const y=m[k];y.total=y.oc+y.cx+y.jv+y.agt;return y;});
+  return Object.keys(m).sort().map(k=>{const y=m[k];y.total=y.oc+y.cx+y.jv+y.cl+y.agt;return y;});
 }
 function renderAllTab(){
-  const sT=(S&&S.totals)||null,rT=(R&&R.totals)||null,jT=(JV&&JV.totals)||null,aT=(AG&&AG.totals)||null;
-  if(!sT&&!rT&&!jT&&!aT)return;
+  const sT=(S&&S.totals)||null,rT=(R&&R.totals)||null,jT=(JV&&JV.totals)||null,aT=(AG&&AG.totals)||null,cT=(CL&&CL.totals)||null;
+  if(!sT&&!rT&&!jT&&!aT&&!cT)return;
   const sTok=sT?(sT.tokens_total||0):0,rTok=rT?(rT.tokens_total||0):0;
   const jTok=jT?((jT.input_tokens||0)+(jT.output_tokens||0)):0;
   const aTok=aT?(aT.tokens_total||0):0;
-  const grand=sTok+rTok+jTok+aTok;
+  const cTok=cT?(cT.total||0):0;
+  const grand=sTok+rTok+jTok+cTok+aTok;
   const cnt=$('tab-all-cnt');
   if(cnt)cnt.textContent=grand?FN(grand):'';
   $('al-range').textContent='ALL SOURCES · LOCAL TIME';
   const bits=[];
   if(sT)bits.push(F(sT.sessions||0)+' sessions');
   if(rT)bits.push(F(rT.requests||0)+' '+((R&&R.req_word_short)||'requests'));
+  if(cT)bits.push(F(cT.requests||0)+' Claude requests');
   if(jT)bits.push(F(jT.proposals||0)+' judgments');
   if(aT)bits.push(F(aT.requests||0)+' agent requests');
   $('al-headline').innerHTML=BOLD(ESC(FN(grand)+' tokens across '+bits.join(' · ')+(bits.length?'':'.')));
-  $('al-pills').innerHTML=[['Tokens total',FN(grand)],['OpenCode',FN(sTok)],['Codex',FN(rTok)],['Jev',FN(jTok)],['Antigravity',FN(aTok)]].map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+v+'</b></span>').join('');
-  const cards=[['Tokens total',FN(grand),'OpenCode + Codex + Jev + Antigravity'],['OpenCode',FN(sTok),sT?F(sT.sessions||0)+' sessions':'not loaded'],['Codex',FN(rTok),rT?F(rT.requests||0)+' '+((R&&R.req_word_short)||'requests'):'not loaded'],['Jev',FN(jTok),jT?F(jT.proposals||0)+' judgments':'not loaded'],['Antigravity',FN(aTok),aT?(F(aT.requests||0)+' requests · '+F(aT.steps||0)+' steps'):'not loaded']];
+  $('al-pills').innerHTML=[['Tokens total',FN(grand)],['OpenCode',FN(sTok)],['Codex',FN(rTok)],['Claude',FN(cTok)],['Jev',FN(jTok)],['Antigravity',FN(aTok)]].map(([k,v])=>'<span class="pill">'+ESC(k)+' <b style="color:var(--text)">'+v+'</b></span>').join('');
+  const cards=[['Tokens total',FN(grand),'OpenCode + Codex + Claude + Jev + Antigravity'],['OpenCode',FN(sTok),sT?F(sT.sessions||0)+' sessions':'not loaded'],['Codex',FN(rTok),rT?F(rT.requests||0)+' '+((R&&R.req_word_short)||'requests'):'not loaded'],['Claude',FN(cTok),cT?(F(cT.requests||0)+' requests · '+F(((CL&&CL.sessions)||[]).length)+' sessions'):'not loaded'],['Jev',FN(jTok),jT?F(jT.proposals||0)+' judgments':'not loaded'],['Antigravity',FN(aTok),aT?(F(aT.requests||0)+' requests · '+F(aT.steps||0)+' steps'):'not loaded']];
   $('al-summary').innerHTML=cards.map(([l,v,s])=>'<div class="sum-card"><div class="sl">'+l+'</div><div class="sv">'+v+'</div><div class="ss">'+s+'</div></div>').join('');
   const rows=combinedDays();
   const tb=document.querySelector('#al-days tbody');
-  if(tb)tb.innerHTML=rows.map(x=>'<tr><td>'+ESC(x.date)+'</td><td class="num">'+FN(x.oc)+'</td><td class="num">'+FN(x.cx)+'</td><td class="num">'+FN(x.jv)+'</td><td class="num">'+FN(x.agt)+'</td><td class="num" style="font-weight:700">'+FN(x.total)+'</td><td class="num">'+F(x.req)+'</td><td class="num">'+F(x.judg)+'</td><td class="num">'+F(x.ag)+'</td></tr>').join('')||'<tr><td colspan="9"><div class="empty">No usage found.</div></td></tr>';
+  if(tb)tb.innerHTML=rows.map(x=>'<tr><td>'+ESC(x.date)+'</td><td class="num">'+FN(x.oc)+'</td><td class="num">'+FN(x.cx)+'</td><td class="num">'+FN(x.cl)+'</td><td class="num">'+FN(x.jv)+'</td><td class="num">'+FN(x.agt)+'</td><td class="num" style="font-weight:700">'+FN(x.total)+'</td><td class="num">'+F(x.req)+'</td><td class="num">'+F(x.judg)+'</td><td class="num">'+F(x.ag)+'</td></tr>').join('')||'<tr><td colspan="10"><div class="empty">No usage found.</div></td></tr>';
   const line=(name,ok,text)=>'<div><b>'+ESC(name)+'</b> — '+(ok?text:'<span style="color:var(--subtle)">not loaded</span>')+'</div>';
   $('al-sources').innerHTML=
     line('OpenCode',sT,FN(sTok)+' tokens · '+F(sT?sT.sessions||0:0)+' sessions')+
     line('Codex',rT,FN(rTok)+' tokens · '+F(rT?rT.requests||0:0)+' '+((R&&R.req_word_short)||'requests'))+
+    line('Claude',cT,FN(cTok)+' tokens · '+F(cT?cT.requests||0:0)+' requests')+
     line('Jev',jT,FN(jTok)+' tokens · '+F(jT?jT.proposals||0:0)+' judgments')+
     line('Antigravity',aT,FN(aTok)+' tokens · '+F(aT?aT.requests||0:0)+' requests · '+F(aT?aT.steps||0:0)+' steps');
 }
@@ -5581,24 +5815,27 @@ function renderRouterRequests(){
 }
 function setTab(name){
   TAB=name;
-  const al=name==='all',oc=name==='opencode',rt=name==='router',jv=name==='jev',av=name==='antigravity';
+  const al=name==='all',oc=name==='opencode',rt=name==='router',cc=name==='claude',jv=name==='jev',av=name==='antigravity';
   $('tab-all').classList.toggle('active',al);
   $('tab-opencode').classList.toggle('active',oc);
   $('tab-router').classList.toggle('active',rt);
+  $('tab-claude').classList.toggle('active',cc);
   $('tab-jev').classList.toggle('active',jv);
   $('tab-antigravity').classList.toggle('active',av);
   $('tab-all').setAttribute('aria-selected',al);
   $('tab-opencode').setAttribute('aria-selected',oc);
   $('tab-router').setAttribute('aria-selected',rt);
+  $('tab-claude').setAttribute('aria-selected',cc);
   $('tab-jev').setAttribute('aria-selected',jv);
   $('tab-antigravity').setAttribute('aria-selected',av);
   $('view-all').hidden=!al;
   $('view-opencode').hidden=!oc;
   $('view-router').hidden=!rt;
+  $('view-claude').hidden=!cc;
   $('view-jev').hidden=!jv;
   $('view-antigravity').hidden=!av;
   try{sessionStorage.setItem('ocd-tab',name);}catch(_){}
-  if(al)renderAllTab();else if(rt)renderRouter();else if(jv)renderJev();else if(av)renderAntigravity();else renderAll();
+  if(al)renderAllTab();else if(rt)renderRouter();else if(cc)renderClaude();else if(jv)renderJev();else if(av)renderAntigravity();else renderAll();
 }
 function sortH(e){const th=e.target.closest('th');if(!th)return;const k=th.dataset.k;if(!k)return;
   if(k===sortK)sortAsc=!sortAsc;else{sortK=k;sortAsc=false;}
@@ -5726,6 +5963,7 @@ $('r-share-btn').onclick=()=>{RSHARE=!RSHARE;$('r-share-btn').textContent='Share
 $('tab-all').onclick=()=>setTab('all');
 $('tab-opencode').onclick=()=>setTab('opencode');
 $('tab-router').onclick=()=>setTab('router');
+$('tab-claude').onclick=()=>setTab('claude');
 $('tab-jev').onclick=()=>setTab('jev');
 $('tab-antigravity').onclick=()=>setTab('antigravity');
 $('r-search').addEventListener('input',renderRouterRequests);
@@ -5763,9 +6001,14 @@ function exportData(kind){
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=kind==='json'?'antigravity-usage.json':'antigravity-steps-days.csv';a.click();
     return;
   }
+  if(TAB==='claude'&&CL){
+    const b=new Blob([kind==='json'?JSON.stringify(CL,null,2):['date','requests','input','cache_new','cache_read','output','total'].concat((CL.days||[]).map(d=>[d.date,d.requests,d.ti,d.cn,d.cr,d.to,d.total].join(','))).join('\n')],{type:kind==='json'?'application/json':'text/csv'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=kind==='json'?'claude-usage.json':'claude-usage-days.csv';a.click();
+    return;
+  }
   if(TAB==='all'){
     const rows=combinedDays();
-    const b=new Blob([kind==='json'?JSON.stringify({opencode:S&&S.totals,codex:R&&R.totals,jev:JV&&JV.totals,antigravity:AG&&AG.totals,days:rows},null,2):['date','opencode_tokens','codex_tokens','jev_tokens','antigravity_tokens','total_tokens','codex_requests','jev_judgments','ag_steps'].concat(rows.map(d=>[d.date,Math.round(d.oc),Math.round(d.cx),Math.round(d.jv),Math.round(d.agt),Math.round(d.total),d.req,d.judg,d.ag].join(','))).join('\n')],{type:kind==='json'?'application/json':'text/csv'});
+    const b=new Blob([kind==='json'?JSON.stringify({opencode:S&&S.totals,codex:R&&R.totals,claude:CL&&CL.totals,jev:JV&&JV.totals,antigravity:AG&&AG.totals,days:rows},null,2):['date','opencode_tokens','codex_tokens','claude_tokens','jev_tokens','antigravity_tokens','total_tokens','codex_requests','jev_judgments','ag_steps'].concat(rows.map(d=>[d.date,Math.round(d.oc),Math.round(d.cx),Math.round(d.cl),Math.round(d.jv),Math.round(d.agt),Math.round(d.total),d.req,d.judg,d.ag].join(','))).join('\n')],{type:kind==='json'?'application/json':'text/csv'});
     const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=kind==='json'?'all-usage.json':'all-usage-days.csv';a.click();
     return;
   }
@@ -5831,7 +6074,8 @@ const SECTIONS=[
  {key:'signals',url:'/api/signals',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.signals),render:d=>{SG=d;renderSignals();}},
  {key:'codex',url:'/api/codex',validate:d=>d&&d.ok===true&&Array.isArray(d.sessions),render:d=>{CX=d;renderCodex();}},
  {key:'jev',url:'/api/jev',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{JV=d;renderJev();renderAllTab();}},
- {key:'antigravity',url:'/api/antigravity',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{AG=d;renderAntigravity();renderAllTab();}}
+ {key:'antigravity',url:'/api/antigravity',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{AG=d;renderAntigravity();renderAllTab();}},
+ {key:'claude',url:'/api/claude',validate:d=>d&&typeof d==='object'&&!d.error&&Array.isArray(d.days),render:d=>{CL=d;renderClaude();renderAllTab();}}
 ];
 function secUnavailable(key,msg){
   var tb=(key==='sessions')?document.querySelector('#sstbl tbody'):((key==='projects')?document.querySelector('#projtbl tbody'):null);
@@ -5841,6 +6085,7 @@ function secUnavailable(key,msg){
   if(key==='codex'){var c=document.querySelector('#cx-tbl tbody');if(c)c.innerHTML='<tr><td colspan="6">unavailable: '+ESC(msg)+'</td></tr>';}
   if(key==='jev'){var j=document.querySelector('#j-tbl tbody');if(j)j.innerHTML='<tr><td colspan="7">unavailable: '+ESC(msg)+'</td></tr>';}
   if(key==='antigravity'){var a=document.querySelector('#ag-tbl tbody');if(a)a.innerHTML='<tr><td colspan="6">unavailable: '+ESC(msg)+'</td></tr>';}
+  if(key==='claude'){var cl=document.querySelector('#cl-tbl tbody');if(cl)cl.innerHTML='<tr><td colspan="6">unavailable: '+ESC(msg)+'</td></tr>';}
 }
 function secStrip(){
   var sts=SEC.sections,parts=[];
@@ -5955,7 +6200,7 @@ document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!AUTH_FAI
 setInterval(()=>{if(!document.hidden&&!AUTH_FAILED)load();},((window.__ocdTimeouts&&window.__ocdTimeouts.refreshMs)||30000));
 try{const sv=sessionStorage.getItem('ocd-range');if(sv){RANGE=sv;document.querySelectorAll('.pbtn[data-r]').forEach(x=>x.classList.toggle('active',x.dataset.r===RANGE));if(RANGE==='custom'){const cc=JSON.parse(sessionStorage.getItem('ocd-custom')||'null');if(cc&&cc.from&&cc.to){CUSTOM=cc;const fi=document.getElementById('c-from'),ti=document.getElementById('c-to'),ap=document.getElementById('c-apply');if(fi)fi.value=cc.from;if(ti)ti.value=cc.to;if(ap)ap.classList.add('active');}}}}catch(_){}
 try{const rv=sessionStorage.getItem('ocd-rrange');if(rv){RRANGE=rv;document.querySelectorAll('.pbtn[data-rr]').forEach(x=>x.classList.toggle('active',x.dataset.rr===RRANGE));if(RRANGE==='custom'){const rc=JSON.parse(sessionStorage.getItem('ocd-rcustom')||'null');if(rc&&rc.from&&rc.to){RCUSTOM=rc;const fi=document.getElementById('r-c-from'),ti=document.getElementById('r-c-to'),ap=document.getElementById('r-c-apply');if(fi)fi.value=rc.from;if(ti)ti.value=rc.to;if(ap)ap.classList.add('active');}}}}catch(_){}
-try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'||saved==='jev'||saved==='antigravity'||saved==='all'){setTab(saved);}}catch(_){}
+try{const saved=sessionStorage.getItem('ocd-tab');if(saved==='router'||saved==='claude'||saved==='jev'||saved==='antigravity'||saved==='all'){setTab(saved);}}catch(_){}
 if(S){renderAll();}
 if(R){renderRouter();}
 if(AUTH_TOKEN){load();}else{showAuthLock(true);}
@@ -5976,6 +6221,7 @@ class Handler(BaseHTTPRequestHandler):
     router_limits = None
     jev_logs = None
     antigravity_dir = None
+    claude_dir = None
     server = None
     quiet = False
 
@@ -6220,6 +6466,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 body = json.dumps({"ok": False, "error": str(e)[:200]}).encode("utf-8")
             self._send(200, "application/json", body)
+        elif path.startswith("/api/claude"):
+            try:
+                body = json.dumps(query_claude(self.claude_dir or str(CLAUDE_DIR_DEFAULT))).encode("utf-8")
+            except Exception as e:
+                body = json.dumps({"ok": False, "error": str(e)[:200]}).encode("utf-8")
+            self._send(200, "application/json", body)
         elif path.startswith("/api/update/check"):
             self._send(200, "application/json",
                        json.dumps(update_check()).encode("utf-8"))
@@ -6428,6 +6680,8 @@ def main():
                         help="Jev audit.jsonl to read (repeatable; defaults to local JevDesk installs)")
     parser.add_argument("--antigravity-dir", default=str(AG_DIR_DEFAULT), metavar="DIR",
                         help="Antigravity data dir (default: ~/.gemini/antigravity)")
+    parser.add_argument("--claude-dir", default=str(CLAUDE_DIR_DEFAULT), metavar="DIR",
+                        help="Claude Code data dir (default: ~/.claude)")
     args = parser.parse_args()
 
     Handler.db_path = args.db
@@ -6435,6 +6689,7 @@ def main():
     Handler.router_limits = args.router_limits
     Handler.jev_logs = args.jev_logs or [str(p) for p in JEV_LOG_DEFAULTS]
     Handler.antigravity_dir = args.antigravity_dir
+    Handler.claude_dir = args.claude_dir
     Handler.quiet = args.quiet
     if args.agents_dir:
         AGENT_DIRS.extend(args.agents_dir)

@@ -153,7 +153,10 @@ class TestJevFrontendWiring(unittest.TestCase):
     def test_switch_restore_and_export_wired(self):
         src = self._source()
         self.assertIn("$('tab-jev').onclick=()=>setTab('jev');", src)
-        self.assertIn("saved==='router'||saved==='jev'", src)
+        # boot restore lists every tab; keep the checks independent of order
+        self.assertIn("saved==='router'", src)
+        self.assertIn("saved==='jev'", src)
+        self.assertIn("setTab(saved);", src)
         self.assertIn("TAB==='jev'&&JV", src)
         self.assertIn("if(key==='jev')", src)
 
